@@ -152,6 +152,13 @@ impl Paths {
         self.data_dir.join("speakers.sqlite")
     }
 
+    /// Catalogue of discovered tools and the user's choices about which ones
+    /// Fono may call (see [`crate::tool_catalog::ToolCatalogStore`]).
+    #[must_use]
+    pub fn tool_catalog_db(&self) -> PathBuf {
+        self.data_dir.join("tools.sqlite")
+    }
+
     #[must_use]
     pub fn whisper_models_dir(&self) -> PathBuf {
         self.cache_dir.join("models").join("whisper")

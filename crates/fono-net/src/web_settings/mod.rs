@@ -21,8 +21,9 @@
 //!
 //! Same rationale as `llm_server` (ADR 0036): the hyper stack is already in
 //! the shipped binary via reqwest, so this module adds **no new crate**. The
-//! HTML/CSS/JS assets are embedded with `include_str!` — no images, fonts, or
-//! external requests; tens of KB total.
+//! HTML/CSS/JS assets are embedded with `include_str!` — no fonts and no
+//! external requests; tens of KB total. The only image is the favicon, and
+//! it is an inline-text SVG (a glyph, not a bitmap).
 //!
 //! Mirrors the `llm_server` pattern: one accept loop, one task per
 //! connection, hook closures invoked per request so config state is always
@@ -67,6 +68,9 @@ const MAX_AUDIO_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const APP_JS: &str = include_str!("assets/app.js");
+/// Kept byte-identical to `fono-site/favicon.svg` so the settings page and
+/// the website show the same φ mark.
+pub const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 
 /// Response body type used across the server.
 type ResBody = BoxBody<Bytes, Infallible>;
@@ -176,6 +180,31 @@ pub type ListUtterancesFn =
 /// `(speaker_id, utterance_id)`.
 pub type DeleteUtteranceFn = Arc<dyn Fn(i64, i64) -> std::result::Result<(), String> + Send + Sync>;
 
+/// List the discovered tool catalogue (`GET /api/tools`):
+/// `{"servers": [{name, url, configured}, …], "tools": [{source, name,
+/// enabled, available, capability, verify_class, …}, …]}`. Reads the local
+/// store only — never contacts a server, so the page renders instantly.
+pub type ListToolsFn =
+    Arc<dyn Fn() -> std::result::Result<serde_json::Value, String> + Send + Sync>;
+/// Allow or deny one tool (`PATCH /api/tools`). Args `(source, name,
+/// enabled)`. Recorded as an explicit user choice, so it survives the tool
+/// disappearing and coming back.
+pub type SetToolEnabledFn =
+    Arc<dyn Fn(&str, &str, bool) -> std::result::Result<(), String> + Send + Sync>;
+/// Contact every configured MCP server and fold what it reports into the
+/// catalogue (`POST /api/tools/discover`). Returns a per-server summary of
+/// what changed. Async: network round-trips happen off the accept loop.
+///
+/// With a `{name, url, auth_token_ref}` body it instead *probes* that one
+/// server and stores nothing, so a URL can be tested before it is saved.
+pub type DiscoverToolsFn = Arc<
+    dyn Fn(
+            Option<serde_json::Value>,
+        ) -> BoxFuture<'static, std::result::Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
+
 /// Hook closures supplied by the daemon layer. The server itself is a thin
 /// wire adapter with no config semantics.
 #[derive(Clone)]
@@ -209,6 +238,11 @@ pub struct WebSettingsHooks {
     pub list_utterances: ListUtterancesFn,
     /// Delete one utterance (`DELETE /api/speakers/{id}/utterances/{uid}`).
     pub delete_utterance: DeleteUtteranceFn,
+    /// Voice-triggered actions: the discovered tool catalogue and the
+    /// user's allow/deny choices about it.
+    pub list_tools: ListToolsFn,
+    pub set_tool_enabled: SetToolEnabledFn,
+    pub discover_tools: DiscoverToolsFn,
 }
 
 /// Configuration for [`WebSettingsServer::start`]. Built from
@@ -380,6 +414,23 @@ async fn serve_conn(sock: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
     }
 }
 
+/// Serve one of the embedded page assets, or `None` if the request is not
+/// for a static asset. Kept separate from [`route`] so the state-bearing
+/// dispatch below stays readable.
+fn static_asset(method: &Method, path: &str) -> Option<Response<ResBody>> {
+    match (method, path) {
+        (&Method::GET | &Method::HEAD, "/" | "/index.html") => {
+            Some(asset(INDEX_HTML, "text/html; charset=utf-8"))
+        }
+        (&Method::GET, "/app.css") => Some(asset(APP_CSS, "text/css; charset=utf-8")),
+        (&Method::GET, "/app.js") => Some(asset(APP_JS, "text/javascript; charset=utf-8")),
+        (&Method::GET | &Method::HEAD, "/favicon.svg" | "/favicon.ico") => {
+            Some(asset(FAVICON_SVG, "image/svg+xml"))
+        }
+        _ => None,
+    }
+}
+
 /// Dispatch one request. The service layer never fails; every path
 /// returns a `Response` (including error responses).
 async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Response<ResBody> {
@@ -387,15 +438,8 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
     let method = req.method().clone();
 
     // Static assets — no auth (no state, no secrets).
-    match (&method, path.as_str()) {
-        (&Method::GET | &Method::HEAD, "/" | "/index.html") => {
-            return asset(INDEX_HTML, "text/html; charset=utf-8");
-        }
-        (&Method::GET, "/app.css") => return asset(APP_CSS, "text/css; charset=utf-8"),
-        (&Method::GET, "/app.js") => {
-            return asset(APP_JS, "text/javascript; charset=utf-8");
-        }
-        _ => {}
+    if let Some(res) = static_asset(&method, path.as_str()) {
+        return res;
     }
 
     // Everything else is state-bearing (JSON API + `/v1/audio/*`). When
@@ -441,6 +485,9 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
         }
         (m, p) if p == "/api/speakers" || p.starts_with("/api/speakers/") => {
             route_speakers(m, p, req, &ctx).await
+        }
+        (m, p) if p == "/api/tools" || p == "/api/tools/discover" => {
+            route_tools(m, p, req, &ctx).await
         }
         (&Method::POST, "/v1/audio/speech") => {
             let Some(body) = read_json_body(req).await else {
@@ -533,6 +580,52 @@ async fn route_api_keys(
             match (ctx.hooks.delete_api_key)(id) {
                 Ok(()) => json_ok(&serde_json::json!({ "ok": true })),
                 Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
+            }
+        }
+        _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+/// `/api/tools*` — the discovered tool catalogue the assistant may use.
+///
+/// `GET` and `PATCH` read and write the local store only, so the page
+/// renders and toggles instantly. Only `POST /api/tools/discover` talks to
+/// the configured servers.
+async fn route_tools(
+    method: &Method,
+    path: &str,
+    req: Request<Incoming>,
+    ctx: &ServerCtx,
+) -> Response<ResBody> {
+    match (method, path) {
+        (&Method::GET, "/api/tools") => match (ctx.hooks.list_tools)() {
+            Ok(v) => json_ok(&v),
+            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
+        (&Method::PATCH, "/api/tools") => {
+            let Some(body) = read_json_body(req).await else {
+                return error_response(StatusCode::BAD_REQUEST, "invalid or oversized JSON body");
+            };
+            let source = body.get("source").and_then(|v| v.as_str()).unwrap_or_default();
+            let name = body.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(enabled) = body.get("enabled").and_then(serde_json::Value::as_bool) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "body must be {\"source\": \"…\", \"name\": \"…\", \"enabled\": true|false}",
+                );
+            };
+            match (ctx.hooks.set_tool_enabled)(source, name, enabled) {
+                Ok(()) => json_ok(&serde_json::json!({ "ok": true })),
+                Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
+            }
+        }
+        (&Method::POST, "/api/tools/discover") => {
+            // An empty body means "refresh everything saved"; a body names a
+            // single, possibly unsaved, server to try.
+            let probe = read_json_body(req).await.filter(|v| v.get("url").is_some());
+            match (ctx.hooks.discover_tools)(probe).await {
+                Ok(v) => json_ok(&v),
+                Err(e) => error_response(StatusCode::BAD_GATEWAY, &e),
             }
         }
         _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
@@ -758,6 +851,61 @@ mod tests {
         assert!(APP_CSS.contains("--accent"));
         assert!(APP_JS.contains("FONO_SECTIONS"));
         assert!(APP_JS.contains("/api/doctor"));
+        assert!(INDEX_HTML.contains("favicon.svg"));
+        assert!(FAVICON_SVG.contains("<svg"));
+    }
+
+    /// Every rendered `<button>` must carry at least one `data-` attribute
+    /// that the delegated click listener actually selects on.
+    ///
+    /// The settings page routes all clicks through one `closest(...)` call
+    /// with an explicit list of attributes. Adding a button and forgetting to
+    /// extend that list produces a button that renders perfectly and silently
+    /// does nothing — no error, nothing in the console, nothing a Rust test
+    /// would otherwise notice. That exact bug shipped once; this is the guard.
+    #[test]
+    fn every_button_is_reachable_by_the_click_handler() {
+        let selector = APP_JS
+            .lines()
+            .find(|l| l.contains("e.target.closest('[data-"))
+            .expect("delegated click listener not found");
+
+        // Attribute names are lower-kebab in the markup; the listener lists
+        // them verbatim, so a plain substring check is enough.
+        let attrs_near = |s: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while let Some(p) = s[i..].find("data-") {
+                let start = i + p;
+                let end = bytes[start..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-'))
+                    .map_or(s.len(), |n| start + n);
+                out.push(s[start..end].to_owned());
+                i = end;
+            }
+            out
+        };
+
+        for (at, _) in APP_JS.match_indices("<button") {
+            let window = &APP_JS[at..(at + 220).min(APP_JS.len())];
+            // Stop at the end of the opening tag where we can find one, so a
+            // later button's attributes cannot rescue this one.
+            let head = window.split_once('>').map_or(window, |(h, _)| h);
+            // `keyIconBtn` builds its attribute name from an argument
+            // (`data-' + action`), so there is nothing static to check.
+            // Buttons carrying an `id` are wired by direct `addEventListener`
+            // instead of delegation, and are checked below.
+            if head.contains("data-'") || head.contains("id=\"") {
+                continue;
+            }
+            let found = attrs_near(head);
+            assert!(
+                found.iter().any(|a| selector.contains(&format!("[{a}]"))),
+                "button at byte {at} has no click-handled attribute (saw {found:?})"
+            );
+        }
     }
 
     /// Every leaf key of a fully-populated `Config` must either be bound
@@ -796,6 +944,10 @@ mod tests {
             // brain-visualization plan) — gets a UI toggle when the
             // overlay style ships (plan Task 4.1)
             "overlay.brain_capture",
+            // Telling the model the real room names is what makes a command
+            // in any language hit the right room, so it is on and stays on.
+            // A hand edit exists only to rule it out when diagnosing.
+            "assistant.tools.place_names",
         ];
 
         // Fully populate the optional sub-tables so their leaves count.

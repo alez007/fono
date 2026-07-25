@@ -53,6 +53,33 @@ fn stub_hooks() -> WebSettingsHooks {
             Ok(serde_json::json!({ "key": view, "secret": "fono_sk_secretsecret" }))
         })
     };
+    // Minimal in-memory tool catalogue: one tool whose `enabled` flag the
+    // PATCH route flips, so the round-trip proves the wiring rather than a
+    // hard-coded reply.
+    let tool_enabled = Arc::new(Mutex::new(true));
+    let list_tools = {
+        let flag = Arc::clone(&tool_enabled);
+        Arc::new(move || {
+            Ok(serde_json::json!({
+                "servers": [{ "name": "ha", "url": "http://ha/sse", "configured": true }],
+                "tools": [{
+                    "source": "ha", "name": "HassTurnOn", "enabled": *flag.lock().unwrap(),
+                    "available": true, "capability": "safe",
+                    "verify_class": "post_condition",
+                }],
+            }))
+        })
+    };
+    let set_tool_enabled = {
+        let flag = Arc::clone(&tool_enabled);
+        Arc::new(move |_source: &str, name: &str, enabled: bool| {
+            if name != "HassTurnOn" {
+                return Err(format!("unknown tool {name}"));
+            }
+            *flag.lock().unwrap() = enabled;
+            Ok(())
+        })
+    };
     WebSettingsHooks {
         get_config: Arc::new(|| Ok(serde_json::json!({}))),
         put_config: Arc::new(|_| Box::pin(async { Ok(String::new()) })),
@@ -79,6 +106,11 @@ fn stub_hooks() -> WebSettingsHooks {
             Ok(serde_json::json!({ "utterances": [], "suggested_prune": [] }))
         }),
         delete_utterance: Arc::new(|_, _| Ok(())),
+        list_tools,
+        set_tool_enabled,
+        discover_tools: Arc::new(|_probe| {
+            Box::pin(async { Err("no MCP server reachable in test".to_string()) })
+        }),
     }
 }
 
@@ -116,12 +148,93 @@ async fn loopback_is_trusted_even_with_auth_on() {
     handle.shutdown().await;
 }
 
+/// The settings page must serve the same φ favicon the website uses, so a
+/// pinned tab looks identical in both places.
+#[tokio::test]
+async fn favicon_is_served_as_svg() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    for path in ["/favicon.svg", "/favicon.ico"] {
+        let r = client.get(format!("{base}{path}")).send().await.expect("send");
+        assert_eq!(r.status(), 200, "{path} should be served");
+        assert_eq!(
+            r.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml"),
+            "{path} should be typed as SVG"
+        );
+        let body = r.text().await.expect("body");
+        assert!(body.contains("<svg"), "{path} should be an SVG document");
+        assert!(body.contains("#c4533a"), "{path} should use the Fono red from the website");
+    }
+
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn doctor_route_open_with_auth_off() {
     let handle = start(false).await;
     let base = format!("http://{}", handle.local_addr());
     let r = reqwest::get(format!("{base}/api/doctor")).await.expect("send");
     assert_eq!(r.status(), 200);
+    handle.shutdown().await;
+}
+
+/// Deselecting a tool must survive the round-trip: the list route reports
+/// the user's choice back, not the default.
+#[tokio::test]
+async fn tool_can_be_deselected_and_the_choice_is_reported_back() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    // Discovered tools start enabled.
+    let r = client.get(format!("{base}/api/tools")).send().await.expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["tools"][0]["name"], "HassTurnOn");
+    assert_eq!(body["tools"][0]["enabled"], true);
+
+    // Switch it off.
+    let r = client
+        .patch(format!("{base}/api/tools"))
+        .header("content-type", "application/json")
+        .body(r#"{"source":"ha","name":"HassTurnOn","enabled":false}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 200);
+
+    let r = client.get(format!("{base}/api/tools")).send().await.expect("send");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["tools"][0]["enabled"], false);
+
+    // A body missing `enabled` is a client error, not a silent no-op.
+    let r = client
+        .patch(format!("{base}/api/tools"))
+        .header("content-type", "application/json")
+        .body(r#"{"source":"ha","name":"HassTurnOn"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 400);
+
+    handle.shutdown().await;
+}
+
+/// A server we cannot reach must surface as an error the UI can show, not a
+/// silent success.
+#[tokio::test]
+async fn discovery_failure_is_reported() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let r = reqwest::Client::new()
+        .post(format!("{base}/api/tools/discover"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 502);
     handle.shutdown().await;
 }
 

@@ -1,5 +1,144 @@
 # Fono — Project Status
-Last updated: 2026-07-21
+Last updated: 2026-07-27
+
+## 2026-07-27 — "Turn on the light in the office" turned on the air conditioning
+
+Three separate bugs, all found in one trace
+(`/tmp/fono-traces/assistant-1785165705-0002.json`) from a Romanian command
+that asked for one lamp and got the climate system.
+
+**The room was acted on without saying which kind of device.** The model called
+`HassTurnOn {"area": "Office"}`, and a Home Assistant area switch-on reaches
+everything switchable in the area — so `climate.office_air_conditioner` and the
+energy meter came on, while `light.office_tv`, the one thing wanted, came back
+under `failed`. The room hint told the model to "act on the room in one call"
+and never mentioned that the tool takes a `domain` too. It now asks for the
+domain whenever the user named a kind of device, with a worked example, and says
+plainly what a domain-less room command does.
+
+**A half-done command was reported as a total failure.** `admits_failure` said
+`true` for any non-empty `failed` list, so a result with six successes and six
+failures reached the model as "HassTurnOn did not work" and it had to compose a
+reply from a false premise. Replaced with an `Admission` of `Worked` /
+`NothingWorked` / `PartlyWorked { failed }`; a partial result now names the
+devices that did not respond and tells the model not to claim the whole request
+succeeded. An area on its own no longer counts as a device that was switched.
+
+**The tool-result log was unreadable, and the drain span was invisible.**
+`debug!(?event, …)` ran `Debug` over a summary string that already held JSON, so
+every quote in the house's answer came out escaped; the fields are now logged
+individually as text. Separately, `playback.drain` shared the `playback` lane
+with the player's own `playback.play` span and only *partly* overlapped it
+(22 µs later in, 53 ms later out), which is illegal for complete slices on one
+track — Perfetto was dropping the slice with
+`slice_spill_overlapping_complete_event`. Drain moved to its own `playback-wait`
+lane.
+
+## 2026-07-26 — Voice actions: Fono itself now switches a real light
+
+The thin end-to-end slice is done, and it is the first time *Fono* (rather
+than a probe script) changed something in the house. Deliberately taken
+before the plan's Phase 2 (prompt-cache prepay), because prepaying a cache
+for a request nothing sends optimises nothing — and every latency number we
+had came from a harness, not from Fono.
+
+**The chain, all of it Fono's own code:** the tools the user left switched
+on → `tools[]` on the chat request → the model picks one → `crates/fono/src/actions.rs`
+runs it over MCP → the outcome is worded honestly → a second model turn tells
+the user. One action per turn: the second request carries no `tools` field, so
+a single sentence cannot set off a chain.
+
+Live, against a real Home Assistant on the LAN, real kitchen lights: **418 ms** for the call
+itself (`turns_on_a_real_light`, `#[ignore]`d).
+
+**Honesty is enforced at the executor, not the prompt.** A server that
+objects is quoted verbatim; a tool nothing can observe afterwards
+(`VerifyClass::None`) may only be reported as *sent*. Two things this found:
+
+- Home Assistant's result is `{"success": [...], "failed": [...]}` — the
+  failure list comes **last**. A 600-char output cap cut exactly that off,
+  leaving the model reading an apparently clean success. Cap raised to 2000
+  and trimming is now visibly marked, because a silent truncation of the
+  evidence is the same bug class as the Romanian false success.
+- The `[assistant.tools].enabled` master switch defaulted off, so the user
+  could add a server, watch it list 26 tools, and have nothing happen. A
+  successful connection now switches it on — connecting *is* the consent.
+
+The realtime backend is out of scope; it speaks its own protocol and gets
+`actions: None`.
+
+Next per the plan: Phase 2 (prepay/cache), now with a real request shape to
+warm for, and Phase 3 (the verification ladder proper — post-condition
+readback, which the executor currently stops short of).
+
+## 2026-07-26 — Voice actions: measured the real house, wrote v4, landed the tool catalogue
+
+Phase 0.5 of the voice-actions work is complete and the plan is now
+`plans/2026-07-26-voice-actions-v4.md` (architecture-first; supersedes v3's D3
+and D5). Phase 1 (the tool catalogue store) landed with it.
+
+**Measured against a real Home Assistant, not fixtures.** A local model now
+actually switches the kitchen lights, in English *and* Romanian — 4/4 live.
+Three findings drove the plan:
+
+- **Reasoning is the biggest latency lever, and it hurts quality.** Turning it
+  off took the first live command from 113 s to 7.9 s (14×). Under a schema
+  constraint, reasoning talked the model *out* of the task. Fono already sends
+  `enable_thinking: false` for local backends
+  (`crates/fono-assistant/src/openai_compat_chat.rs:706-709`), and so does the
+  bench — an earlier claim that the Phase 0.5 matrix was "4× pessimistic" was
+  wrong and is corrected in the plan as F21. Scope limit: reasoning-off is for
+  the *action* path only; Fono's own OpenAI-compatible server must leave the
+  client in control.
+- **Romanian failed on names, not language.** The model emitted
+  `area: "bucătărie"`; every HA area is English-named. Injecting the 13 real
+  area names (~30 tokens) fixed both Romanian commands immediately.
+- **Home Assistant reported success for calls that did nothing.** So
+  verification gates learning: transport success never counts, and a command is
+  only promoted to a deterministic shortcut on evidence we can re-read.
+
+With reasoning off the bottleneck flips from decode to **prefill (~76 % of the
+decision turn)**, which is why the plan now puts the catalogue store and
+prompt-cache prepay ahead of grammar work.
+
+**Phase 1 shipped:** `crates/fono-core/src/tool_catalog.rs` — a SQLite
+catalogue of discovered tools. Everything discovered is enabled by default and
+the user only deselects; a tool that vanishes is marked unavailable, never
+deleted, and its enabled flag is never reset, so a server restart cannot
+silently re-enable something switched off. Each tool records how strongly its
+outcome can be verified. The rendered prompt catalogue is byte-stable so a
+pinned prompt-cache prefix stays valid. Zero new dependencies (`rusqlite` and
+`sha2` were already in the graph) — size gate 21.83 MiB of 25 MiB.
+
+The plan also names how each phase gets checked: the existing pre-commit gate,
+the real-house test at 4/4, and saying one command out loud. An earlier draft
+grew a four-tier test taxonomy with a release checklist; it was cut back to
+those three, since the rest was policy about policy.
+
+**Discovery + Settings UI shipped (same day).** The catalogue is now filled from
+real servers and surfaced in the browser. New `fono-assistant::mcp_client`
+(feature `mcp-client`, default-on) speaks the **SSE** MCP transport Home
+Assistant 2026.7 actually serves — `GET …/sse` returns a POST endpoint and the
+JSON-RPC *responses come back on the stream*, which is the whole reason it is a
+module rather than a couple of `reqwest::post` calls. New `[assistant.tools]`
+config block holds the master toggle and the server list (tokens by secret
+*name*, never inline). Three routes — `GET`/`PATCH /api/tools` read and write
+the local store only so the page renders and toggles instantly, and only
+`POST /api/tools/discover` touches the network. A new "Tools & actions" section
+lists every tool with the strength of proof Fono can offer for it, flags the
+ones that must never be replayed automatically, and shows tools that have gone
+missing rather than hiding them.
+
+Verified against the live house, not a mock: discovery returns all 26 Home
+Assistant tools in ~0.3 s, `GetLiveContext` is picked as the readback tool (not
+`GetDateTime`), `HassTurnOn` classifies as provable-by-re-reading, and a tool
+switched off stays off across a second discovery pass. Two `#[ignore]` tests
+gated on `FONO_TEST_MCP_URL` cover the transport and the full store glue; a
+unit test pins the real 26-tool catalogue so the heuristics stay anchored to a
+catalogue that exists. Net-zero new dependencies (`bytes` was already in the
+graph via `fono-http`) — size gate 21.92 MiB of 25 MiB.
+
+Next: Phase 2 (prompt-cache prepay).
 
 ## 2026-07-21 — Release 0.17.1 (natural multilingual voice by default)
 

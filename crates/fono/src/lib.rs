@@ -18,6 +18,7 @@
 // `plans/2026-04-27-shared-ggml-static-binary-v1.md` for the full
 // rationale and the long-term shared-ggml plan.
 
+pub mod actions;
 pub mod agent_setup;
 pub mod agents;
 pub mod api_key_auth;

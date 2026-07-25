@@ -797,6 +797,19 @@ const FONO_SECTIONS = [
     html() { return speakersHtml(); },
   },
   {
+    id: 'tools', title: 'Tools & actions',
+    summary() {
+      if (!gv('assistant.tools.enabled', false)) return 'off';
+      if (toolsErr) return 'unavailable';
+      if (!toolsData) return 'loading\u2026';
+      const t = toolsData.tools || [];
+      if (!t.length) return 'nothing discovered yet';
+      const on = t.filter((x) => x.enabled && x.available).length;
+      return on + ' of ' + t.length + ' in use';
+    },
+    html() { return toolsHtml(); },
+  },
+  {
     id: 'servers', title: 'Servers & Advanced',
     summary() {
       const bits = [];
@@ -1684,6 +1697,164 @@ function spkCalApply(thr) {
   toast('Threshold set to ' + thr + ' \u2014 press Save to apply');
 }
 
+// ---------- voice-triggered actions (GET/PATCH /api/tools, POST discover) ----------
+// Fono asks each configured MCP server what it can do, remembers the answer,
+// and lets you switch individual tools off. Everything discovered starts on;
+// you only ever deselect. Fewer tools is both faster and more accurate, so
+// the count is worth showing.
+let toolsData = null, toolsErr = null, toolsBusy = false;
+function refreshToolsSection() {
+  const sec = FONO_SECTIONS.find((s) => s.id === 'tools');
+  if (sec && document.getElementById('d-tools')) renderSection(sec);
+}
+async function loadTools() {
+  try {
+    toolsData = await api('/api/tools');
+    toolsErr = null;
+  } catch (err) {
+    toolsData = null;
+    toolsErr = err.message;
+  }
+  refreshToolsSection();
+}
+// How confidently Fono can tell whether a call actually did anything. This
+// is not cosmetic: a tool it cannot check may never be replayed from a
+// learned shortcut, and Fono will say "sent", never "done".
+// Mirrors fono_core::config::derive_token_ref. The name is derived, not
+// typed, so there is no second field whose only job is to agree with the
+// first — and no way to mistype it into a token that reads as "not set".
+function deriveTokenRef(name) {
+  let out = '';
+  for (const ch of name) {
+    if (/[A-Za-z0-9]/.test(ch)) out += ch.toUpperCase();
+    else if (!out.endsWith('_')) out += '_';
+  }
+  const base = out.replace(/^_+|_+$/g, '');
+  if (!base) return '';
+  // Secret names must start with a letter, or the server refuses to store it.
+  return (/^[0-9]/.test(base) ? 'MCP_' : '') + base + '_TOKEN';
+}
+const TOOL_PROOF = {
+  post_condition: ['checked', 'Fono re-reads the state afterwards to confirm it really happened.'],
+  result_contract: ['reported', 'Fono relies on the server reporting a failure. It cannot see the result itself.'],
+  none: ['unverified', 'Nothing can be checked \u2014 Fono can only say the request was sent.'],
+};
+function toolsHtml() {
+  let out = row('Let the assistant control things', 'Discovers what your smart home and other connected services can do, '
+    + 'and lets the assistant use them when you ask.', toggle('assistant.tools.enabled', false, 'tools'), 'master');
+  const servers = (cfg.assistant && cfg.assistant.tools && cfg.assistant.tools.mcp) || [];
+  const known = new Set((toolsData && toolsData.tools || []).map((t) => t.source));
+  out += servers.map((s, i) => {
+    const ref = s.auth_token_ref || deriveTokenRef(s.name || '');
+    const seen = known.has(s.name);
+    const tokenSet = !!(ref && meta && meta.secrets && meta.secrets[ref]);
+    // The token row is only meaningful once the server has a name, since the
+    // secret is filed under a name derived from it.
+    const tokenPart = ref
+      ? keyRow(ref, 'Access token', 'Write-only \u2014 the stored value is never shown. Filed under a name taken from the server\u2019s.')
+      : row('Access token', 'Name the server first \u2014 its token is filed under a name taken from that.',
+        '<span class="keystatus unset"><span class="dot"></span>Waiting for a name</span>');
+    return '<div class="enroll-card"><div class="enroll-row">'
+      + '<input class="input" data-bind="assistant.tools.mcp.name" data-idx="' + i + '" data-kind="text" placeholder="Name (e.g. Home Assistant)" value="' + esc(s.name || '') + '" style="width:170px" />'
+      + '<input class="input mono" data-bind="assistant.tools.mcp.url" data-idx="' + i + '" data-kind="text" placeholder="http://homeassistant.local:8123" value="' + esc(s.url || '') + '" style="flex:1" />'
+      + '<button class="btn" type="button" data-tool-try="' + i + '"' + (toolsBusy ? ' disabled' : '') + '>'
+      + (toolsBusy ? 'Asking\u2026' : (seen ? 'Refresh' : 'Save & connect')) + '</button>'
+      + '<button class="btn ghost" type="button" data-tool-srv-rm="' + i + '">Remove</button>'
+      + '</div>'
+      + tokenPart
+      + (ref && !tokenSet ? '<p class="hint">Most servers need a token. Home Assistant: Profile \u2192 Security \u2192 Long-lived access tokens.</p>' : '')
+      + '</div>';
+  }).join('');
+  out += '<div class="enroll-row"><button class="btn ghost" type="button" data-tool-srv-add>Add a server</button>'
+    + (servers.length > 1
+      ? '<button class="btn ghost" type="button" data-tool-discover' + (toolsBusy ? ' disabled' : '') + '>Refresh all</button>'
+      : '')
+    + '<span class="hint">Save &amp; connect checks the address before saving anything.</span></div>';
+
+  if (toolsErr) return out + '<p class="privacy-note">Could not load tools: ' + esc(toolsErr) + '</p>';
+  if (!toolsData) return out + '<p class="hint">Loading\u2026</p>';
+  const tools = toolsData.tools || [];
+  if (!tools.length) {
+    return out + '<p class="hint">' + (servers.length
+      ? 'Nothing found yet. Paste the token, then press Save &amp; connect.'
+      : 'Add a server to see what it can do.') + '</p>';
+  }
+  const off = tools.filter((t) => !t.enabled).length;
+  out += '<p class="hint">Found ' + tools.length + ' things this can do, all switched on. '
+    + 'Switch off anything you would rather the assistant never touched \u2014 a shorter list is both faster and more accurate.'
+    + (off ? ' <strong>' + off + ' switched off.</strong>' : '') + '</p>';
+  const rows = tools.map((t) => {
+    const proof = TOOL_PROOF[t.verify_class] || TOOL_PROOF.none;
+    return '<tr' + (t.available ? '' : ' class="utt-weak"') + '>'
+      + '<td><input type="checkbox" class="toggle" data-tool-toggle="1" data-tool-src="' + esc(t.source) + '" data-tool-name="' + esc(t.name) + '"' + (t.enabled ? ' checked' : '') + ' /></td>'
+      + '<td class="mono">' + esc(t.name) + '</td>'
+      + '<td>' + esc(t.source) + '</td>'
+      + '<td><span class="hint" title="' + esc(proof[1]) + '">' + proof[0] + '</span></td>'
+      + '<td>' + (t.capability === 'dangerous' ? '<span class="spk-strength weak" title="Its name suggests something hard to take back (unlock, delete, remove, reset, pay\u2026), so Fono will never run it automatically from a learned shortcut. Asking for it still works.">careful</span>' : '<span class="hint">\u2014</span>') + '</td>'
+      + '<td>' + (t.available ? '<span class="hint">\u2713</span>' : '<span class="spk-strength weak" title="Not offered by the server any more. Your choice is remembered in case it comes back.">missing</span>') + '</td>'
+      + '</tr>';
+  }).join('');
+  return out + '<table class="key-table"><thead><tr>'
+    + '<th>Use</th><th>Tool</th><th>From</th><th>Proof</th><th></th><th>Available</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+async function setToolEnabled(source, name, enabled) {
+  try {
+    await api('/api/tools', { method: 'PATCH', body: JSON.stringify({ source, name, enabled }) });
+    const t = toolsData && (toolsData.tools || []).find((x) => x.source === source && x.name === name);
+    if (t) t.enabled = enabled;
+    refreshToolsSection();
+  } catch (err) { toast('Could not change that tool: ' + err.message, true); }
+}
+// Save one server — but only after checking it actually answers.
+//
+// The check runs against what is currently typed and writes nothing, so a
+// wrong address or a missing token can never leave a half-finished server
+// behind. Only once the server replies do we save the config and fold what
+// it offers into the catalogue. Saving something known-broken is the
+// failure mode worth designing out.
+async function tryServer(i) {
+  const s = (gv('assistant.tools.mcp', [])[i]) || {};
+  if (!(s.name || '').trim()) { toast('Give the server a name first.', true); return; }
+  if (!(s.url || '').trim()) { toast('Give the server an address first.', true); return; }
+  toolsBusy = true;
+  refreshToolsSection();
+  try {
+    const p = await api('/api/tools/discover', {
+      method: 'POST',
+      body: JSON.stringify({ name: s.name, url: s.url, auth_token_ref: s.auth_token_ref || '' }),
+    });
+    await saveAll();
+    await api('/api/tools/discover', { method: 'POST' });
+    // The token's name is derived from the server's, so saving a rename can
+    // change which secret this row reports on. Re-read rather than guess.
+    try { meta = await api('/api/meta'); } catch (_) { /* keep the old view */ }
+    toast('Connected to ' + (p.server_name || s.name) + ' \u2014 ' + p.count
+      + (p.count === 1 ? ' thing it can do' : ' things it can do'));
+  } catch (err) {
+    toast((s.name || 'Server') + ': ' + err.message, true);
+  }
+  toolsBusy = false;
+  await loadTools();
+}
+
+async function discoverTools() {
+  toolsBusy = true;
+  refreshToolsSection();
+  try {
+    const r = await api('/api/tools/discover', { method: 'POST' });
+    const bad = (r.servers || []).filter((s) => s.error);
+    const ok = (r.servers || []).filter((s) => !s.error);
+    const found = ok.reduce((n, s) => n + (s.count || 0), 0);
+    if (bad.length) toast(bad.map((s) => s.server + ': ' + s.error).join('; '), true);
+    else toast('Found ' + found + (found === 1 ? ' tool' : ' tools'));
+  } catch (err) {
+    toast('Could not reach the server: ' + err.message, true);
+  }
+  toolsBusy = false;
+  await loadTools();
+}
+
 // ---------- render ----------
 function renderSection(s) {
   const d = document.getElementById('d-' + s.id);
@@ -1736,6 +1907,10 @@ function boundPath(el) {
 // ---------- events ----------
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.dataset && el.dataset.toolToggle !== undefined) {
+    setToolEnabled(el.dataset.toolSrc, el.dataset.toolName, el.checked);
+    return;
+  }
   if (el.dataset && el.dataset.vocabFrom !== undefined) {
     vocab.vocabulary[+el.dataset.vocabFrom].from =
       el.value.split(',').map((s) => s.trim()).filter(Boolean);
@@ -1790,10 +1965,27 @@ document.addEventListener('input', (e) => {
 });
 
 document.addEventListener('click', (e) => {
-  const t = e.target.closest('[data-seg],[data-pick],[data-tts-test],[data-tag-rm],[data-wake-rm],[data-wake-add],[data-vocab-rm],[data-vocab-add],[data-keycap],[data-reset],[data-key-edit],[data-key-clear],[data-key-save],[data-key-cancel],[data-key-new],[data-key-rename],[data-key-revoke],[data-key-restore],[data-key-delete],[data-spk-rename],[data-spk-delete],[data-spk-record],[data-spk-submit],[data-spk-discard],[data-spk-cal-record],[data-spk-cal-run],[data-spk-cal-clear],[data-spk-cal-apply],[data-spk-manage],[data-spk-manage-close],[data-spk-utt-del],[data-spk-prune]');
+  const t = e.target.closest('[data-seg],[data-pick],[data-tts-test],[data-tag-rm],[data-wake-rm],[data-wake-add],[data-vocab-rm],[data-vocab-add],[data-keycap],[data-reset],[data-key-edit],[data-key-clear],[data-key-save],[data-key-cancel],[data-key-new],[data-key-rename],[data-key-revoke],[data-key-restore],[data-key-delete],[data-spk-rename],[data-spk-delete],[data-spk-record],[data-spk-submit],[data-spk-discard],[data-spk-cal-record],[data-spk-cal-run],[data-spk-cal-clear],[data-spk-cal-apply],[data-spk-manage],[data-spk-manage-close],[data-spk-utt-del],[data-spk-prune],[data-tool-discover],[data-tool-try],[data-tool-srv-add],[data-tool-srv-rm]');
   if (!t) return;
   const secEl = t.closest('details.sec');
   const sec = secEl ? FONO_SECTIONS.find((s) => 'd-' + s.id === secEl.id) : null;
+
+  if (t.dataset.toolDiscover !== undefined) { discoverTools(); return; }
+  if (t.dataset.toolTry !== undefined) { tryServer(Number(t.dataset.toolTry)); return; }
+  if (t.dataset.toolSrvAdd !== undefined) {
+    const arr = gv('assistant.tools.mcp', []).slice();
+    arr.push({ name: '', url: '', auth_token_ref: '' });
+    set(cfg, 'assistant.tools.mcp', arr);
+    afterChange(t, sec);
+    return;
+  }
+  if (t.dataset.toolSrvRm !== undefined) {
+    const arr = gv('assistant.tools.mcp', []).slice();
+    arr.splice(parseInt(t.dataset.toolSrvRm, 10), 1);
+    set(cfg, 'assistant.tools.mcp', arr);
+    afterChange(t, sec);
+    return;
+  }
 
   if (t.dataset.seg) { SEG[t.dataset.seg](t.dataset.val); afterChange(t, sec); return; }
   if (t.dataset.pick) { PICK[t.dataset.pick](t.dataset.val); afterChange(t, sec); return; }
@@ -2114,6 +2306,7 @@ async function init() {
     renderAll();
     loadApiKeys(); // fire-and-forget: fills the API Keys section
     loadSpeakers(); // fire-and-forget: fills the Speakers section
+    loadTools(); // fire-and-forget: fills the Tools section
   } catch (err) {
     document.getElementById('loading').textContent = 'Could not load configuration: ' + err.message
       + (TOKEN ? '' : ' \u2014 if a token is configured, open this page as /?token=\u2026');

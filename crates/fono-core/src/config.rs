@@ -1170,6 +1170,121 @@ pub struct Assistant {
     /// the F8-hold push-to-talk realtime path and the staged path use
     /// none of them.
     pub realtime: AssistantRealtime,
+    /// `[assistant.tools]` — voice-triggered actions: which MCP servers
+    /// Fono asks for tools, and how careful it is with them. *Which*
+    /// individual tools are allowed is deliberately not config — that is
+    /// discovered data with a lifecycle, so it lives in the tool catalogue
+    /// database (see `fono_core::tool_catalog`).
+    #[serde(default)]
+    pub tools: AssistantTools,
+}
+
+/// `[assistant.tools]` — voice-triggered actions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AssistantTools {
+    /// Master switch. Off until the user adds a server, so a default
+    /// install never reaches out to anything.
+    pub enabled: bool,
+    /// `[[assistant.tools.mcp]]` — the servers to discover tools from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpClientServer>,
+    /// Tell the model the real names of the rooms in the house.
+    ///
+    /// On by default because without it the model invents a name: asked in
+    /// Romanian it sends `bucătărie` to a house whose rooms are all in
+    /// English, and nothing happens. Costs roughly thirty tokens, prepared
+    /// when a server is connected rather than per command.
+    ///
+    /// Exposed only so the difference can be measured — turn it off, ask
+    /// for a room in another language, and watch it fail.
+    #[serde(default = "default_true")]
+    pub place_names: bool,
+}
+
+impl Default for AssistantTools {
+    fn default() -> Self {
+        Self { enabled: false, mcp: Vec::new(), place_names: true }
+    }
+}
+
+/// One external MCP server Fono discovers tools from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpClientServer {
+    /// Stable label. Also the catalogue's `source` key, so renaming a
+    /// server orphans (never deletes) its remembered tool choices.
+    pub name: String,
+    /// Where the server lives. A bare origin (`http://homeassistant.local:8123`)
+    /// is completed to the Home Assistant endpoint; see [`Self::sse_url`].
+    pub url: String,
+    /// Name of the secret holding the bearer token — never the token
+    /// itself. Normally left empty and derived from `name`, so the user
+    /// never has to invent a key; see [`Self::token_ref`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_token_ref: String,
+}
+
+impl McpClientServer {
+    /// The secret key holding this server's bearer token.
+    ///
+    /// Derived from the name (`Home Assistant` → `HOME_ASSISTANT_TOKEN`) unless
+    /// the config names one explicitly. Deriving it means adding a server is
+    /// name, address, paste the token — no third field whose only job is to
+    /// agree with the first.
+    #[must_use]
+    pub fn token_ref(&self) -> String {
+        if !self.auth_token_ref.is_empty() {
+            return self.auth_token_ref.clone();
+        }
+        derive_token_ref(&self.name)
+    }
+
+    /// The SSE endpoint to open.
+    ///
+    /// A URL with no path is completed to Home Assistant's `/mcp_server/sse`,
+    /// because "paste the address of my Home Assistant" is what people
+    /// actually do, and a bare origin otherwise fails deep inside the stream
+    /// with a confusing error. Any explicit path is left alone.
+    #[must_use]
+    pub fn sse_url(&self) -> String {
+        let trimmed = self.url.trim().trim_end_matches('/');
+        let has_path = trimmed
+            .find("://")
+            .and_then(|i| trimmed.get(i + 3..))
+            .is_some_and(|rest| rest.contains('/'));
+        if has_path {
+            trimmed.to_owned()
+        } else {
+            format!("{trimmed}/mcp_server/sse")
+        }
+    }
+}
+
+/// `Home Assistant` → `HOME_ASSISTANT_TOKEN`. Runs of non-alphanumerics
+/// collapse to one underscore so the key stays a plausible env-var name.
+///
+/// The result must also satisfy the settings server's secret-name rule
+/// (starts with an uppercase letter), or the browser could derive a name it
+/// is then refused permission to store — so a leading digit gets a prefix.
+#[must_use]
+pub fn derive_token_ref(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let base = out.trim_matches('_');
+    if base.is_empty() {
+        String::new()
+    } else if base.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("MCP_{base}_TOKEN")
+    } else {
+        format!("{base}_TOKEN")
+    }
 }
 
 /// `[assistant.realtime]` — live-mode (F8-tap full-duplex) settings.
@@ -1216,6 +1331,7 @@ impl Default for Assistant {
             prefer_vision: true,
             prefer_web_search: false,
             realtime: AssistantRealtime::default(),
+            tools: AssistantTools::default(),
         }
     }
 }
@@ -2632,5 +2748,44 @@ mod tests {
         cfg.migrate().unwrap();
         assert_eq!(cfg.polish.prompt.main, default_prompt_main());
         assert_eq!(cfg.polish.prompt.advanced, default_prompt_advanced());
+    }
+
+    /// A server's token is named after it, so the user never invents a key —
+    /// and cannot mistype one into a token that reports as "not set".
+    #[test]
+    fn token_ref_is_derived_from_the_server_name() {
+        let mut s = McpClientServer {
+            name: "Home Assistant".into(),
+            url: "http://x".into(),
+            auth_token_ref: String::new(),
+        };
+        assert_eq!(s.token_ref(), "HOME_ASSISTANT_TOKEN");
+        s.name = "home-assistant!!".into();
+        assert_eq!(s.token_ref(), "HOME_ASSISTANT_TOKEN");
+        // A leading digit would be refused by the settings server's secret
+        // name rule, so it never reaches the browser in that shape.
+        s.name = "2nd home".into();
+        assert_eq!(s.token_ref(), "MCP_2ND_HOME_TOKEN");
+        // An explicit ref still wins, so existing configs keep working.
+        s.auth_token_ref = "MY_OWN".into();
+        assert_eq!(s.token_ref(), "MY_OWN");
+    }
+
+    /// Pasting the address of a Home Assistant is what people actually do;
+    /// a bare origin otherwise fails deep in the stream with a baffling error.
+    #[test]
+    fn bare_origin_is_completed_to_the_mcp_endpoint() {
+        let srv = |u: &str| McpClientServer {
+            name: "h".into(),
+            url: u.into(),
+            auth_token_ref: String::new(),
+        };
+        assert_eq!(srv("http://ha.local:8123").sse_url(), "http://ha.local:8123/mcp_server/sse");
+        assert_eq!(srv("http://ha.local:8123/").sse_url(), "http://ha.local:8123/mcp_server/sse");
+        // An explicit path is never second-guessed.
+        assert_eq!(
+            srv("http://ha.local:8123/other/sse").sse_url(),
+            "http://ha.local:8123/other/sse"
+        );
     }
 }

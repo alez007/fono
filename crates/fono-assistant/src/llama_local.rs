@@ -36,10 +36,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
-use crate::history::ChatRole;
+use crate::history::{ChatRole, ToolCall};
+use crate::local_tools;
 use crate::traits::{
     Assistant, AssistantCacheTrigger, AssistantContext, AssistantPromptCacheSnapshot,
-    AssistantPromptCacheWarmup, TokenDelta,
+    AssistantPromptCacheWarmup, TokenDelta, ToolEvent,
 };
 
 const MAX_NEW_TOKENS: i32 = 384;
@@ -1973,15 +1974,56 @@ fn assistant_base_prefix(system: &str, model_name: &str) -> String {
     }
 }
 
+/// Continues a finished prompt with the model's tool call and the tool's
+/// answer, ready for the second generation that words the result.
+///
+/// The first prompt already ends with the open-model marker, so we close the
+/// model's turn, hand the result back as a user turn, and re-open. The tool's
+/// answer travels as ordinary text rather than a dedicated tool role: the
+/// hand-rolled templates have no such role, and inventing one would put
+/// tokens in front of the model that it was never trained on.
+fn tool_result_continuation(prompt: &str, call: &str, result: &str, model_name: &str) -> String {
+    let m = turn_markers(model_name);
+    let reply_role =
+        if model_name.to_ascii_lowercase().contains("gemma") { "model" } else { "assistant" };
+    format!(
+        "{prompt}{call}{close}\n{open}user\nTool result: {result}{close}\n{open}{reply_role}\n",
+        close = m.close,
+        open = m.open,
+    )
+}
+
 #[async_trait]
 impl Assistant for LlamaLocalAssistant {
+    #[allow(clippy::too_many_lines)] // one streaming closure; splitting it would
+                                     // only move the borrowed state into a struct of arguments
     async fn reply_stream(
         &self,
         user_text: &str,
         ctx: &AssistantContext,
     ) -> Result<BoxStream<'static, Result<TokenDelta>>> {
         let model_name = self.model_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        // Tools are described in the system prompt because this backend renders
+        // its own chat markers and so never sees the GGUF's tool template. The
+        // block is *appended*, never prepended, so the pinned system checkpoint
+        // stays a genuine token prefix and the turn is not cold-prefilled.
+        let actions = ctx
+            .actions
+            .clone()
+            .filter(|a| !a.descriptors.is_empty())
+            .filter(|_| std::env::var_os("FONO_LOCAL_TOOLS_OFF").is_none());
+        let ctx = actions.as_ref().map_or(std::borrow::Cow::Borrowed(ctx), |a| {
+            let mut c = ctx.clone();
+            c.system_prompt = format!(
+                "{}\n\n{}",
+                c.system_prompt.trim_end(),
+                local_tools::instructions(&a.descriptors)
+            );
+            std::borrow::Cow::Owned(c)
+        });
+        let ctx = ctx.as_ref();
         let prompt = build_prompt(ctx, user_text, model_name);
+
         let (cache_prefix, cache_suffix) = build_prompt_split(ctx, user_text, model_name);
         current_instant(
             "llm.prompt_built",
@@ -2015,13 +2057,20 @@ impl Assistant for LlamaLocalAssistant {
             allow_capture: ctx.allow_brain_capture,
         };
         let started = Instant::now();
+        let model_name_owned = model_name.to_string();
         let (tx, rx) = mpsc::channel::<Result<TokenDelta>>(STREAM_CHANNEL_CAPACITY);
+        let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let total_span = current_span("llm.local_streaming_inference", "assistant.llm", "llm");
             let mut deltas_emitted = 0_u32;
             let result = (|| -> Result<String> {
                 me.ensure_loaded()?;
-                me.run_inference_with_prefix_cache(
+                // While tools are on, a reply that might still turn out to be a
+                // call is held back rather than spoken. `could_be_call` releases
+                // it the moment it is plainly prose, so an ordinary answer keeps
+                // its head start; only a genuine call is ever buffered whole.
+                let mut held = actions.is_some().then(String::new);
+                let text = me.run_inference_with_prefix_cache(
                     &prompt,
                     &cache_prefix,
                     &cache_suffix,
@@ -2031,6 +2080,84 @@ impl Assistant for LlamaLocalAssistant {
                         let delta = delta.trim_start_matches('\u{feff}').to_string();
                         if delta.is_empty() {
                             return Ok(true);
+                        }
+                        if let Some(buf) = held.as_mut() {
+                            buf.push_str(&delta);
+                            if local_tools::could_be_call(buf) {
+                                return Ok(true);
+                            }
+                            let flush = std::mem::take(buf);
+                            held = None;
+                            deltas_emitted = deltas_emitted.saturating_add(1);
+                            return Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok());
+                        }
+                        deltas_emitted = deltas_emitted.saturating_add(1);
+                        Ok(tx.blocking_send(Ok(TokenDelta::text(delta))).is_ok())
+                    },
+                )?;
+                let Some(held) = held else { return Ok(text) };
+                let Some(actions) = actions else { return Ok(text) };
+                if held.trim().is_empty() {
+                    return Ok(text);
+                }
+                let Some((name, arguments)) = local_tools::parse_call(&held) else {
+                    // Ambiguous to the last token, but prose after all. Say it —
+                    // swallowing it would leave the user with silence.
+                    deltas_emitted = deltas_emitted.saturating_add(1);
+                    let _ = tx.blocking_send(Ok(TokenDelta::text(held)));
+                    return Ok(text);
+                };
+                let call = ToolCall {
+                    id: format!("local-{}", started.elapsed().as_nanos()),
+                    name,
+                    arguments,
+                };
+                let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone()))));
+                let outcome = handle.block_on((actions.execute)(call.clone()));
+                let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Result {
+                    tool_call_id: call.id.clone(),
+                    summary: outcome.summary.clone(),
+                    failed: outcome.failed,
+                })));
+                // Second pass: word the result. The continuation still starts
+                // with the pinned system prefix, so the cache is reused.
+                let call_text =
+                    format!("{{\"name\": \"{}\", \"arguments\": {}}}", call.name, call.arguments);
+                let cont = tool_result_continuation(
+                    &prompt,
+                    &call_text,
+                    &outcome.summary,
+                    &model_name_owned,
+                );
+                let cont_suffix =
+                    cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string();
+                // Some models open the wording pass with their own channel
+                // header. Hold the opening tokens only while they still look
+                // like one, so the header never reaches the speaker.
+                let mut head = Some(String::new());
+                me.run_inference_with_prefix_cache(
+                    &cont,
+                    &cache_prefix,
+                    &cont_suffix,
+                    PromptStateCacheLayer::F8ChatPrefix,
+                    gen_params,
+                    |delta| {
+                        let delta = delta.trim_start_matches('\u{feff}').to_string();
+                        if delta.is_empty() {
+                            return Ok(true);
+                        }
+                        if let Some(buf) = head.as_mut() {
+                            buf.push_str(&delta);
+                            if local_tools::maybe_preamble(buf) {
+                                return Ok(true);
+                            }
+                            let flush = local_tools::strip_preamble(buf).to_string();
+                            head = None;
+                            if flush.is_empty() {
+                                return Ok(true);
+                            }
+                            deltas_emitted = deltas_emitted.saturating_add(1);
+                            return Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok());
                         }
                         deltas_emitted = deltas_emitted.saturating_add(1);
                         Ok(tx.blocking_send(Ok(TokenDelta::text(delta))).is_ok())
@@ -2087,6 +2214,10 @@ impl Assistant for LlamaLocalAssistant {
 
     fn name(&self) -> &'static str {
         "llama-local-assistant"
+    }
+
+    fn can_run_actions(&self) -> bool {
+        true
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -2324,6 +2455,164 @@ mod tests {
 
         // Empty system prompt -> empty base (nothing to pin).
         assert!(assistant_base_prefix("   ", "gemma-4-e2b-it").is_empty());
+    }
+
+    #[test]
+    fn pinned_base_survives_per_turn_system_decoration() {
+        // Regression guard for the D2 defect in the voice-actions v3 plan.
+        //
+        // The daemon pins `F8System` from bare `prompt_main` at startup, but the
+        // live turn may decorate the system prompt (today: a speaker-identity
+        // note; soon: a tool catalogue). Decoration MUST be appended so
+        // `prompt_main` keeps leading. Prepending diverges at roughly token one,
+        // which silently turns every decorated turn into a full cold prefill —
+        // the pin is never restored and the cache looks like it is working
+        // because nothing errors.
+        let prompt_main = "You are Fono, a terse assistant.";
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let base = assistant_base_prefix(prompt_main, model);
+            assert!(!base.is_empty());
+
+            // APPENDED decoration: base still leads. This is the supported shape.
+            let appended = format!("{prompt_main}\n\nThe current speaker is Ana.");
+            let ctx = AssistantContext { system_prompt: appended, ..AssistantContext::default() };
+            let (prefix, _) = build_prompt_split(&ctx, "turn on the lights", model);
+            assert!(
+                prefix.starts_with(&base),
+                "appended decoration must keep the pinned base leading for {model:?}\n \
+                 base: {base:?}\n prefix: {prefix:?}"
+            );
+
+            // PREPENDED decoration: base no longer leads. Asserting the negative
+            // documents exactly what regressed, so a future refactor that
+            // reintroduces prepending fails here instead of silently costing a
+            // full prefill on every turn.
+            let prepended = format!("The current speaker is Ana.\n\n{prompt_main}");
+            let bad_ctx =
+                AssistantContext { system_prompt: prepended, ..AssistantContext::default() };
+            let (bad_prefix, _) = build_prompt_split(&bad_ctx, "turn on the lights", model);
+            assert!(
+                !bad_prefix.starts_with(&base),
+                "prepended decoration is expected to break the pin for {model:?}; if this \
+                 now passes, the cache layout changed and the guard needs revisiting"
+            );
+        }
+    }
+
+    /// Tools reach this backend through the system prompt, so the two things
+    /// that could quietly go wrong are: the block landing *before* the pinned
+    /// base (a cold prefill on every turn), and the second pass not continuing
+    /// the same prefix (a second cold prefill, on the slowest path there is).
+    #[test]
+    fn the_tool_block_and_its_follow_up_both_keep_the_pinned_base_leading() {
+        let prompt_main = "You are Fono, a terse assistant.";
+        let descriptors = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "HassTurnOn", "parameters": {"type": "object",
+                "properties": {"area": {"type": "string"}}}}
+        })];
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let base = assistant_base_prefix(prompt_main, model);
+            let decorated =
+                format!("{prompt_main}\n\n{}", crate::local_tools::instructions(&descriptors));
+            let ctx = AssistantContext { system_prompt: decorated, ..AssistantContext::default() };
+            let (prefix, _) = build_prompt_split(&ctx, "turn on the kitchen lights", model);
+            assert!(prefix.starts_with(&base), "tool block must be appended for {model:?}");
+
+            let prompt = build_prompt(&ctx, "turn on the kitchen lights", model);
+            let cont = tool_result_continuation(&prompt, "{\"name\":\"x\"}", "done", model);
+            assert!(
+                cont.starts_with(&prefix),
+                "the follow-up turn must continue the cached prefix for {model:?}"
+            );
+        }
+    }
+
+    /// The whole local tool path against a real model: the block reaches the
+    /// prompt, the model answers with a call, the call is parsed and executed,
+    /// and the result comes back as spoken words rather than JSON.
+    ///
+    /// Everything else about this feature is testable without a model. This is
+    /// the one thing that is not — whether the model, shown these particular
+    /// instructions, actually emits something the parser recognises.
+    #[tokio::test]
+    #[ignore = "requires FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf"]
+    async fn a_real_model_calls_a_tool_and_words_the_result() {
+        use crate::traits::{ActionTools, ToolOutcome};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let model_path = std::env::var_os("FONO_TEST_ASSISTANT_GGUF")
+            .expect("set FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf");
+        let context = std::env::var("FONO_TEST_ASSISTANT_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let assistant = LlamaLocalAssistant::new(model_path, context);
+
+        let seen: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let actions = Arc::new(ActionTools {
+            descriptors: vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "HassTurnOn",
+                    "description": "Turns on lights or devices in an area of the home.",
+                    "parameters": {"type": "object", "properties": {
+                        "area": {"type": "string"},
+                        "domain": {"type": "array", "items": {"type": "string"}}
+                    }}
+                }
+            })],
+            hint: Some("Rooms in this home: Kitchen, Office.".into()),
+            execute: Arc::new(move |call: ToolCall| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    recorder.lock().expect("poisoned").push(call);
+                    ToolOutcome {
+                        summary: "{\"success\": [{\"name\": \"Kitchen light\"}], \"failed\": []}"
+                            .into(),
+                        failed: false,
+                    }
+                })
+            }),
+        });
+
+        let ctx = AssistantContext {
+            system_prompt: "You are Fono, a terse voice assistant. Reply in one short sentence."
+                .into(),
+            actions: Some(actions),
+            ..AssistantContext::default()
+        };
+        let mut stream =
+            assistant.reply_stream("turn on the kitchen lights", &ctx).await.expect("stream");
+        let mut spoken = String::new();
+        let mut called = false;
+        while let Some(delta) = stream.next().await {
+            let delta = delta.expect("delta");
+            match delta.tool_event {
+                Some(ToolEvent::Called(_)) => called = true,
+                Some(ToolEvent::Result { .. }) => {}
+                None => spoken.push_str(&delta.text),
+            }
+        }
+
+        let calls = seen.lock().expect("poisoned").clone();
+        assert!(called, "no tool call was emitted; the model said: {spoken:?}");
+        assert_eq!(calls.len(), 1, "expected exactly one call, got {calls:?}");
+        assert_eq!(calls[0].name, "HassTurnOn", "wrong tool: {calls:?}");
+        assert!(
+            calls[0].arguments.to_lowercase().contains("kitchen"),
+            "the room did not survive into the arguments: {:?}",
+            calls[0].arguments
+        );
+        // The user must hear words, not the raw tool answer.
+        assert!(!spoken.trim().is_empty(), "the turn produced no speech at all");
+        assert!(
+            !spoken.contains("<tool_call>") && !spoken.contains("\"success\""),
+            "raw machinery leaked into speech: {spoken:?}"
+        );
+        println!("call: {:?}\nspoken: {spoken:?}", calls[0]);
     }
 
     #[test]
@@ -2667,6 +2956,86 @@ mod tests {
         assert!(
             events.iter().any(|e| e["name"] == "llm.prompt_cache_prefix_match"),
             "second summary never restored the cached system-prompt prefix"
+        );
+    }
+
+    /// Live runtime confirmation of the D2 prompt-cache fix (voice-actions v3).
+    ///
+    /// The daemon pins `F8System` from bare `prompt_main` at startup, but a
+    /// speaker-verified turn decorates the system prompt with an identity note.
+    /// The fix APPENDS that note (`assistant_system_prompt`) so `prompt_main`
+    /// keeps leading and the pin stays a genuine token prefix. This drives the
+    /// real warmup → decorated-turn path and asserts through the trace that the
+    /// pinned `F8System` base is actually *restored* rather than cold-prefilled
+    /// — the number that says the caching fix is real at runtime, not just as a
+    /// string invariant (which `pinned_base_survives_per_turn_system_decoration`
+    /// already proves without a model).
+    ///
+    /// Run with `--test-threads=1` (see the sibling live-cache tests).
+    #[tokio::test]
+    #[ignore = "requires FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf"]
+    async fn appended_speaker_note_restores_pinned_f8_system() {
+        use fono_core::turn_trace::TurnTrace;
+        use futures::StreamExt;
+
+        let model_path = std::env::var_os("FONO_TEST_ASSISTANT_GGUF")
+            .expect("set FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf");
+        let context = std::env::var("FONO_TEST_ASSISTANT_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let assistant = LlamaLocalAssistant::new(model_path, context);
+
+        let prompt_main = "You are Fono, a terse voice assistant. Reply with one short sentence.";
+
+        // Pin `F8System` from bare `prompt_main`, exactly as the daemon startup
+        // warmup does (`assistant_cache_warmup`).
+        assistant
+            .prewarm_prompt_caches(AssistantPromptCacheWarmup {
+                f8_system_prompt: Some(prompt_main.to_string()),
+                ..AssistantPromptCacheWarmup::default()
+            })
+            .await
+            .expect("warmup");
+
+        // Trace only the live turn, so the assertion sees its cache decision and
+        // not the warmup's build instants.
+        let trace_dir = std::env::temp_dir().join(format!("fono-d2-cache-{}", std::process::id()));
+        let trace = TurnTrace::start_in(&trace_dir);
+        let guard = trace.make_current();
+
+        // The D2 fix shape: identity note APPENDED, `prompt_main` still leading.
+        let decorated = format!("{prompt_main}\n\nThe current speaker is Ana.");
+        let ctx = AssistantContext {
+            system_prompt: decorated,
+            max_new_tokens: Some(24),
+            ..AssistantContext::default()
+        };
+        let mut stream =
+            assistant.reply_stream("turn on the kitchen lights", &ctx).await.expect("reply_stream");
+        let mut text = String::new();
+        while let Some(delta) = stream.next().await {
+            text.push_str(&delta.expect("token delta").text);
+        }
+        assert!(!text.trim().is_empty(), "empty reply");
+
+        guard.clear();
+        trace.finish(serde_json::json!({}));
+        let raw = std::fs::read_to_string(trace.path()).expect("read trace file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse trace JSON");
+        let events = parsed["traceEvents"].as_array().expect("traceEvents array");
+
+        // The pinned `F8System` base must be restored on the decorated turn.
+        assert!(
+            events.iter().any(|e| e["name"] == "llm.prompt_cache_prefix_match"
+                && e["args"]["matched_layer"] == "f8_system"),
+            "appended speaker note did NOT restore the pinned F8System base — D2 regression"
+        );
+        // And the turn must not have cold-prefilled for lack of a prefix.
+        assert!(
+            !events.iter().any(|e| e["name"] == "llm.prompt_cache_cold_prefill"
+                && e["args"]["reason"] == "no_prefix_match"),
+            "turn cold-prefilled despite the pinned F8System base — D2 regression"
         );
     }
 

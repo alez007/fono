@@ -4021,34 +4021,7 @@ fn web_settings_hooks(
         })
     });
 
-    let sp = secrets_path.clone();
-    let orch = orchestrator.map(Arc::clone);
-    let wake_secret = wake.clone();
-    let set_secret: fono_net::web_settings::SetSecretFn = Arc::new(move |name, value| {
-        let mut s = Secrets::load(&sp).map_err(|e| format!("load secrets: {e}"))?;
-        if value.is_empty() {
-            s.keys.remove(name);
-        } else {
-            s.insert(name, value);
-        }
-        s.save(&sp).map_err(|e| format!("save secrets: {e}"))?;
-        info!(
-            "web settings: secret {name} {} via browser UI",
-            if value.is_empty() { "cleared" } else { "updated" }
-        );
-        // Background reload so a freshly added key takes effect without a
-        // separate save. Best-effort — the secret itself is already on disk.
-        if let Some(o) = orch.clone() {
-            let wake = wake_secret.clone();
-            tokio::spawn(async move {
-                match o.reload().await {
-                    Ok(_) => wake.reload(),
-                    Err(e) => warn!("web settings: reload after secret change failed: {e:#}"),
-                }
-            });
-        }
-        Ok(())
-    });
+    let set_secret = set_secret_hook(secrets_path.clone(), orchestrator, wake);
 
     let (get_vocabulary, put_vocabulary) = vocabulary_hooks(paths);
     let (list_speakers, rename_speaker, delete_speaker, enroll_speaker, calibrate_speaker) =
@@ -4058,6 +4031,7 @@ fn web_settings_hooks(
     let speak = speech_hook(config_path.clone(), secrets_path.clone(), paths.voices_dir());
     let meta = meta_hook(config_path, secrets_path);
     let doctor = doctor_hook(paths);
+    let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths);
 
     fono_net::WebSettingsHooks {
         get_config,
@@ -4079,7 +4053,274 @@ fn web_settings_hooks(
         calibrate_speaker,
         list_utterances,
         delete_utterance,
+        list_tools,
+        set_tool_enabled,
+        discover_tools,
     }
+}
+
+/// `POST /api/secret/{name}`: store or clear one write-only secret.
+///
+/// Reloads the orchestrator in the background afterwards so a freshly pasted
+/// key takes effect without a second save. Best-effort: the secret is already
+/// on disk by then, so a failed reload costs a restart, never the value.
+fn set_secret_hook(
+    secrets_path: std::path::PathBuf,
+    orchestrator: Option<&Arc<SessionOrchestrator>>,
+    wake: &crate::wake::WakeHandle,
+) -> fono_net::web_settings::SetSecretFn {
+    let orch = orchestrator.map(Arc::clone);
+    let wake_secret = wake.clone();
+    Arc::new(move |name, value| {
+        let sp = &secrets_path;
+        let mut s = Secrets::load(sp).map_err(|e| format!("load secrets: {e}"))?;
+        if value.is_empty() {
+            s.keys.remove(name);
+        } else {
+            s.insert(name, value);
+        }
+        s.save(sp).map_err(|e| format!("save secrets: {e}"))?;
+        info!(
+            "web settings: secret {name} {} via browser UI",
+            if value.is_empty() { "cleared" } else { "updated" }
+        );
+        if let Some(o) = orch.clone() {
+            let wake = wake_secret.clone();
+            tokio::spawn(async move {
+                match o.reload().await {
+                    Ok(_) => wake.reload(),
+                    Err(e) => warn!("web settings: reload after secret change failed: {e:#}"),
+                }
+            });
+        }
+        Ok(())
+    })
+}
+
+/// Tool-catalogue hooks (`/api/tools`).
+///
+/// The store is reopened per call — the same cheap-SQLite-open pattern the
+/// config, vocabulary and speaker hooks use — so a CLI edit and a browser
+/// edit stay coherent without a shared handle.
+///
+/// `list` never touches the network: the page must render instantly from what
+/// the last discovery pass recorded, showing tools that have gone missing
+/// rather than pretending they were never there. Only `discover` reaches out.
+fn tool_catalog_hooks(
+    paths: &Paths,
+) -> (
+    fono_net::web_settings::ListToolsFn,
+    fono_net::web_settings::SetToolEnabledFn,
+    fono_net::web_settings::DiscoverToolsFn,
+) {
+    use fono_core::tool_catalog::ToolCatalogStore;
+
+    let db = paths.tool_catalog_db();
+    let cp = paths.config_file();
+    let list_tools: fono_net::web_settings::ListToolsFn = Arc::new(move || {
+        let cfg = Config::load(&cp).map_err(|e| format!("load config: {e}"))?;
+        let servers: Vec<serde_json::Value> = cfg
+            .assistant
+            .tools
+            .mcp
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "url": s.url,
+                    "auth_token_ref": s.auth_token_ref,
+                })
+            })
+            .collect();
+        let store = ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
+        // The config is the authority on which servers exist. Remove one and
+        // its tools must go with it, otherwise the page lists tools from a
+        // server the user has deleted and nothing can ever clear them.
+        let configured: Vec<String> =
+            cfg.assistant.tools.mcp.iter().map(|s| s.name.clone()).collect();
+        let forgotten = store
+            .forget_sources_except(&configured)
+            .map_err(|e| format!("forget removed servers: {e}"))?;
+        if forgotten > 0 {
+            info!(target: "fono::tools", forgotten, "forgot tools from removed servers");
+        }
+        let tools = store.all_tools().map_err(|e| format!("list tools: {e}"))?;
+        Ok(serde_json::json!({
+            "enabled": cfg.assistant.tools.enabled,
+            "servers": servers,
+            "tools": tools,
+        }))
+    });
+
+    let db = paths.tool_catalog_db();
+    let set_tool_enabled: fono_net::web_settings::SetToolEnabledFn =
+        Arc::new(move |source, name, enabled| {
+            let store =
+                ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
+            store.set_enabled(source, name, enabled).map_err(|e| format!("set tool: {e}"))?;
+            info!(
+                "web settings: tool {source}/{name} {} via browser UI",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            Ok(())
+        });
+
+    let discover_tools = discover_tools_hook(paths);
+    (list_tools, set_tool_enabled, discover_tools)
+}
+
+/// `POST /api/tools/discover`: ask every configured MCP server what it
+/// offers and fold the answers into the catalogue.
+///
+/// Servers are contacted independently and one failure never sinks the pass —
+/// an unreachable server yields an `error` in its summary row while the
+/// others still reconcile. Reconcile never deletes and never resets the
+/// user's choices, so a server that is down simply has its tools marked
+/// unavailable until it returns.
+fn discover_tools_hook(paths: &Paths) -> fono_net::web_settings::DiscoverToolsFn {
+    use fono_core::tool_catalog::ToolCatalogStore;
+
+    let db = paths.tool_catalog_db();
+    let config_path = paths.config_file();
+    let secrets_path = paths.secrets_file();
+    Arc::new(move |probe| {
+        let db = db.clone();
+        let config_path = config_path.clone();
+        let secrets_path = secrets_path.clone();
+        Box::pin(async move {
+            let secrets = Secrets::load(&secrets_path).unwrap_or_default();
+
+            // Probe mode: try one server the user has typed but not saved.
+            // Nothing is written, so a wrong address cannot leave debris in
+            // the catalogue — the whole point of testing before committing.
+            if let Some(spec) = probe {
+                let server = fono_core::config::McpClientServer {
+                    name: spec.get("name").and_then(|v| v.as_str()).unwrap_or("server").to_owned(),
+                    url: spec.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    auth_token_ref: spec
+                        .get("auth_token_ref")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                };
+                let found = ask_server(&server, &secrets).await?;
+                return Ok(serde_json::json!({
+                    "probe": true,
+                    "server_name": found.server.name,
+                    "server_version": found.server.version,
+                    "count": found.tools.len(),
+                    "tools": found.tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                }));
+            }
+
+            let cfg = Config::load(&config_path).map_err(|e| format!("load config: {e}"))?;
+            if cfg.assistant.tools.mcp.is_empty() {
+                return Err("no MCP servers configured — add one first".to_string());
+            }
+
+            let mut summaries = Vec::new();
+            for server in &cfg.assistant.tools.mcp {
+                let found = match ask_server(server, &secrets).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("tool discovery: {} unreachable: {e}", server.name);
+                        summaries.push(serde_json::json!({ "server": server.name, "error": e }));
+                        continue;
+                    }
+                };
+                let tools = classify_all(&found);
+                let store =
+                    ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
+                let report = store
+                    .reconcile(&server.name, "sse", &tools)
+                    .map_err(|e| format!("reconcile {}: {e}", server.name))?;
+                // Remember the rooms too. Without them the model invents a
+                // name — asked in Romanian it sends "bucătărie" to a house
+                // whose rooms are all in English, and nothing happens.
+                if let Err(e) = store.set_place_names(&server.name, &found.places) {
+                    warn!("tool discovery: cannot store room names for {}: {e}", server.name);
+                }
+                // And the device names. The home only matches a name exactly,
+                // so a lamp called "Office outdoor light" cannot be found by
+                // asking for "outdoor light" or "outdoor office light".
+                if let Err(e) = store.set_device_names(&server.name, &found.devices) {
+                    warn!("tool discovery: cannot store device names for {}: {e}", server.name);
+                }
+                info!(
+                    "tool discovery: {} reported {} tool(s) ({} new, {} changed, {} missing)",
+                    server.name,
+                    tools.len(),
+                    report.added.len(),
+                    report.schema_changed.len(),
+                    report.went_missing.len(),
+                );
+                summaries.push(serde_json::json!({
+                    "server": server.name,
+                    "server_name": found.server.name,
+                    "server_version": found.server.version,
+                    "count": tools.len(),
+                    "report": report,
+                }));
+            }
+            // Connecting a server is the user saying they want it used. A
+            // separate master switch that silently stays off would leave
+            // them with a configured server that does nothing and no clue
+            // why, so a successful connection turns the feature on.
+            if summaries.iter().any(|s| s.get("error").is_none()) && !cfg.assistant.tools.enabled {
+                let mut cfg = cfg;
+                cfg.assistant.tools.enabled = true;
+                if let Err(e) = cfg.save(&config_path) {
+                    warn!("tool discovery: could not switch tool use on: {e}");
+                }
+            }
+            Ok(serde_json::json!({ "servers": summaries }))
+        })
+    })
+}
+
+/// Ask one server what it offers. Errors are strings because they are shown
+/// to the user in the browser, not logged and swallowed.
+async fn ask_server(
+    server: &fono_core::config::McpClientServer,
+    secrets: &Secrets,
+) -> std::result::Result<fono_assistant::mcp_client::Discovery, String> {
+    use fono_assistant::mcp_client::{discover, McpEndpoint};
+
+    let key = server.token_ref();
+    let token = secrets.keys.get(&key).cloned();
+    if token.is_none() && !key.is_empty() {
+        // Not fatal: plenty of MCP servers need no auth. The attempt will
+        // fail with the server's own 401 if this one does, which is a
+        // better message than a guess.
+        info!("tool discovery: no secret named {key}; trying {} unauthenticated", server.name);
+    }
+    let ep =
+        McpEndpoint { url: server.sse_url(), token, timeout: std::time::Duration::from_secs(20) };
+    discover(&ep).await.map_err(|e| format!("{e:#}"))
+}
+
+fn classify_all(
+    found: &fono_assistant::mcp_client::Discovery,
+) -> Vec<fono_core::tool_catalog::DiscoveredTool> {
+    use fono_core::tool_catalog::{classify, pick_readback_tool, DiscoveredTool};
+
+    let names: Vec<String> = found.tools.iter().map(|t| t.name.clone()).collect();
+    let readback = pick_readback_tool(&names);
+    found
+        .tools
+        .iter()
+        .map(|t| {
+            let (capability, verify_class, readback_tool) = classify(&t.name, readback.as_deref());
+            DiscoveredTool {
+                description: t.description.clone(),
+                name: t.name.clone(),
+                schema: t.schema.clone(),
+                capability,
+                verify_class,
+                readback_tool,
+            }
+        })
+        .collect()
 }
 
 /// OpenAI-compatible `POST /v1/audio/speech` handler for the settings server.
@@ -4283,13 +4524,22 @@ fn meta_hook(
         }
         names.remove("");
         let secrets = Secrets::load(&secrets_path).unwrap_or_default();
-        let statuses: serde_json::Map<String, serde_json::Value> = names
-            .into_iter()
-            .map(|n| (n.to_string(), serde_json::Value::Bool(secrets.has_in_file(n))))
-            .collect();
         // Inbound-auth toggle state so the UI can render the on/off switch
         // and warn when a server is exposed with auth off.
         let cfg = Config::load(&config_path).unwrap_or_default();
+        let mut statuses: serde_json::Map<String, serde_json::Value> = names
+            .into_iter()
+            .map(|n| (n.to_string(), serde_json::Value::Bool(secrets.has_in_file(n))))
+            .collect();
+        // Tool-server tokens are named by the user, not drawn from the
+        // provider catalogue, so they have to be added explicitly — otherwise
+        // the page reports a token that is present as "not set".
+        for s in &cfg.assistant.tools.mcp {
+            let key = s.token_ref();
+            if !key.is_empty() {
+                statuses.insert(key.clone(), serde_json::Value::Bool(secrets.has_in_file(&key)));
+            }
+        }
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "config_path": config_path.display().to_string(),
@@ -5429,6 +5679,100 @@ fn snapshot_discovered(registry: &fono_net::discovery::Registry) -> Vec<fono_ipc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end against a real MCP server: discover, classify, store, and
+    /// prove the user's choice survives a second pass. Exercises the glue the
+    /// unit tests cannot — config lookup, secret lookup, and reconcile —
+    /// which is where a wiring mistake would actually hide.
+    ///
+    /// Set `FONO_TEST_MCP_URL` and, if the server wants one,
+    /// `FONO_TEST_MCP_TOKEN`.
+    #[tokio::test]
+    #[ignore = "needs a reachable MCP server"]
+    async fn discovers_and_remembers_against_a_real_server() {
+        let Ok(url) = std::env::var("FONO_TEST_MCP_URL") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let paths = Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+        };
+        for d in [&paths.config_dir, &paths.data_dir, &paths.cache_dir, &paths.state_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.assistant.tools.enabled = true;
+        cfg.assistant.tools.mcp = vec![fono_core::config::McpClientServer {
+            name: "home".into(),
+            url,
+            auth_token_ref: "HOMEASSISTANT_TOKEN".into(),
+        }];
+        cfg.save(&paths.config_file()).unwrap();
+        if let Ok(tok) = std::env::var("FONO_TEST_MCP_TOKEN") {
+            let mut s = Secrets::default();
+            s.insert("HOMEASSISTANT_TOKEN", &tok);
+            s.save(&paths.secrets_file()).unwrap();
+        }
+
+        let (list, set_enabled, discover) = tool_catalog_hooks(&paths);
+
+        // Probe mode first: a server can be tried before it is saved, and a
+        // probe must never leave anything behind. This is the "Test" button.
+        let probe = discover(Some(serde_json::json!({
+            "name": "unsaved",
+            "url": std::env::var("FONO_TEST_MCP_URL").unwrap(),
+            "auth_token_ref": "HOMEASSISTANT_TOKEN",
+        })))
+        .await
+        .expect("probe failed");
+        assert_eq!(probe["probe"], true);
+        assert!(probe["count"].as_u64().unwrap() > 0);
+        assert!(
+            list().unwrap()["tools"].as_array().unwrap().is_empty(),
+            "probe wrote to the store"
+        );
+
+        let summary = discover(None).await.expect("discovery failed");
+        eprintln!("{}", serde_json::to_string_pretty(&summary).unwrap());
+
+        let listed = list().expect("list failed");
+        let tools = listed["tools"].as_array().unwrap();
+        assert!(!tools.is_empty(), "nothing was stored");
+        let find = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap_or_else(|| panic!("{n} not stored"))
+                .clone()
+        };
+
+        // Everything arrives switched on — the user deselects, never selects.
+        assert!(tools.iter().all(|t| t["enabled"] == true));
+        assert!(tools.iter().all(|t| t["available"] == true));
+
+        // Turning a light on is provable by re-reading the house.
+        let on = find("HassTurnOn");
+        assert_eq!(on["verify_class"], "post_condition");
+        assert_eq!(on["readback_tool"], "GetLiveContext");
+
+        // Deselect one, discover again: the choice must survive a pass that
+        // re-reports the tool as present and unchanged.
+        set_enabled("home", "HassTurnOn", false).unwrap();
+        discover(None).await.expect("second discovery failed");
+        let listed = list().unwrap();
+        let on = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "HassTurnOn")
+            .unwrap()
+            .clone();
+        assert_eq!(on["enabled"], false, "rediscovery re-enabled a tool the user switched off");
+        assert_eq!(on["available"], true);
+    }
 
     #[test]
     fn prettify_wake_phrase_title_cases_underscored_ids() {

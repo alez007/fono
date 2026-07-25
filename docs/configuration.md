@@ -34,6 +34,7 @@ field-level rustdoc comments. The user-facing sections are:
 | `[stt]` | Speech-to-text backend selection + per-backend config | [providers.md](providers.md) |
 | `[polish]` | Cleanup-pass backend selection + behaviour | [providers.md](providers.md) |
 | `[assistant]` | Voice-assistant chat backend + capability flags | [providers.md](providers.md) |
+| `[assistant.tools]` | Voice-controlled devices via MCP servers (Home Assistant, …) | below |
 | `[tts]` | Text-to-speech for the assistant | [providers.md](providers.md) |
 | `[interactive]` | Streaming-pipeline tuning (live mode) | [interactive.md](interactive.md) |
 | `[inject]` | Injection backend override and clipboard safety net | [inject.md](inject.md) |
@@ -359,6 +360,63 @@ min_speech_secs = 3.0       # speech gathered (wake phrase + command) before a
 > authentication** — voiceprints can be defeated by cloning or replay, so
 > never gate a fail-deadly action on the voice channel alone. Voiceprints
 > live in `speakers.sqlite` (mode `0600`) and never leave the machine.
+
+### Voice-controlled devices (`[assistant.tools]`)
+
+Off by default. When switched on, Fono asks each configured MCP server
+what it can do, remembers the answer, and offers the enabled tools to
+the assistant so a spoken command can actually switch something. Add
+servers in the browser under **Settings → Tools & actions** (see
+[below](#settings-in-the-browser)) — pressing **Save & connect** there
+sets `enabled = true` for you.
+
+```toml
+[assistant.tools]
+enabled = true              # off by default; offers no tools to the model
+place_names = true          # tell the model the real room names (see below)
+
+[[assistant.tools.mcp]]
+name = "Home Assistant"     # also names the token: HOME_ASSISTANT_TOKEN
+url = "http://homeassistant.local:8123"   # /mcp_server/sse is appended if absent
+# auth_token_ref = "MY_OWN_TOKEN"         # only to override the derived name
+```
+
+The bearer token is stored by name in `secrets.toml`, never in this
+file. The name is derived from the server's, so `Home Assistant` looks
+up `HOME_ASSISTANT_TOKEN`; set it with `fono keys add HOME_ASSISTANT_TOKEN`
+or via the web UI.
+
+**Which tools are allowed is stored per tool, not in this file.** Every
+tool starts enabled; deselect the ones you never want used in **Settings
+→ Tools & actions**. That choice survives the server going offline or
+restarting, and a shorter list is both faster and more accurate — the
+model picks the wrong device less often when it is not sifting dozens of
+irrelevant ones. Removing a server forgets its tools entirely.
+
+`place_names` tells the assistant what the rooms are actually called.
+Without it the model invents a name: asked in Romanian it sends
+`bucătărie` to a house whose areas are all English, Home Assistant
+matches nothing, and the lights do not move. The list costs roughly
+thirty tokens and is fetched when a server is connected, never while you
+are waiting for a command. It also picks up any alternative names you
+have given a room. Leave it on unless you are measuring the difference —
+switching it off breaks commands in any language your rooms are not
+named in. It is deliberately file-only, with no checkbox in the web UI.
+
+**Not every assistant backend can act.** Only the OpenAI-compatible
+chat backends (`openai`, `ollama`, and anything else speaking that wire
+format) can invoke tools today; the embedded local model and the
+Anthropic backend cannot. Rather than let a backend that cannot act
+reply "I'll turn the light on" while nothing happens, Fono withholds the
+tools from it and tells the model plainly that it is unable to act, so
+it says so. Switch `[assistant] backend` to an OpenAI-compatible one to
+control devices.
+
+> Fono only claims an action is **done** when it can check. Home
+> Assistant answers cheerfully even when a command matched nothing, so
+> Fono reads what was actually switched; a command that touched nothing
+> is reported as not having worked. For a tool whose effect cannot be
+> observed — sending a message, say — it says only that it was *sent*.
 
 ### MCP voice-tool relevance filter
 

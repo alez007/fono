@@ -90,7 +90,13 @@ pub enum ToolEvent {
     /// The tool returned a result. `summary` is a short, prose
     /// description suitable for storing in history; the actual
     /// payload (image bytes, etc.) is _not_ retained.
-    Result { tool_call_id: String, summary: String },
+    ///
+    /// `failed` is the executor's own verdict, carried here rather than
+    /// re-derived from `summary`. Guessing it back out of the prose was a
+    /// real bug: a Home Assistant result that succeeded ends with
+    /// `"failed": []`, and keyword matching duly logged the turn as a
+    /// failure. Only the party that ran the tool knows how it went.
+    Result { tool_call_id: String, summary: String, failed: bool },
 }
 
 /// Synchronous screen-capture callback type. The closure runs the
@@ -99,6 +105,51 @@ pub enum ToolEvent {
 /// Wrapped in [`Arc`] so it can be cheaply cloned into spawned tasks.
 pub type ScreenCaptureFn =
     Arc<dyn Fn(CaptureMode) -> Result<CapturedImage, CaptureError> + Send + Sync>;
+
+/// Runs one tool call the model asked for, and reports back in prose.
+///
+/// Returns a summary rather than a `Result` on purpose. A tool that
+/// failed is not an error in the turn — it is *the news*, and the user
+/// must hear it. Bubbling it up as `Err` would abort the reply and leave
+/// them wondering whether the light came on. The executor is also the
+/// only party that can word the outcome honestly, because it is the one
+/// that knows whether the effect could be checked afterwards — and for
+/// the same reason it is the only party that can say whether it failed,
+/// which is why the verdict travels alongside the prose.
+pub type ToolExecFn =
+    Arc<dyn Fn(ToolCall) -> futures::future::BoxFuture<'static, ToolOutcome> + Send + Sync>;
+
+/// What running one tool came to: what to tell the model, and whether it
+/// worked. `failed` means "something demonstrably went wrong" — never
+/// "we checked and it was fine", which for many tools is unknowable.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    pub summary: String,
+    pub failed: bool,
+}
+
+/// The tools Fono may let the model invoke this turn, and how to run
+/// them. Built from the user's tool catalogue; absent when they have no
+/// servers configured or have switched the feature off.
+#[derive(Clone)]
+pub struct ActionTools {
+    /// OpenAI-style function descriptors, already filtered to the tools
+    /// the user left switched on.
+    pub descriptors: Vec<serde_json::Value>,
+    pub execute: ToolExecFn,
+    /// A line to append to the system prompt naming the real rooms, so the
+    /// model picks one instead of translating and inventing. `None` when
+    /// nothing is known or the user switched it off.
+    pub hint: Option<String>,
+}
+
+impl std::fmt::Debug for ActionTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionTools")
+            .field("descriptors", &self.descriptors.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Per-turn context passed to [`Assistant::reply_stream`]. The history
 /// is a snapshot taken by the caller *before* it pushed the new user
@@ -118,6 +169,10 @@ pub struct AssistantContext {
     /// `fono_screen` to capture the screen during a voice turn.
     /// Set from the F8 voice loop when a `GrabberProbe` is available.
     pub screen_capture: Option<ScreenCaptureFn>,
+    /// When `Some`, the model may also invoke the user's own tools —
+    /// smart-home commands and the like. Set only on turns Fono is
+    /// willing to act on.
+    pub actions: Option<Arc<ActionTools>>,
     /// When `true` (and [`screen_capture`] is `Some`), include the
     /// `fono_screen` tool descriptor in every request. Users opt in
     /// with `[assistant].prefer_vision = true`.
@@ -145,6 +200,7 @@ impl std::fmt::Debug for AssistantContext {
             .field("history", &self.history)
             .field("active_window_context", &self.active_window_context)
             .field("screen_capture", &self.screen_capture.is_some())
+            .field("actions", &self.actions)
             .field("prefer_vision", &self.prefer_vision)
             .field("max_new_tokens", &self.max_new_tokens)
             .field("allow_brain_capture", &self.allow_brain_capture)
@@ -166,6 +222,19 @@ pub trait Assistant: Send + Sync {
 
     /// Backend identifier for history / logging.
     fn name(&self) -> &'static str;
+
+    /// Whether this backend can actually invoke [`AssistantContext::actions`].
+    ///
+    /// The default is `false`, and deliberately so: a backend that ignores
+    /// the field still produces a perfectly fluent reply, so the model
+    /// cheerfully promises to switch the lights on and nothing happens. That
+    /// is the worst failure available to us — from where the user is
+    /// standing it is indistinguishable from success. Opting in is therefore
+    /// explicit, and a backend that has not opted in is told plainly that it
+    /// cannot act, so it says so instead of promising.
+    fn can_run_actions(&self) -> bool {
+        false
+    }
 
     /// Optional best-effort warmup. Cloud backends should fire a cheap
     /// HEAD/GET; local backends should mmap their model. Failures are

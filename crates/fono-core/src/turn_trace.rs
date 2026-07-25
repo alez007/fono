@@ -57,6 +57,7 @@ static TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// | `splitter`      | sentence splitting between LLM and TTS (`splitter.*`)  |
 /// | `tts`           | text-to-speech synthesis                               |
 /// | `playback`      | audio playback at the device (`playback.*`)            |
+/// | `playback-wait` | the orchestrator waiting for playback to finish        |
 /// | `cache`         | prompt-state (KV) cache decisions for both F7 and F8   |
 /// | `warmup`        | startup prewarm (startup trace file only)              |
 /// | `assistant-pump`| turn lifecycle (`turn.start` / `turn.finish`)          |
@@ -73,6 +74,16 @@ pub const CAPTURE_LANE: &str = "capture";
 pub const TTS_LANE: &str = "tts";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
 pub const PLAYBACK_LANE: &str = "playback";
+/// Where the orchestrator's wait-for-audio-to-finish span goes.
+///
+/// It cannot share [`PLAYBACK_LANE`] with the player's own spans even though it
+/// is about the same audio: the two start within microseconds of each other and
+/// the wait outlives the last clip by a few tens of milliseconds, so they
+/// *partially* overlap. Complete slices on one track have to nest strictly, and
+/// Perfetto drops one of any pair that does not — which is how the drain span
+/// went missing from a real trace. A lane of its own keeps both visible.
+/// See [`KEYS_LANE`] for the full lane taxonomy.
+pub const PLAYBACK_WAIT_LANE: &str = "playback-wait";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
 pub const STT_LANE: &str = "stt";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
@@ -107,6 +118,7 @@ const LANE_ORDER: &[&str] = &[
     SPLITTER_LANE,
     TTS_LANE,
     PLAYBACK_LANE,
+    PLAYBACK_WAIT_LANE,
     CACHE_LANE,
     WARMUP_LANE,
     PUMP_LANE,

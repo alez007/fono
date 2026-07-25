@@ -219,6 +219,45 @@ fn assistant_cache_warmup(config: &Config) -> AssistantPromptCacheWarmup {
     }
 }
 
+/// Compose the live F8 system prompt: the configured `prompt_main`, plus
+/// the room names when the user has tools, plus a one-line speaker identity
+/// note when voice verification matched.
+///
+/// **`prompt_main` must stay leading.** The prompt-state cache pins the
+/// `F8System` layer as `assistant_base_prefix(prompt_main)`, built from bare
+/// `prompt_main` at startup by [`assistant_cache_warmup`]. That checkpoint is
+/// restorable only while it remains a genuine token prefix of the live prompt,
+/// so any per-turn decoration has to be appended, never prepended. Prepending
+/// the identity note diverged at roughly token one and cold-prefilled the whole
+/// system block on every speaker-matched turn. The F7 polish path composes its
+/// per-app context the same way, onto the end of the polish base.
+///
+/// Order among the appended parts matters for the same reason: the room
+/// names change only when the house does, the speaker changes every turn,
+/// so the steadier one goes first and stays cacheable for longer.
+pub(crate) fn assistant_system_prompt(
+    prompt_main: &str,
+    rooms: Option<&str>,
+    speaker: Option<&str>,
+) -> String {
+    // Nothing to add: leave the prompt byte-identical to what the cache
+    // pinned, trailing whitespace and all.
+    if rooms.is_none() && speaker.is_none() {
+        return prompt_main.to_string();
+    }
+    let mut out = prompt_main.trim_end().to_string();
+    if let Some(rooms) = rooms {
+        out.push_str("\n\n");
+        out.push_str(rooms);
+    }
+    if let Some(name) = speaker {
+        out.push_str("\n\nThe current speaker is ");
+        out.push_str(name);
+        out.push('.');
+    }
+    out
+}
+
 fn f7_polish_prompt_for_cache(config: &Config) -> String {
     let mut prompt = config.polish.prompt.main.trim().to_string();
     let advanced = config.polish.prompt.advanced.trim();
@@ -3257,11 +3296,31 @@ impl SessionOrchestrator {
             }
         }
         // Option 1 (speaker verification): when the voice matched an enrolled
-        // speaker, tell the assistant who it is talking to by prepending a
-        // one-line identity note to the system prompt. No-op when unmatched.
-        let system_prompt = assistant_speaker.as_deref().map_or_else(
-            || cfg.assistant.prompt_main.clone(),
-            |name| format!("The current speaker is {name}.\n\n{}", cfg.assistant.prompt_main),
+        // speaker, tell the assistant who it is talking to with a one-line
+        // identity note. No-op when unmatched.
+        //
+        // The note is APPENDED, never prepended. The prompt-state cache pins
+        // `F8System` as `assistant_base_prefix(prompt_main)` (built at startup
+        // from bare `prompt_main`, see `assistant_cache_warmup`), and
+        // `find_longest_prefix` restores it only when it is a genuine token
+        // prefix of the live prompt. Prepending pushed the divergence to
+        // roughly token one, so every speaker-matched turn cold-prefilled the
+        // whole system block. Appending keeps `prompt_main` leading, which is
+        // also how F7 composes its per-app context onto the polish base.
+        // The user's own tools, when they have any switched on. Built from
+        // data already on disk, so this costs no network — including the
+        // room names, which have to be in hand *before* the prompt is
+        // composed and so cannot be fetched now.
+        let actions = self.paths.as_ref().and_then(|p| crate::actions::build(&cfg, p));
+        // Not every backend can invoke them. One that cannot does not error —
+        // it answers fluently, having ignored the tools, and promises to
+        // switch the light on. So the tools are withheld and the model told.
+        let (actions, tools_note) =
+            crate::actions::for_backend(actions, assistant.can_run_actions(), assistant.name());
+        let system_prompt = assistant_system_prompt(
+            &cfg.assistant.prompt_main,
+            tools_note.as_deref(),
+            assistant_speaker.as_deref(),
         );
         let inputs = AssistantTurnInputs {
             pcm,
@@ -3281,6 +3340,7 @@ impl SessionOrchestrator {
             pre_transcribed,
             prefer_vision,
             screen_capture_fn,
+            actions,
             active_window_context,
         };
         let state_for_task = self.assistant_session.clone();
@@ -5929,6 +5989,42 @@ mod tests {
         assert_eq!(lang_for(&c).as_deref(), Some("ro"));
         c.general.languages = vec!["en".into(), "ro".into()];
         assert!(lang_for(&c).is_none());
+    }
+
+    #[test]
+    fn speaker_note_is_appended_so_prompt_main_stays_a_prefix() {
+        let main = "You are Fono, a helpful voice assistant.";
+
+        // No decoration at all: the live prompt is exactly what the cache pins.
+        assert_eq!(assistant_system_prompt(main, None, None), main);
+
+        // With a speaker, `prompt_main` must still lead, or the pinned
+        // `F8System` checkpoint stops being a token prefix and every
+        // speaker-matched turn cold-prefills the whole system block.
+        let decorated = assistant_system_prompt(main, None, Some("Bogdan"));
+        assert!(
+            decorated.starts_with(main),
+            "speaker note must be appended, never prepended: {decorated:?}"
+        );
+        assert!(decorated.contains("The current speaker is Bogdan."));
+
+        // Trailing whitespace in `prompt_main` must not produce a double
+        // blank line, but the prefix relationship still has to hold on the
+        // trimmed base that the warmup path pins.
+        let padded = assistant_system_prompt("Be brief.\n\n", None, Some("Ana"));
+        assert_eq!(padded, "Be brief.\n\nThe current speaker is Ana.");
+
+        // Room names are appended too, and ahead of the speaker note: they
+        // change only when the house does, so putting them first keeps the
+        // longest possible run of the prompt identical between turns.
+        let both = assistant_system_prompt(main, Some("Rooms: Kitchen."), Some("Ana"));
+        assert!(both.starts_with(main), "{both:?}");
+        assert!(
+            both.find("Rooms: Kitchen.") < both.find("The current speaker"),
+            "the steadier part must come first: {both:?}"
+        );
+        // And with rooms alone, the base still leads.
+        assert!(assistant_system_prompt(main, Some("Rooms: Kitchen."), None).starts_with(main));
     }
 
     #[test]

@@ -175,6 +175,9 @@ pub struct AssistantTurnInputs {
     /// `GrabberProbe` in the F8 voice loop when `prefer_vision` is
     /// true and the backend is vision-capable.
     pub screen_capture_fn: Option<ScreenCaptureFn>,
+    /// The user's own tools this turn may invoke, when they have any
+    /// switched on. `None` leaves the turn conversation-only.
+    pub actions: Option<std::sync::Arc<fono_assistant::ActionTools>>,
     /// Runtime-only active-window context captured at assistant hotkey press.
     /// Local backends can cache this independently from stable system prompts.
     pub active_window_context: Option<String>,
@@ -260,6 +263,7 @@ pub async fn run_assistant_turn(
         pre_transcribed,
         prefer_vision,
         screen_capture_fn,
+        actions,
         active_window_context,
     } = inputs;
 
@@ -496,6 +500,7 @@ pub async fn run_assistant_turn(
         history: history_snapshot,
         active_window_context,
         screen_capture: screen_capture_fn,
+        actions,
         prefer_vision,
         max_new_tokens: None,
         // Local hotkey-triggered turn: this is the one the on-screen
@@ -772,20 +777,37 @@ pub async fn run_assistant_turn(
         // client follows up with the real prose reply on the same
         // stream.
         if let Some(event) = delta.tool_event {
+            // Logged field by field, and the summary as plain text. Debugging
+            // the whole event ran `Debug` over a string that already held JSON,
+            // so every quote in a real Home Assistant answer came back escaped
+            // and the one line that explains what the house did was the hardest
+            // thing in the log to read.
             match &event {
                 ToolEvent::Called(call) => {
+                    debug!(
+                        target: "fono::assistant",
+                        tool = %call.name,
+                        args = %call.arguments,
+                        "tool call recorded for history"
+                    );
                     tool_started
                         .insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
                 }
-                ToolEvent::Result { tool_call_id, summary } => {
+                ToolEvent::Result { tool_call_id, summary, failed } => {
                     if let Some((name, started_at)) = tool_started.remove(tool_call_id) {
                         let exec_ms = started_at.elapsed().as_millis() as u64;
-                        let outcome = classify_tool_outcome(summary);
+                        let outcome = classify_tool_outcome(summary, *failed);
                         metrics.tools.push(AssistantToolMetric { name, exec_ms, outcome });
                     }
+                    debug!(
+                        target: "fono::assistant",
+                        call_id = %tool_call_id,
+                        failed = *failed,
+                        summary = %summary,
+                        "tool result recorded for history"
+                    );
                 }
             }
-            debug!(target: "fono::assistant", ?event, "tool event recorded for history");
             tool_event_log.push(event);
             continue;
         }
@@ -920,7 +942,7 @@ pub async fn run_assistant_turn(
                 ToolEvent::Called(call) => {
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                 }
-                ToolEvent::Result { tool_call_id, summary } => {
+                ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -995,12 +1017,14 @@ pub async fn run_assistant_turn(
         }
         // Always record the drain span (zero-width when playback was already
         // idle) so the post-TTS tail between last audio and turn end is never
-        // unexplained whitespace on the timeline.
+        // unexplained whitespace on the timeline. It goes on its own lane
+        // because it only partly overlaps the player's own span, and partly
+        // overlapping slices on one lane cannot both be drawn.
         if let Some(t) = &trace {
             t.duration_between(
                 "playback.drain",
                 "assistant.playback",
-                fono_core::turn_trace::PLAYBACK_LANE,
+                fono_core::turn_trace::PLAYBACK_WAIT_LANE,
                 drain_started,
                 std::time::Instant::now(),
                 json!({ "reason": drain_reason }),
@@ -1118,10 +1142,10 @@ async fn drive_text_only_reply(
                     tool_started
                         .insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
                 }
-                ToolEvent::Result { tool_call_id, summary } => {
+                ToolEvent::Result { tool_call_id, summary, failed } => {
                     if let Some((name, started_at)) = tool_started.remove(tool_call_id) {
                         let exec_ms = started_at.elapsed().as_millis() as u64;
-                        let outcome = classify_tool_outcome(summary);
+                        let outcome = classify_tool_outcome(summary, *failed);
                         metrics.tools.push(AssistantToolMetric { name, exec_ms, outcome });
                     }
                 }
@@ -1158,7 +1182,7 @@ async fn drive_text_only_reply(
                 ToolEvent::Called(call) => {
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                 }
-                ToolEvent::Result { tool_call_id, summary } => {
+                ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -1881,6 +1905,9 @@ pub async fn run_realtime_turn(
         history: history_snapshot,
         active_window_context,
         screen_capture: screen_capture_fn,
+        // The realtime backend speaks its own protocol; user tools ride
+        // the chat path only.
+        actions: None,
         prefer_vision,
         max_new_tokens: None,
         // Local hotkey-triggered turn: this is the one the on-screen
@@ -2162,6 +2189,7 @@ pub async fn run_live_session(
         history: history_snapshot,
         active_window_context,
         screen_capture: None,
+        actions: None,
         prefer_vision: false,
         max_new_tokens: None,
         // Local hotkey-triggered turn: this is the one the on-screen
@@ -2826,13 +2854,21 @@ fn truncate(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{cut}…"))
 }
 
-/// Map a `ToolEvent::Result.summary` string back to a typed
-/// [`AssistantToolOutcome`] for the `assistant:` summary line. The
-/// classifier is conservative: it only recognises the canned phrases
-/// emitted by the assistant client's tool-dispatch helper; any other
-/// summary (including the success case `"Captured 954x564 PNG…"`)
-/// falls through to [`AssistantToolOutcome::Ok`].
-fn classify_tool_outcome(summary: &str) -> AssistantToolOutcome {
+/// Map a `ToolEvent::Result` to a typed [`AssistantToolOutcome`] for the
+/// `assistant:` summary line.
+///
+/// `failed` is the executor's own verdict and settles the question on its
+/// own. The prose is consulted only to tell the *kinds* of screen-capture
+/// failure apart, because that tool reports its reason in words.
+///
+/// Reading the verdict out of the prose is exactly the bug this argument
+/// exists to prevent: a Home Assistant call that worked returns a payload
+/// ending in `"failed": []`, which keyword matching logged as a failure —
+/// telling the user their light had not come on while it visibly had.
+fn classify_tool_outcome(summary: &str, failed: bool) -> AssistantToolOutcome {
+    if !failed {
+        return AssistantToolOutcome::Ok;
+    }
     let lower = summary.to_ascii_lowercase();
     if lower.contains("private window") {
         AssistantToolOutcome::Private
@@ -2840,12 +2876,8 @@ fn classify_tool_outcome(summary: &str) -> AssistantToolOutcome {
         AssistantToolOutcome::Cancelled
     } else if lower.contains("no capture tool") || lower.contains("no-tool") {
         AssistantToolOutcome::NoTool
-    } else if lower.starts_with("captured ") || lower.contains("png of") {
-        AssistantToolOutcome::Ok
-    } else if lower.contains("failed") || lower.contains("error") {
-        AssistantToolOutcome::Failed
     } else {
-        AssistantToolOutcome::Ok
+        AssistantToolOutcome::Failed
     }
 }
 
@@ -2863,7 +2895,21 @@ fn notify_triggered(_notify: &Arc<Notify>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_json_message, read_dwell, truncate};
+    use super::{classify_tool_outcome, extract_json_message, read_dwell, truncate};
+    use crate::session::AssistantToolOutcome;
+
+    /// The reported outcome comes from the executor, never from reading the
+    /// words. A real Home Assistant success ends in `"failed": []`, and
+    /// matching on that text logged a light that had visibly come on as
+    /// `[HassTurnOn failed]`.
+    #[test]
+    fn a_success_that_mentions_failure_is_still_a_success() {
+        let worked = r#"{"data": {"success": [{"name": "Hall lamp"}], "failed": []}}"#;
+        assert_eq!(classify_tool_outcome(worked, false), AssistantToolOutcome::Ok);
+        assert_eq!(classify_tool_outcome("cancelled by the user", false), AssistantToolOutcome::Ok);
+        // And the executor's verdict is equally decisive the other way.
+        assert_eq!(classify_tool_outcome("Done.", true), AssistantToolOutcome::Failed);
+    }
 
     #[test]
     fn read_dwell_floors_short_replies() {

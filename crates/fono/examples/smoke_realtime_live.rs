@@ -156,6 +156,7 @@ mod realtime_live {
             history: ConversationHistory::default().snapshot(),
             active_window_context: None,
             screen_capture: None,
+            actions: None,
             prefer_vision: false,
             max_new_tokens: None,
             allow_brain_capture: false,

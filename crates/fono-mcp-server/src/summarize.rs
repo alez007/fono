@@ -377,6 +377,7 @@ async fn summarize_with_timeouts(
         history: Vec::new(),
         active_window_context: None,
         screen_capture: None,
+        actions: None,
         prefer_vision: false,
         max_new_tokens: Some(SUMMARY_MAX_NEW_TOKENS),
         // Background summarize (may arrive via MCP): never light the overlay.
@@ -680,6 +681,7 @@ mod tests {
                 TokenDelta::tool(ToolEvent::Result {
                     tool_call_id: "t1".into(),
                     summary: "ignored".into(),
+                    failed: false,
                 }),
                 TokenDelta::text("a deployment failure.".into()),
             ],

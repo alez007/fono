@@ -16,7 +16,7 @@ pub mod factory;
 pub mod history;
 pub mod traits;
 
-#[cfg(any(feature = "openai-compat", feature = "anthropic"))]
+#[cfg(any(feature = "openai-compat", feature = "anthropic", feature = "mcp-client"))]
 mod sse;
 
 #[cfg(feature = "anthropic")]
@@ -25,6 +25,10 @@ pub mod anthropic_chat;
 pub mod gemini_live;
 #[cfg(feature = "llama-local")]
 pub mod llama_local;
+#[cfg(feature = "llama-local")]
+pub mod local_tools;
+#[cfg(feature = "mcp-client")]
+pub mod mcp_client;
 #[cfg(feature = "openai-compat")]
 pub mod openai_compat_chat;
 
@@ -37,7 +41,7 @@ pub use factory::{
 pub use gemini_live::GeminiLive;
 pub use history::{ChatRole, ChatTurn, ConversationHistory, ToolCall};
 pub use traits::{
-    Assistant, AssistantCacheTrigger, AssistantContext, AssistantPromptCacheSnapshot,
+    ActionTools, Assistant, AssistantCacheTrigger, AssistantContext, AssistantPromptCacheSnapshot,
     AssistantPromptCacheWarmup, RealtimeAssistant, RealtimeEvent, RealtimeMode, RealtimeSession,
-    ScreenCaptureFn, TokenDelta, ToolEvent,
+    ScreenCaptureFn, TokenDelta, ToolEvent, ToolExecFn, ToolOutcome,
 };

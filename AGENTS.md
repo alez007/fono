@@ -133,19 +133,27 @@ section is the durable backup in case the skill is unavailable.
 
 ## Hard rules for agent sessions
 
+- **Always run builds and tests under `nice -n 10`.** Every `cargo`
+  invocation (`build`, `check`, `clippy`, `test`, `run`) and every
+  `./tests/check.sh` run must be prefixed with `nice -n 10 …`, so a long
+  compile or a CPU-bound model test never starves the interactive
+  desktop. This covers both gates below and every ad-hoc build in a
+  session. No exceptions.
+
 - **Pre-commit gate (run, in order, before EVERY `git commit` and EVERY
   `git push`):**
-  1. `cargo fmt --all -- --check` — must exit 0. If it fails, run
-     `cargo fmt --all` and re-stage. Do **not** push fmt-dirty code; CI
-     will reject it at the `cargo fmt --check` step (see
-     `.github/workflows/ci.yml`). This caught us once on commit
+  1. `nice -n 10 cargo fmt --all -- --check` — must exit 0. If it fails,
+     run `nice -n 10 cargo fmt --all` and re-stage. Do **not** push
+     fmt-dirty code; CI will reject it at the `cargo fmt --check` step
+     (see `.github/workflows/ci.yml`). This caught us once on commit
      `33e3e51` — never again.
-  2. `cargo clippy --workspace --all-targets -- -D warnings` — must
-     exit 0. Same lint set as CI; passes locally ⇒ passes there. If CI
-     stops at fmt it will *not* surface clippy errors, so always run
-     clippy locally too.
-  3. `cargo test --workspace --tests --lib` — must pass. (Skip doctests
-     locally if your toolchain lacks `rustdoc`; CI runs them.)
+  2. `nice -n 10 cargo clippy --workspace --all-targets -- -D warnings`
+     — must exit 0. Same lint set as CI; passes locally ⇒ passes there.
+     If CI stops at fmt it will *not* surface clippy errors, so always
+     run clippy locally too.
+  3. `nice -n 10 cargo test --workspace --tests --lib` — must pass.
+     (Skip doctests locally if your toolchain lacks `rustdoc`; CI runs
+     them.)
 
   These three commands take under a minute on a warm target dir.
   Running them before pushing prevents the "push → wait 10 min → red CI
@@ -153,7 +161,7 @@ section is the durable backup in case the skill is unavailable.
   rely on the human to catch it.
 
 - **Size-budget gate (run before EVERY `git push`, and before every tag
-  / release):** `./tests/check.sh --size-budget`. This builds the
+  / release):** `nice -n 10 ./tests/check.sh --size-budget`. This builds the
   canonical ship artefact (`release-slim`, glibc `cpu`, default
   features) and asserts the **exact** thing CI's `size-budget` job
   asserts — binary ≤ the `cpu` budget (currently 25 MiB / 26,214,400 B)

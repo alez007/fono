@@ -1433,6 +1433,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bytes",
  "encoding_rs",
  "fono-core",
  "fono-http",

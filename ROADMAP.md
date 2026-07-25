@@ -196,9 +196,11 @@ The connector is the [Model Context Protocol](https://modelcontextprotocol.io)
 — Fono is the **client**, speaking to whichever MCP servers you configure. A
 typical setup points at Home Assistant on your LAN for smart-home control;
 power users add GitHub, calendar, file-search, or any of the growing MCP
-ecosystem. Tools are advertised to the assistant LLM via its native
-function-calling API (works on OpenAI, Anthropic, Groq, Cerebras, and Gemini —
-local LLM tool-calling lands later).
+ecosystem. Tools are advertised to the assistant model through its own
+function-calling interface, and the work covers cloud and on-device models
+together rather than treating on-device as a later add-on — because how well a
+small local model can pick the right tool is the single biggest open question,
+it gets measured on a real Home Assistant setup before the rest is built.
 
 Two in-process built-ins ship by default — `pomodoro_start` and
 `pomodoro_cancel` — so the feature works out of the box without any external
@@ -207,9 +209,17 @@ wired in from day one so dangerous actions ("delete every file in Downloads")
 can later require a spoken "yes" or a hotkey tap before they fire. v1 ships
 with confirmation off by default; the UX layers on later without schema churn.
 
-Concrete plan: `plans/2026-05-22-voice-actions-via-mcp-v1.md`. Once it lands,
-voice actions apply in lockstep to both the staged pipeline and the realtime
-assistant.
+Commands you use often get **faster the more you use them**. When the assistant
+handles the same request the same way twice, Fono remembers the phrase and runs
+it straight away next time — no model, no waiting. Because it remembers the
+*phrase*, several wordings in several languages can point at the same action, so
+"turn on the kitchen lights" and "pornește luminile în bucătărie" both work.
+Everything it has learned is listed in Settings, grouped by what it does, with
+how often it ran and who asked — and anything wrong can be edited or removed.
+
+Concrete plan: `plans/2026-07-25-voice-actions-v3.md` (decision record:
+`docs/decisions/0029-voice-triggered-actions.md`). Once it lands, voice actions
+apply in lockstep to both the staged pipeline and the realtime assistant.
 
 ### Larger-than-RAM local models
 

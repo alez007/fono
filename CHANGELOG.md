@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fono can now find out what your smart home and other connected services are
+  able to do, and lets you choose what it may use.** Point Settings at a server
+  that speaks the Model Context Protocol — Home Assistant, for example — and
+  Fono asks it what it offers and remembers the answer. Everything is switched
+  on to begin with, so nothing you rely on stops working; you simply switch off
+  anything you would rather it never touched. That choice sticks: if a device
+  goes offline or the server restarts, the tool is marked unavailable instead
+  of forgotten, and it never comes back switched on behind your back. Each
+  entry also shows how confidently Fono could tell whether it really worked,
+  and flags the ones it will never run automatically on your behalf.
+- **The assistant can now actually switch things on and off for you.** Ask it to
+  turn on the kitchen lights and it does, using the tools you left switched on.
+  It tells you what happened in the same breath, and it is careful about what it
+  claims: if a server reports a problem, you hear the problem, and for the kind
+  of action nothing can check afterwards — an announcement, say — it will only
+  tell you the request was sent, never that it is done. One action per request,
+  so a single sentence can never set off a chain of them.
+- Connecting a tool server now switches tool use on for you. Previously you
+  could add a server, watch it list everything it could do, and still have
+  nothing happen, because a separate switch had quietly stayed off.
+
+### Fixed
+
+- **The assistant no longer throws away its head start when it recognises who is
+  speaking.** Fono prepares the assistant in the background so your first
+  question doesn't wait on setup. On turns where voice recognition identified
+  you, that preparation was being discarded and redone from scratch, so those
+  replies took noticeably longer to start than unidentified ones. The prepared
+  work is now reused as intended, which helps most on large on-device models.
+
 ## [0.17.1] — 2026-07-22
 
 ### Changed

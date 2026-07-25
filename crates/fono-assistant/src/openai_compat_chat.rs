@@ -393,17 +393,9 @@ fn build_initial_messages(ctx: &AssistantContext, user_text: &str) -> Vec<WireMe
     messages
 }
 
-/// Append the canonical post-tool-call triplet to `messages`:
-///
-/// 1. assistant message echoing the tool call
-/// 2. tool message with a short text summary
-/// 3. user message carrying the captured image as a content part
-fn append_tool_result_with_image(
-    messages: &mut Vec<WireMessage>,
-    call: &ToolCall,
-    summary: &str,
-    image: &CapturedImage,
-) {
+/// Append the assistant's tool call and the tool's textual result, the
+/// two messages every tool round-trip needs.
+fn append_tool_result(messages: &mut Vec<WireMessage>, call: &ToolCall, summary: &str) {
     messages.push(WireMessage {
         role: ChatRole::Assistant.as_str(),
         content: None,
@@ -423,6 +415,20 @@ fn append_tool_result_with_image(
         tool_calls: Vec::new(),
         tool_call_id: Some(call.id.clone()),
     });
+}
+
+/// Append the canonical post-tool-call triplet to `messages`:
+///
+/// 1. assistant message echoing the tool call
+/// 2. tool message with a short text summary
+/// 3. user message carrying the captured image as a content part
+fn append_tool_result_with_image(
+    messages: &mut Vec<WireMessage>,
+    call: &ToolCall,
+    summary: &str,
+    image: &CapturedImage,
+) {
+    append_tool_result(messages, call, summary);
     messages.push(WireMessage {
         role: ChatRole::User.as_str(),
         content: Some(WireContent::Parts(vec![WireContentPart::ImageUrl {
@@ -479,6 +485,12 @@ impl Assistant for OpenAiCompatChat {
         self.backend_name
     }
 
+    /// This backend speaks the OpenAI function-calling wire format, so the
+    /// user's tools reach the model and the calls come back parsed.
+    fn can_run_actions(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn reply_stream(
         &self,
@@ -501,13 +513,17 @@ impl Assistant for OpenAiCompatChat {
         }
 
         let initial_messages = build_initial_messages(ctx, user_text);
-        let tools = if ctx.prefer_vision && ctx.screen_capture.is_some() {
-            Some(build_screen_tool())
-        } else {
-            None
-        };
+        let mut descriptors: Vec<serde_json::Value> = Vec::new();
+        if ctx.prefer_vision && ctx.screen_capture.is_some() {
+            descriptors.extend(build_screen_tool());
+        }
+        if let Some(actions) = &ctx.actions {
+            descriptors.extend(actions.descriptors.iter().cloned());
+        }
+        let tools = if descriptors.is_empty() { None } else { Some(descriptors) };
         let buffer_first_turn = tools.is_some();
         let screen_cap_fn = ctx.screen_capture.clone();
+        let actions = ctx.actions.clone();
 
         let runner = ChatRunner {
             endpoint: self.endpoint.clone(),
@@ -551,13 +567,35 @@ impl Assistant for OpenAiCompatChat {
             // real answer comes after the second turn.
             drop(first.buffered_content);
 
-            // Only fono_screen is wired today.
+            // Anything that is not the screen tool is one of the user's own
+            // tools, run by the executor the caller attached.
             if call.name != "fono_screen" {
-                tracing::warn!(
-                    target: "fono.assistant",
-                    "unknown tool call from model: {}; ignoring",
-                    call.name
-                );
+                let Some(actions) = actions else {
+                    tracing::warn!(
+                        target: "fono.assistant",
+                        "unknown tool call from model: {}; ignoring",
+                        call.name
+                    );
+                    return;
+                };
+                let _ = tx.send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone())))).await;
+                let outcome = (actions.execute)(call.clone()).await;
+                let _ = tx
+                    .send(Ok(TokenDelta::tool(ToolEvent::Result {
+                        tool_call_id: call.id.clone(),
+                        summary: outcome.summary.clone(),
+                        failed: outcome.failed,
+                    })))
+                    .await;
+
+                // Second turn: the model tells the user what happened. No
+                // `tools` field, so it cannot chain another action off the
+                // back of the first — one action per turn, deliberately.
+                let mut second_messages = initial_messages;
+                append_tool_result(&mut second_messages, &call, &outcome.summary);
+                if let Err(e) = runner.run_chat_pump(second_messages, None, false, &tx).await {
+                    let _ = tx.send(Err(e)).await;
+                }
                 return;
             }
 
@@ -586,6 +624,7 @@ impl Assistant for OpenAiCompatChat {
                         .send(Ok(TokenDelta::tool(ToolEvent::Result {
                             tool_call_id: call.id.clone(),
                             summary,
+                            failed: true,
                         })))
                         .await;
                     let _ = tx.send(Ok(TokenDelta::text(sentence.to_string()))).await;
@@ -602,6 +641,7 @@ impl Assistant for OpenAiCompatChat {
                 .send(Ok(TokenDelta::tool(ToolEvent::Result {
                     tool_call_id: call.id.clone(),
                     summary: summary.clone(),
+                    failed: false,
                 })))
                 .await;
 
@@ -964,6 +1004,7 @@ mod tests {
             history: vec![turn(ChatRole::User, "hi"), turn(ChatRole::Assistant, "hello")],
             active_window_context: None,
             screen_capture: None,
+            actions: None,
             prefer_vision: false,
             max_new_tokens: None,
             allow_brain_capture: false,
@@ -1002,6 +1043,7 @@ mod tests {
             ],
             active_window_context: None,
             screen_capture: None,
+            actions: None,
             prefer_vision: false,
             max_new_tokens: None,
             allow_brain_capture: false,
