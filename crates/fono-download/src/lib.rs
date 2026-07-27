@@ -3,6 +3,7 @@
 //! progress UI. Phase 9 Task 9.5 (mirror override) + first-run downloads.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
@@ -11,6 +12,23 @@ use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
+
+/// Running total of payload bytes written to disk by every download in this
+/// process.
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Payload bytes written to disk by all downloads so far in this process.
+///
+/// Exists so a caller can estimate the *live* transfer rate — sample this
+/// twice a couple of seconds apart and divide by the interval — and from
+/// that derive a "done in about N minutes" figure for a desktop
+/// notification, without threading a progress callback through every model
+/// fetch in the workspace. Monotonic; resumed downloads count only the
+/// bytes this process actually transferred.
+#[must_use]
+pub fn bytes_written() -> u64 {
+    BYTES_WRITTEN.load(Ordering::Relaxed)
+}
 
 /// Download `url` to `dest`, resuming if a partial file exists. Verifies the
 /// final file against `expected_sha256` (hex lowercase, 64 chars). A hash
@@ -119,6 +137,7 @@ async fn try_download(url: &str, dest: &Path) -> Result<()> {
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("stream chunk")?;
         file.write_all(&bytes).await?;
+        BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         pb.inc(bytes.len() as u64);
     }
     file.flush().await?;

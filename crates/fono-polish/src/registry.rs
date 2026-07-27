@@ -18,6 +18,23 @@ pub struct LocalLlmModelInfo {
 ///
 /// NOTE: SHA256s below are pinned from the upstream GGUF/LFS metadata;
 /// `fono models verify` re-checks them.
+///
+/// Every `url_path` MUST pin an immutable commit revision — `resolve/<40-hex
+/// sha>/…`, never `resolve/main/…`. HuggingFace lets an uploader replace a
+/// file in place on a branch, which silently invalidates our `sha256` and
+/// breaks first-run downloads for every user with a hard-fail
+/// `sha256 mismatch` (the downloader deletes the file and gives up — see
+/// `fono-download`). This bit us on `gemma-4-e2b`: Google re-uploaded
+/// `gemma-4-E2B_q4_0-it.gguf` twice (2026-07-15 and 2026-07-17) under a
+/// moving `main`, so a pin that was correct when written started rejecting
+/// a perfectly good download. Pinning the revision makes the URL content-
+/// stable, so a pin only ever changes when WE deliberately bump it.
+///
+/// To bump a model: pick the new revision sha (`GET
+/// https://huggingface.co/api/models/<repo>` → `.sha`), read the file's
+/// `.siblings[].lfs.sha256` from the same response, and update both fields
+/// together. Verify with
+/// `curl -sSI <url> | grep -i x-linked-etag` — the etag is the LFS sha256.
 pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
     LocalLlmModelInfo {
         name: "gemma-4-e2b",
@@ -25,8 +42,9 @@ pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
         multilingual: true,
         default_eligible: true,
         approx_mb: 3_195,
-        url_path: "google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf",
-        sha256: "3646b4c147cd235a44d91df1546d3b7d8e29b547dbe4e1f80856419aa455e6fd",
+        url_path: "google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/\
+                   675cff42a74c774d6cb76f76d8eacb49b48c9b93/gemma-4-E2B_q4_0-it.gguf",
+        sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
         license: "Apache-2.0",
     },
     LocalLlmModelInfo {
@@ -35,7 +53,8 @@ pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
         multilingual: true,
         default_eligible: false,
         approx_mb: 528,
-        url_path: "lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+        url_path: "lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/\
+                   26bab2c9369648924251c0ebb3dae012f5147707/Qwen3.5-0.8B-Q4_K_M.gguf",
         sha256: "f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec",
         license: "Apache-2.0",
     },
@@ -45,7 +64,8 @@ pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
         multilingual: true,
         default_eligible: false,
         approx_mb: 1_270,
-        url_path: "lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+        url_path: "lmstudio-community/Qwen3.5-2B-GGUF/resolve/\
+                   bb84e11355a036e28f080c7793fa6d22b7c4e344/Qwen3.5-2B-Q4_K_M.gguf",
         sha256: "0bfe35afc9f05b7fac3fa04925e051ac7939a42a8a17ea11afc99701bea826cc",
         license: "Apache-2.0",
     },
@@ -55,7 +75,8 @@ pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
         multilingual: true,
         default_eligible: false,
         approx_mb: 9_602,
-        url_path: "bogdan-radulescu/gemma-4-26B-A4B-it-asym-GGUF/resolve/main/gemma-4-26B-A4B-it-asym.gguf",
+        url_path: "bogdan-radulescu/gemma-4-26B-A4B-it-asym-GGUF/resolve/\
+                   bf985a41932607910430c6977ef9620a5bf36496/gemma-4-26B-A4B-it-asym.gguf",
         sha256: "88cca0d55b441627f2c9cb05b5a4752d6bf78b28377ddb4ea0b81675334d8404",
         license: "Apache-2.0",
     },
@@ -65,7 +86,8 @@ pub const LOCAL_LLM_MODELS: &[LocalLlmModelInfo] = &[
         multilingual: true,
         default_eligible: false,
         approx_mb: 11_737,
-        url_path: "bogdan-radulescu/qwen3.6-35B-A3B-asym-GGUF/resolve/main/qwen3.6-35b-a3b-asym.gguf",
+        url_path: "bogdan-radulescu/qwen3.6-35B-A3B-asym-GGUF/resolve/\
+                   934c81eadef2f749482612fb09b8d093658165e8/qwen3.6-35b-a3b-asym.gguf",
         sha256: "d5d34aba11845c8a6fee4a8007c49989769fa1bc9418a1ad22dbd13faef8a41c",
         license: "Apache-2.0",
     },
@@ -135,12 +157,78 @@ mod tests {
         assert_eq!(gemma.approx_mb, 3_195);
         assert_eq!(
             gemma.url_path,
-            "google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf"
+            "google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/\
+             675cff42a74c774d6cb76f76d8eacb49b48c9b93/gemma-4-E2B_q4_0-it.gguf"
         );
         assert_eq!(
             gemma.sha256,
-            "3646b4c147cd235a44d91df1546d3b7d8e29b547dbe4e1f80856419aa455e6fd"
+            "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"
         );
+    }
+
+    /// Every download URL must pin an immutable commit revision, never a
+    /// moving branch. A `resolve/main/…` path lets upstream swap the file
+    /// under us and hard-fail first-run downloads with a `sha256 mismatch`
+    /// even though nothing on our side changed — exactly what happened when
+    /// Google re-uploaded the `gemma-4-e2b` GGUF twice in July 2026.
+    #[test]
+    fn every_url_path_pins_an_immutable_revision() {
+        for m in LocalLlmRegistry::all() {
+            let rev = m
+                .url_path
+                .split("/resolve/")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{}: url_path has no /resolve/ segment", m.name))
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            assert_eq!(rev.len(), 40, "{}: revision {rev:?} is not a 40-hex commit sha", m.name);
+            assert!(
+                rev.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}: revision {rev:?} is not hex — branch names like `main` are forbidden \
+                 because upstream can replace the file in place",
+                m.name
+            );
+        }
+    }
+
+    /// The long pinned paths are wrapped with a `\` line continuation, which
+    /// swallows the following newline AND its indentation. A plain wrap
+    /// (without the backslash) would silently bake spaces into the URL, so
+    /// assert the assembled download URL is whitespace-free and well-formed.
+    #[test]
+    fn url_for_builds_a_clean_absolute_url() {
+        for m in LocalLlmRegistry::all() {
+            let url = LocalLlmRegistry::url_for(m);
+            assert!(
+                !url.contains(char::is_whitespace),
+                "{}: assembled url contains whitespace: {url:?}",
+                m.name
+            );
+            assert!(url.starts_with("https://"), "{}: url is not absolute: {url:?}", m.name);
+            assert!(
+                std::path::Path::new(&url)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")),
+                "{}: url does not name a GGUF: {url:?}",
+                m.name
+            );
+        }
+    }
+
+    /// Guards the two fields that must always be bumped together. A pin is
+    /// only meaningful if it is a full digest, and a stale digest is the
+    /// failure mode this module's docs describe.
+    #[test]
+    fn every_model_pins_a_full_sha256() {
+        for m in LocalLlmRegistry::all() {
+            assert_eq!(m.sha256.len(), 64, "{}: sha256 must be a full 64-hex digest", m.name);
+            assert!(
+                m.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{}: sha256 must be lowercase hex",
+                m.name
+            );
+        }
     }
 
     #[test]

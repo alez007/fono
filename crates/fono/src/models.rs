@@ -20,6 +20,8 @@
 //! [`fono_stt::ModelRegistry`].
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fono_core::config::{AssistantBackend, Config, PolishBackend, SttBackend};
@@ -40,6 +42,268 @@ pub enum EnsureOutcome {
     /// can auto-download. The caller should leave the existing file (if
     /// any) alone.
     Unknown,
+}
+
+/// How long we watch the transfer, once bytes are actually moving, before
+/// deciding whether to say anything — so both the "will this take a while?"
+/// verdict and the "done in about N minutes" figure come from the user's real
+/// download speed rather than a guess.
+///
+/// Measured against the real mirrors, three seconds of *flowing* transfer
+/// lands within about 10% of the true finish time, which is well inside the
+/// precision of a "~4 min left" message. The window is timed from the first
+/// byte rather than from the call, because that is what makes three seconds
+/// enough — see [`wait_for_first_byte`].
+const RATE_SAMPLE: Duration = Duration::from_secs(3);
+
+/// How long to wait for the transfer to actually start before giving up on
+/// measuring it.
+///
+/// DNS, TLS and the redirect to the CDN cost about a second before a single
+/// byte lands, and that second is dead time at zero bytes. Averaging it into
+/// the rate is what made a naive three-second sample overestimate the finish
+/// time by ~35%; anchoring the window to the first byte instead brings the
+/// error to roughly zero. If nothing arrives within this budget the download
+/// really is stalled or offline, which is its own answer.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often to poll for that first byte. Fine enough not to add meaningful
+/// lag to the anchor, coarse enough to be free.
+const FIRST_BYTE_POLL: Duration = Duration::from_millis(100);
+
+/// Only downloads projected to run longer than this are worth interrupting
+/// the user for. A first run may fetch three models — two small ones that
+/// land in seconds and one large one — and popping a toast for the quick
+/// ones is just noise; by the time the user's eyes reach the notification
+/// the download it describes is already finished.
+const NOTIFY_THRESHOLD: Duration = Duration::from_secs(15);
+
+/// Set synchronously when a download starts, so [`take_download_notice`]
+/// knows a verdict is coming and waits for it instead of racing ahead.
+static DOWNLOAD_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Set only when the "downloading" notification was actually shown, which is
+/// what makes the matching "ready" notification owed.
+static DOWNLOAD_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// Set once the notify-or-stay-silent decision has been made (and the
+/// notification, if any, sent), so a waiter that arrives late can tell
+/// "decided, stay silent" apart from "not decided yet".
+static DOWNLOAD_DECIDED: AtomicBool = AtomicBool::new(false);
+
+/// Wakes anyone waiting on that decision. See [`take_download_notice`].
+static DOWNLOAD_DECIDED_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Tell the user, in a desktop notification, that a model download is under
+/// way — including roughly how long it will take — but only if it is going
+/// to take long enough to be worth saying.
+///
+/// Fono is often started from a systemd user unit or an autostart entry,
+/// where nobody is watching the console, so a first-run download of a few
+/// hundred megabytes looks exactly like a hang. `summary` and `body`
+/// describe the models; `total_mb` is their combined download size and is
+/// what makes the time estimate possible.
+///
+/// Both the estimate and the decision need a transfer rate, and the only
+/// honest way to get one is to measure it: we wait for the transfer to
+/// actually start, watch it for [`RATE_SAMPLE`], and project the finish time
+/// from the bytes `fono-download` wrote in that window. A download that will
+/// be over within [`NOTIFY_THRESHOLD`] is left unmentioned — no "downloading"
+/// toast, and no "ready" toast either. Fire-and-forget: it runs on its own
+/// task and can neither block nor fail the download it describes.
+fn notify_download_started(summary: String, body: String, total_mb: u32) {
+    DOWNLOAD_PENDING.store(true, Ordering::Relaxed);
+    let start_bytes = fono_download::bytes_written();
+    tokio::spawn(async move {
+        let overall = Instant::now();
+        // Anchor the measurement to the first byte, not to this call: the
+        // connection setup in between is dead time that would otherwise be
+        // averaged into the rate and inflate the estimate.
+        let anchor_bytes = wait_for_first_byte(start_bytes).await;
+        let sampled_from = Instant::now();
+        let (done, per_sec) = match anchor_bytes {
+            Some(anchor) => {
+                tokio::time::sleep(RATE_SAMPLE).await;
+                let now = fono_download::bytes_written();
+                let in_window = now.saturating_sub(anchor);
+                let rate = in_window as f64 / sampled_from.elapsed().as_secs_f64().max(0.001);
+                (now.saturating_sub(start_bytes), rate)
+            }
+            // Nothing ever started flowing; report it as such and let the
+            // no-estimate branch below speak up.
+            None => (0, 0.0),
+        };
+        let remaining = remaining_secs(total_mb, done, per_sec);
+        // A measured, short finish time is the one case we stay quiet. No
+        // measurement at all (nothing moved: stalled, offline, or a mirror
+        // still handshaking) is precisely when the run looks like a hang, so
+        // that speaks up.
+        if remaining.is_some_and(|secs| {
+            overall.elapsed().as_secs_f64() + secs < NOTIFY_THRESHOLD.as_secs_f64()
+        }) {
+            debug!("model download will finish shortly; skipping the notification");
+        } else {
+            let body = match remaining.map(|secs| eta_text(secs, per_sec)) {
+                Some(eta) => format!("{body} — {eta}"),
+                None => body,
+            };
+            fono_core::notify::send(
+                &summary,
+                &body,
+                "emblem-downloads",
+                10_000,
+                fono_core::notify::Urgency::Normal,
+            );
+            DOWNLOAD_ANNOUNCED.store(true, Ordering::Relaxed);
+        }
+        DOWNLOAD_DECIDED.store(true, Ordering::Relaxed);
+        DOWNLOAD_DECIDED_WAKE.notify_waiters();
+    });
+}
+
+/// Block until the transfer has actually moved past `start_bytes`, and return
+/// the byte count at that moment — the anchor the rate window is measured
+/// from. `None` if nothing arrives within [`FIRST_BYTE_TIMEOUT`].
+async fn wait_for_first_byte(start_bytes: u64) -> Option<u64> {
+    let deadline = Instant::now() + FIRST_BYTE_TIMEOUT;
+    loop {
+        let now = fono_download::bytes_written();
+        if now > start_bytes {
+            return Some(now);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(FIRST_BYTE_POLL).await;
+    }
+}
+
+/// Claim the pending "models are ready" notification, if one is owed.
+///
+/// Returns `true` only when this start both had to download something *and*
+/// told the user about it, so the "ready" notification never arrives on its
+/// own: a start with every model already cached, or one whose download was
+/// too quick to be worth mentioning, stays silent. Whoever claims it (the
+/// startup warmup coordinator, once the weights are actually loaded into
+/// memory) owns sending that notification.
+///
+/// Waits for the notify-or-stay-silent verdict first, since it is held back
+/// briefly to measure the transfer rate and everything else can finish inside
+/// that window.
+pub async fn take_download_notice() -> bool {
+    if !DOWNLOAD_PENDING.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    let wake = DOWNLOAD_DECIDED_WAKE.notified();
+    // Check only after subscribing, so a verdict landing in between still
+    // wakes us rather than leaving us to time out. The budget covers the
+    // worst case the verdict can take: waiting out the first byte, then the
+    // sample window itself.
+    if !DOWNLOAD_DECIDED.load(Ordering::Relaxed) {
+        let _ = tokio::time::timeout(FIRST_BYTE_TIMEOUT + RATE_SAMPLE * 2, wake).await;
+    }
+    DOWNLOAD_DECIDED.store(false, Ordering::Relaxed);
+    DOWNLOAD_ANNOUNCED.swap(false, Ordering::Relaxed)
+}
+
+/// Seconds left on a download of `total_mb` given the bytes already in and
+/// the measured rate. `None` when nothing moved during the sample window
+/// (offline, stalled, or a mirror still handshaking) — the caller then has no
+/// basis to either estimate or stay silent, and errs towards speaking up.
+fn remaining_secs(total_mb: u32, done_bytes: u64, bytes_per_sec: f64) -> Option<f64> {
+    if bytes_per_sec < 1_000.0 {
+        return None;
+    }
+    let total = u64::from(total_mb) * 1_000_000;
+    Some(total.saturating_sub(done_bytes) as f64 / bytes_per_sec)
+}
+
+/// Render "about 4 min left (5.2 MB/s)" from a remaining time and a rate.
+fn eta_text(remaining_secs: f64, bytes_per_sec: f64) -> String {
+    let rate = bytes_per_sec / 1_000_000.0;
+    if remaining_secs < 60.0 {
+        format!("less than a minute left ({rate:.1} MB/s)")
+    } else {
+        format!("about {} min left ({rate:.1} MB/s)", (remaining_secs / 60.0).ceil() as u64)
+    }
+}
+
+/// One model the current config needs that is not on disk yet: a
+/// user-facing description and its approximate download size in MB.
+struct Pending {
+    what: String,
+    mb: u32,
+}
+
+/// Everything the current config references that still has to be downloaded.
+/// Empty on every start after the first, which is what keeps the startup
+/// notification from becoming noise.
+fn pending_downloads(paths: &Paths, config: &Config) -> Vec<Pending> {
+    let mut pending = Vec::new();
+    if config.stt.backend == SttBackend::Local {
+        let name = &config.stt.local.model;
+        let quant = &config.stt.local.quantization;
+        let missing = resolve_local_stt(name, quant)
+            .ok()
+            .flatten()
+            .is_some_and(|(info, q)| !whisper_dest(paths, info.name, q).exists());
+        if missing {
+            let mb = local_stt_size_mb(name, quant).unwrap_or(0);
+            pending.push(Pending { what: format!("speech model {name}"), mb });
+        }
+    }
+    // The cleanup and assistant LLMs are often the same GGUF; list it once.
+    let mut llms: Vec<(&str, &String)> = Vec::new();
+    if config.polish.backend == PolishBackend::Local {
+        llms.push(("cleanup model", &config.polish.local.model));
+    }
+    if config.assistant.enabled && config.assistant.backend == AssistantBackend::Ollama {
+        llms.push(("assistant model", &config.assistant.local.model));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for (role, name) in llms {
+        let stem = fono_polish::LocalLlmRegistry::resolve_filename_stem(name);
+        if seen.contains(&stem) || paths.polish_models_dir().join(format!("{stem}.gguf")).exists() {
+            continue;
+        }
+        seen.push(stem);
+        let mb = local_llm_size_mb(name).unwrap_or(0);
+        pending.push(Pending { what: format!("{role} {name}"), mb });
+    }
+    #[cfg(feature = "tts-local")]
+    if config.tts.backend == fono_core::config::TtsBackend::Local {
+        if let Some(mb) = local_tts_pending_mb(paths, config) {
+            pending.push(Pending { what: "text-to-speech voice".to_string(), mb });
+        }
+    }
+    pending
+}
+
+/// Announce the first-run model download to the desktop, if there is one
+/// worth announcing.
+///
+/// Called from [`ensure_models`], i.e. on the daemon-startup path, precisely
+/// because that path is usually invisible: launched from a systemd user unit
+/// or a desktop autostart entry, Fono would otherwise spend several silent
+/// minutes fetching weights with no hint that anything is happening. All the
+/// missing models are described in a single notification rather than one per
+/// model, and [`notify_download_started`] drops even that when the whole
+/// batch is going to be over in seconds.
+fn announce_pending_downloads(paths: &Paths, config: &Config) {
+    let pending = pending_downloads(paths, config);
+    if pending.is_empty() {
+        return;
+    }
+    let total_mb: u32 = pending.iter().map(|p| p.mb).sum();
+    let summary = if pending.len() == 1 {
+        "Fono — downloading a model".to_string()
+    } else {
+        format!("Fono — downloading {} models", pending.len())
+    };
+    let what = pending.iter().map(|p| p.what.as_str()).collect::<Vec<_>>().join(", ");
+    let body = if total_mb > 0 { format!("{what} ({total_mb} MB)") } else { what };
+    info!("first-run download: {body}");
+    notify_download_started(summary, body, total_mb);
 }
 
 /// Resolve a `(name, quantization_pref)` pair from config into the
@@ -77,7 +341,15 @@ pub fn whisper_dest(paths: &Paths, name: &str, quant: Quantization) -> PathBuf {
 /// are missing. Individual failures log a warning but do not abort the
 /// daemon; this is invoked unconditionally from startup and we never
 /// want a transient HTTP failure to keep the daemon from coming up.
+///
+/// When anything does have to be fetched, and the fetch is slow enough to be
+/// worth mentioning, the user gets a desktop notification about it (with a
+/// time estimate) — see [`announce_pending_downloads`] — because this runs on
+/// the invisible startup path where a multi-minute download would otherwise
+/// look like a hang. Starts where every model is already cached, or where the
+/// download finishes in seconds, stay silent.
 pub async fn ensure_models(paths: &Paths, config: &Config) -> Result<()> {
+    announce_pending_downloads(paths, config);
     if config.stt.backend == SttBackend::Local {
         let r =
             ensure_local_stt(paths, &config.stt.local.model, &config.stt.local.quantization).await;
@@ -356,4 +628,94 @@ pub fn local_stt_size_mb(model_name: &str, quantization: &str) -> Option<u32> {
 #[must_use]
 pub fn local_llm_size_mb(model_name: &str) -> Option<u32> {
     fono_polish::LocalLlmRegistry::get(model_name).map(|m| m.approx_mb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Would this download be announced, given the rate measured by the
+    /// decision point? Mirrors [`notify_download_started`]; `spent_secs` is
+    /// the total time elapsed when the verdict is reached.
+    fn would_notify_after(
+        total_mb: u32,
+        done_bytes: u64,
+        bytes_per_sec: f64,
+        spent_secs: f64,
+    ) -> bool {
+        let remaining = remaining_secs(total_mb, done_bytes, bytes_per_sec);
+        !remaining.is_some_and(|secs| spent_secs + secs < NOTIFY_THRESHOLD.as_secs_f64())
+    }
+
+    /// The common case: about a second of DNS/TLS, then the sample window.
+    fn would_notify(total_mb: u32, done_bytes: u64, bytes_per_sec: f64) -> bool {
+        would_notify_after(total_mb, done_bytes, bytes_per_sec, 1.0 + RATE_SAMPLE.as_secs_f64())
+    }
+
+    #[test]
+    fn a_quick_download_is_not_worth_a_notification() {
+        // A 30 MB voice on a 10 MB/s link: 30 MB in by the 3 s mark, so it is
+        // done at ~3 s. Well inside the threshold — say nothing.
+        assert!(!would_notify(30, 30_000_000, 10_000_000.0));
+    }
+
+    #[test]
+    fn a_slow_download_is_announced() {
+        // A 700 MB LLM at 2 MB/s: ~5 minutes to go. Worth interrupting for,
+        // especially when Fono was started from a systemd unit.
+        assert!(would_notify(700, 6_000_000, 2_000_000.0));
+    }
+
+    #[test]
+    fn a_download_just_over_the_threshold_is_announced() {
+        // 1 s connecting + 3 s sampled + 12 s projected = 16 s, past the bar.
+        assert!(would_notify(15, 3_000_000, 1_000_000.0));
+    }
+
+    /// The regression this timing was built for, using figures measured
+    /// against the real mirror: a 292 MB model that genuinely finishes in
+    /// ~11 s, whose first byte lands at ~1.0 s and which has written 73.5 MB
+    /// by the 4 s mark.
+    ///
+    /// Averaging the dead first second into the rate gives 18.4 MB/s, which
+    /// projects ~16 s and wrongly clears the 15 s bar. Measuring only the
+    /// three seconds of flowing transfer gives the true 24.5 MB/s, projects
+    /// ~13 s, and correctly stays quiet.
+    #[test]
+    fn connection_setup_is_not_averaged_into_the_rate() {
+        let done = 73_500_000;
+        let naive_rate = done as f64 / 4.0;
+        assert!(
+            would_notify_after(292, done, naive_rate, 4.0),
+            "averaging in the idle first second over-estimates and notifies needlessly"
+        );
+
+        let anchored_rate = done as f64 / 3.0;
+        assert!(
+            !would_notify_after(292, done, anchored_rate, 4.0),
+            "the true rate shows this finishes inside the threshold"
+        );
+    }
+
+    #[test]
+    fn a_stalled_download_is_announced_even_without_an_estimate() {
+        // Nothing moved: offline, or a mirror still handshaking. This is
+        // exactly when a silent run looks like a hang, so speak up.
+        assert!(would_notify(300, 0, 0.0));
+    }
+
+    #[test]
+    fn eta_reports_minutes_remaining_at_the_measured_rate() {
+        assert_eq!(eta_text(294.0, 1_000_000.0), "about 5 min left (1.0 MB/s)");
+    }
+
+    #[test]
+    fn eta_says_less_than_a_minute_when_nearly_done() {
+        assert_eq!(eta_text(2.0, 5_000_000.0), "less than a minute left (5.0 MB/s)");
+    }
+
+    #[test]
+    fn remaining_is_unknown_when_the_transfer_has_not_moved() {
+        assert!(remaining_secs(300, 0, 0.0).is_none());
+    }
 }

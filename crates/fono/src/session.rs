@@ -2311,16 +2311,29 @@ impl SessionOrchestrator {
             Ok(name) => debug!("warmup: inject backend = {name}"),
             Err(e) => debug!("warmup: inject backend probe failed: {e:#}"),
         });
-        // Coordinator: once every async warmup completes, write the startup
-        // trace file. Fire-and-forget; if no trace is active this is a no-op.
-        if let Some(t) = trace {
-            tokio::spawn(async move {
-                for h in warmup_handles {
-                    let _ = h.await;
-                }
+        // Coordinator: once every async warmup completes, tell the user the
+        // models are ready — but only when this start had a download slow
+        // enough that we told them it was happening (`take_download_notice`).
+        // A normal launch, or one whose download was over in seconds, stays
+        // silent. Writes the startup trace file in the same pass;
+        // fire-and-forget.
+        tokio::spawn(async move {
+            for h in warmup_handles {
+                let _ = h.await;
+            }
+            if crate::models::take_download_notice().await {
+                fono_core::notify::send(
+                    "Fono — ready",
+                    "Models downloaded and loaded. Fono is listening.",
+                    "emblem-default",
+                    5_000,
+                    fono_core::notify::Urgency::Normal,
+                );
+            }
+            if let Some(t) = trace {
                 t.finish(json!({ "path": "startup", "summary": t.cache_scoreboard() }));
-            });
-        }
+            }
+        });
     }
 
     /// Spawn the polish (cleanup) prewarm task on the startup trace, if a
