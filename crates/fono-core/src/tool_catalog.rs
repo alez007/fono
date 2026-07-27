@@ -160,12 +160,18 @@ pub struct ToolCatalogStore {
 
 impl ToolCatalogStore {
     /// Open (or create) the store at `path` and apply migrations.
+    ///
+    /// The DB file (and any pre-existing WAL/SHM sidecars) is clamped to
+    /// owner-only `0600` on Unix, matching every other Fono store. The
+    /// `device_name` / `place_name` tables enumerate the user's smart-home
+    /// topology, so they must not be readable by other local users.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|source| Error::Io { path: dir.to_path_buf(), source })?;
         }
         let conn = Connection::open(path)?;
+        restrict_to_owner(path);
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         let db = Self { conn };
         db.migrate()?;
@@ -627,9 +633,47 @@ fn sha256_hex(s: &str) -> String {
     })
 }
 
+/// Best-effort clamp to owner-only `0600` (main DB + WAL/SHM sidecars).
+/// Failure is non-fatal — a read-only FS must not break tool discovery.
+fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, mode.clone());
+        for suffix in ["-wal", "-shm"] {
+            let mut os = path.as_os_str().to_owned();
+            os.push(suffix);
+            let sidecar = std::path::PathBuf::from(os);
+            if sidecar.exists() {
+                let _ = std::fs::set_permissions(&sidecar, mode.clone());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_clamps_db_file_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.sqlite");
+        // Pre-create world-readable, as every catalogue written before the
+        // clamp landed will be. Opening must tighten it in place.
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _db = ToolCatalogStore::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "tool catalogue must be owner-only, got {mode:o}");
+    }
 
     /// The exact 26 tools a real Home Assistant 2026.7 advertises. Pinned so
     /// the heuristics are anchored to a catalogue that exists rather than to

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fono now remembers your conversations with the assistant, and a restart no
+  longer loses your train of thought.** Until now a chat lived only in memory:
+  close the daemon mid-discussion and it was gone. Conversations are now saved
+  on your machine as threads, and if Fono restarts while you were talking it
+  picks up where you left off. A gap of quiet — five minutes by default —
+  ends the thread, so the next thing you say starts a fresh conversation rather
+  than dragging in something from this morning. The tray's "Forget conversation"
+  still gives you an immediate clean slate; it ends the thread rather than
+  erasing it, so you can still read back what was said.
+- **A new History page in Settings lets you read back everything Fono has saved
+  for you.** Open <http://127.0.0.1:10808/#/history> — or the new icon in the
+  Settings header — for two tabs: your dictated transcripts, searchable, and
+  your assistant conversations, where you can expand any thread to read it turn
+  by turn. Delete a single entry or clear a whole tab from the same page; no
+  database tools required.
+- **You can now see who was speaking.** When speaker verification recognises
+  someone, their name is shown beside each transcript and each conversation
+  turn, so a machine several people share is no longer an anonymous pile of
+  text. Names are kept as a record of what happened at the time: removing
+  someone's voice enrollment stops future recognition but does not quietly
+  rewrite your past history.
+
 - **Fono can now find out what your smart home and other connected services are
   able to do, and lets you choose what it may use.** Point Settings at a server
   that speaks the Model Context Protocol — Home Assistant, for example — and
@@ -62,6 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Your history retention setting is now actually applied.** Fono offered a
+  "keep transcripts for N days" setting but never acted on it, so history grew
+  without limit no matter what you chose. Old transcripts are now cleared on
+  startup, as the setting always promised. Set it to `0` to keep everything.
+- **The list of devices and places Fono has discovered is no longer readable by
+  other accounts on the machine.** That file was world-readable while every
+  other Fono database was private to you; it now matches them.
 - **A switched-off cleanup step no longer downloads a several-gigabyte model
   it will never use.** Fono checked which model cleanup was set to before
   checking whether cleanup was switched on at all.

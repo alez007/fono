@@ -31,28 +31,7 @@ fn stub_hooks() -> WebSettingsHooks {
             }))
         })
     });
-    // Minimal in-memory API-key store so the management routes have real
-    // create → list behaviour to exercise. `next_id` mints sequential ids.
-    let keys: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let next_id = Arc::new(std::sync::atomic::AtomicI64::new(1));
-    let list_keys = {
-        let keys = Arc::clone(&keys);
-        Arc::new(move || Ok(serde_json::json!({ "keys": *keys.lock().unwrap() })))
-    };
-    let create_key = {
-        let keys = Arc::clone(&keys);
-        let next_id = Arc::clone(&next_id);
-        Arc::new(move |name: &str, _exp: Option<i64>| {
-            let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let view = serde_json::json!({
-                "id": id, "name": name, "masked": "fono_sk_\u{2026}abcd",
-                "created_at": 1, "expires_at": null, "last_used_at": null,
-                "revoked": false, "usage_day": 0, "usage_month": 0,
-            });
-            keys.lock().unwrap().push(view.clone());
-            Ok(serde_json::json!({ "key": view, "secret": "fono_sk_secretsecret" }))
-        })
-    };
+    let (list_keys, create_key) = api_key_stubs();
     // Minimal in-memory tool catalogue: one tool whose `enabled` flag the
     // PATCH route flips, so the round-trip proves the wiring rather than a
     // hard-coded reply.
@@ -80,6 +59,7 @@ fn stub_hooks() -> WebSettingsHooks {
             Ok(())
         })
     };
+    let (list_dictation, list_threads, get_thread, delete_history) = history_stubs();
     WebSettingsHooks {
         get_config: Arc::new(|| Ok(serde_json::json!({}))),
         put_config: Arc::new(|_| Box::pin(async { Ok(String::new()) })),
@@ -114,7 +94,111 @@ fn stub_hooks() -> WebSettingsHooks {
         probe_llm: Arc::new(|_spec| {
             Box::pin(async { Err("no LLM server reachable in test".to_string()) })
         }),
+        list_dictation,
+        list_threads,
+        get_thread,
+        delete_history,
     }
+}
+
+/// Minimal in-memory API-key store so the management routes have real
+/// create → list behaviour to exercise. `next_id` mints sequential ids.
+fn api_key_stubs() -> (fono_net::web_settings::ListApiKeysFn, fono_net::web_settings::CreateApiKeyFn)
+{
+    let keys: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let next_id = Arc::new(std::sync::atomic::AtomicI64::new(1));
+    let list_keys: fono_net::web_settings::ListApiKeysFn = {
+        let keys = Arc::clone(&keys);
+        Arc::new(move || Ok(serde_json::json!({ "keys": *keys.lock().unwrap() })))
+    };
+    let create_key: fono_net::web_settings::CreateApiKeyFn = {
+        let keys = Arc::clone(&keys);
+        Arc::new(move |name: &str, _exp: Option<i64>| {
+            let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let view = serde_json::json!({
+                "id": id, "name": name, "masked": "fono_sk_\u{2026}abcd",
+                "created_at": 1, "expires_at": null, "last_used_at": null,
+                "revoked": false, "usage_day": 0, "usage_month": 0,
+            });
+            keys.lock().unwrap().push(view.clone());
+            Ok(serde_json::json!({ "key": view, "secret": "fono_sk_secretsecret" }))
+        })
+    };
+    (list_keys, create_key)
+}
+
+/// In-memory stand-ins for the four `/api/history/*` hooks. Dictation is
+/// backed by real mutable state so the delete verbs have something to
+/// change; conversations are fixed fixtures, since the routes only ever
+/// read them.
+fn history_stubs() -> (
+    fono_net::web_settings::ListDictationFn,
+    fono_net::web_settings::ListThreadsFn,
+    fono_net::web_settings::GetThreadFn,
+    fono_net::web_settings::DeleteHistoryFn,
+) {
+    // One entry with a detected speaker and one without, so the response
+    // shape is exercised both ways.
+    let dict: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![
+        serde_json::json!({
+            "id": 1, "ts": 100, "raw": "hello world", "cleaned": "Hello, world.",
+            "app_class": "kitty", "app_title": "zsh", "stt_backend": "whisper",
+            "language": "en", "speaker": "Radu",
+        }),
+        serde_json::json!({
+            "id": 2, "ts": 200, "raw": "second note", "cleaned": null,
+            "app_class": null, "app_title": null, "stt_backend": "whisper",
+            "language": "en", "speaker": null,
+        }),
+    ]));
+    let list_dictation: fono_net::web_settings::ListDictationFn = {
+        let dict = Arc::clone(&dict);
+        Arc::new(move |q, limit| {
+            let hits: Vec<_> = dict
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| q.is_empty() || e["raw"].as_str().is_some_and(|r| r.contains(q)))
+                .take(limit)
+                .cloned()
+                .collect();
+            Ok(serde_json::json!({ "entries": hits }))
+        })
+    };
+    let delete_history: fono_net::web_settings::DeleteHistoryFn = {
+        let dict = Arc::clone(&dict);
+        Arc::new(move |kind, id| {
+            if kind != "dictation" {
+                return Ok(0);
+            }
+            let mut rows = dict.lock().unwrap();
+            let before = rows.len();
+            match id {
+                Some(id) => rows.retain(|e| e["id"].as_i64() != Some(id)),
+                None => rows.clear(),
+            }
+            Ok(before - rows.len())
+        })
+    };
+    let list_threads: fono_net::web_settings::ListThreadsFn = Arc::new(|_limit| {
+        Ok(serde_json::json!({ "threads": [{
+            "id": 7, "started_at": 100, "last_at": 160, "ended": true,
+            "turn_count": 2, "preview": "what is the time",
+            "speakers": ["Radu"], "backend": "openai", "model": "gpt-4o-mini",
+        }] }))
+    });
+    let get_thread: fono_net::web_settings::GetThreadFn = Arc::new(|id| {
+        if id != 7 {
+            return Err("no such conversation".to_string());
+        }
+        Ok(serde_json::json!({ "turns": [
+            { "ordinal": 0, "role": "user", "text": "what is the time",
+              "ts": 100, "speaker": "Radu", "latency_ms": null, "partial": false },
+            { "ordinal": 1, "role": "assistant", "text": "just past four",
+              "ts": 101, "speaker": null, "latency_ms": 820, "partial": false },
+        ] }))
+    });
+    (list_dictation, list_threads, get_thread, delete_history)
 }
 
 async fn start(auth_enabled: bool) -> fono_net::web_settings::WebSettingsHandle {
@@ -363,6 +447,77 @@ async fn speakers_list_and_mutations_round_trip() {
         .await
         .expect("send");
     assert_eq!(r.status(), 400);
+
+    handle.shutdown().await;
+}
+
+/// The history page must be able to browse both stores, see the detected
+/// speaker, search, and delete — end to end over HTTP.
+#[tokio::test]
+async fn history_browse_search_and_delete_round_trip() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    // Dictation listing carries the verified speaker when there was one.
+    let r = client.get(format!("{base}/api/history/dictation")).send().await.expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(body["entries"][0]["speaker"], "Radu");
+    assert!(body["entries"][1]["speaker"].is_null(), "unattributed entries stay null");
+
+    // Search narrows the list; `limit` is honoured.
+    let r = client
+        .get(format!("{base}/api/history/dictation?q=second&limit=10"))
+        .send()
+        .await
+        .expect("send");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(body["entries"][0]["id"], 2);
+
+    // Conversation threads list with their participants.
+    let r = client.get(format!("{base}/api/history/conversations")).send().await.expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["threads"][0]["id"], 7);
+    assert_eq!(body["threads"][0]["speakers"][0], "Radu");
+
+    // Opening a thread returns its turns in order, speaker included.
+    let r = client.get(format!("{base}/api/history/conversations/7")).send().await.expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["turns"][0]["role"], "user");
+    assert_eq!(body["turns"][0]["speaker"], "Radu");
+    assert_eq!(body["turns"][1]["role"], "assistant");
+
+    // An unknown thread is a 404, not a 500.
+    let r = client.get(format!("{base}/api/history/conversations/99")).send().await.expect("send");
+    assert_eq!(r.status(), 404);
+
+    // A non-numeric id is a client error.
+    let r = client.get(format!("{base}/api/history/conversations/abc")).send().await.expect("send");
+    assert_eq!(r.status(), 400);
+
+    // Deleting one entry removes exactly that entry.
+    let r = client.delete(format!("{base}/api/history/dictation/1")).send().await.expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["deleted"], 1);
+
+    let r = client.get(format!("{base}/api/history/dictation")).send().await.expect("send");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+
+    // "Clear all" wipes the rest.
+    let r = client.delete(format!("{base}/api/history/dictation")).send().await.expect("send");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["deleted"], 1);
+
+    // An unknown history kind is a 404, not a silent success.
+    let r = client.delete(format!("{base}/api/history/nonsense")).send().await.expect("send");
+    assert_eq!(r.status(), 404);
 
     handle.shutdown().await;
 }

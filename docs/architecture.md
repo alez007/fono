@@ -95,6 +95,11 @@ ones when `[interactive].enabled = true`, routing capture through
 | Whisper models       | `~/.cache/fono/models/whisper/ggml-<name>.bin`             |
 | Polish models (GGUF)    | `~/.cache/fono/models/polish/<name>.gguf`                     |
 | History DB           | `~/.local/share/fono/history.sqlite`                       |
+| Conversations DB     | `~/.local/share/fono/conversations.sqlite`                 |
 | IPC socket + PID     | `~/.local/state/fono/fono.sock`, `fono.pid`                |
 
-All paths honour `XDG_*_HOME` overrides.
+All paths honour `XDG_*_HOME` overrides. The databases are split by
+lifecycle rather than merged: transcripts, assistant conversations,
+voiceprints, inbound API keys, and the discovered tool catalogue each
+have their own file (all mode `0600`), so erasing one leaves the others
+intact. See ADR 0040.

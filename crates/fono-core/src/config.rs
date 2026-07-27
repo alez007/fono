@@ -62,6 +62,9 @@ pub struct Config {
     pub history: History,
 
     #[serde(default)]
+    pub conversations: Conversations,
+
+    #[serde(default)]
     pub inject: Inject,
 
     #[serde(default)]
@@ -116,6 +119,7 @@ impl Default for Config {
             context_rules: Vec::new(),
             overlay: Overlay::default(),
             history: History::default(),
+            conversations: Conversations::default(),
             inject: Inject::default(),
             update: Update::default(),
             interactive: Interactive::default(),
@@ -1705,6 +1709,40 @@ pub struct History {
 impl Default for History {
     fn default() -> Self {
         Self { enabled: true, retention_days: 90, redact_secrets: true }
+    }
+}
+
+/// `[conversations]` — persistence of assistant conversations (ADR 0040).
+///
+/// Dictation transcripts are governed by `[history]`; this is the parallel
+/// switch for the spoken back-and-forth with the assistant. When
+/// `enabled = false` no `conversations.sqlite` is created at all, so the
+/// absence of the file is proof of the opt-out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Conversations {
+    pub enabled: bool,
+    /// Threads whose last activity is older than this are purged by the
+    /// same sweep that prunes dictation history. `0` disables retention.
+    pub retention_days: u32,
+    /// Silence, in minutes, after which the current thread is closed and
+    /// the next utterance starts a new one. Also the window within which a
+    /// daemon restart resumes the previous conversation.
+    pub idle_timeout_minutes: u32,
+}
+
+impl Default for Conversations {
+    fn default() -> Self {
+        Self { enabled: true, retention_days: 90, idle_timeout_minutes: 5 }
+    }
+}
+
+impl Conversations {
+    /// Idle window in seconds, for the store's segmentation and resume
+    /// checks.
+    #[must_use]
+    pub fn idle_secs(&self) -> i64 {
+        i64::from(self.idle_timeout_minutes) * 60
     }
 }
 

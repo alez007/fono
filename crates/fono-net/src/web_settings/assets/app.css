@@ -398,6 +398,25 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
 .key-new-row .select { width: auto; }
 .key-exp-warn { color: var(--accent); }
 
+/* ---------- history browser ---------- */
+.hlist { border-top: 1px solid var(--line); }
+.hrow .lbl { font-weight: 400; white-space: pre-wrap; text-wrap: pretty; }
+.hrow .desc { max-width: none; }
+.hthread + .hthread { border-top: 1px solid var(--line); }
+.hthread .hrow { border-top: none; }
+.linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; color: inherit; text-align: left;
+}
+.linkbtn:hover { color: var(--accent); }
+.turns { padding: 4px 0 16px 18px; border-left: 2px solid var(--line-2); margin-left: 4px; }
+.turn { padding: 8px 0; }
+.turn + .turn { border-top: 1px solid var(--line); }
+.turn .who { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-dim); }
+.turn .what { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; text-wrap: pretty; margin: 2px 0; }
+.turn.assistant .what { color: var(--ink-mute); }
+.turn.tool_call .what, .turn.tool_result .what { font-family: var(--mono); font-size: 12px; color: var(--ink-mute); }
+
 @media (max-width: 560px) {
   main { padding: 24px 14px 140px; }
   details.sec .body { padding-left: 18px; }

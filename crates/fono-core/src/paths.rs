@@ -138,9 +138,15 @@ impl Paths {
         self.data_dir.join("api_keys.sqlite")
     }
 
+    /// Persisted assistant conversations — threads and their turns,
+    /// including the verified speaker name per turn (ADR 0040). Lives
+    /// beside `history.sqlite` under the data dir — desktop:
+    /// `$XDG_DATA_HOME/fono/`; system service: `/var/lib/fono/`. Clamped
+    /// `0600`: it holds spoken conversation transcripts. Never created at
+    /// all when `[conversations].enabled = false`.
     #[must_use]
-    pub fn notes_db(&self) -> PathBuf {
-        self.data_dir.join("notes.sqlite")
+    pub fn conversations_db(&self) -> PathBuf {
+        self.data_dir.join("conversations.sqlite")
     }
 
     /// Store for enrolled speaker voice-print embeddings and their
@@ -279,6 +285,7 @@ mod tests {
         let p = Paths::rooted_at(tmp.path());
         assert!(p.config_file().ends_with("config/fono/config.toml"));
         assert!(p.history_db().ends_with("data/fono/history.sqlite"));
+        assert!(p.conversations_db().ends_with("data/fono/conversations.sqlite"));
         assert!(p.ipc_socket().ends_with("state/fono/fono.sock"));
         p.ensure().unwrap();
         assert!(p.whisper_models_dir().is_dir());

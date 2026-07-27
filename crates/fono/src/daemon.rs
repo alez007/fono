@@ -4124,6 +4124,7 @@ fn web_settings_hooks(
     let doctor = doctor_hook(paths);
     let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths);
     let probe_llm = probe_llm_hook(paths);
+    let (list_dictation, list_threads, get_thread, delete_history) = history_hooks(paths);
 
     fono_net::WebSettingsHooks {
         get_config,
@@ -4149,7 +4150,161 @@ fn web_settings_hooks(
         set_tool_enabled,
         discover_tools,
         probe_llm,
+        list_dictation,
+        list_threads,
+        get_thread,
+        delete_history,
     }
+}
+
+/// `/api/history/*`: let the browser read back what Fono has saved —
+/// dictation transcripts and assistant conversations, each carrying the
+/// detected speaker when speaker verification made a match.
+///
+/// Every closure opens its own short-lived connection rather than holding
+/// one open. History browsing is an occasional, human-paced activity, and
+/// a connection per request keeps this completely out of the way of the
+/// dictation pipeline's own handle.
+fn history_hooks(
+    paths: &Paths,
+) -> (
+    fono_net::web_settings::ListDictationFn,
+    fono_net::web_settings::ListThreadsFn,
+    fono_net::web_settings::GetThreadFn,
+    fono_net::web_settings::DeleteHistoryFn,
+) {
+    use fono_core::conversations::ConversationStore;
+    use fono_core::history::HistoryDb;
+
+    let hp = paths.history_db();
+    let list_dictation: fono_net::web_settings::ListDictationFn = Arc::new(move |query, limit| {
+        let db = HistoryDb::open(&hp).map_err(|e| format!("open history: {e}"))?;
+        let q = query.trim();
+        // FTS5 MATCH would reject bare punctuation and unbalanced quotes
+        // that a user can easily type into a search box, so wrap the terms
+        // as a quoted phrase and fall back to the recent list on error.
+        let entries = if q.is_empty() {
+            db.recent(limit).map_err(|e| format!("read history: {e}"))?
+        } else {
+            let phrase = format!("\"{}\"", q.replace('"', ""));
+            db.search(&phrase, limit).unwrap_or_default()
+        };
+        let entries: Vec<serde_json::Value> = entries.iter().map(dictation_json).collect();
+        Ok(serde_json::json!({ "entries": entries }))
+    });
+
+    let cp = paths.conversations_db();
+    let list_threads: fono_net::web_settings::ListThreadsFn = Arc::new(move |limit| {
+        // No file yet means the assistant has not been used (or saving is
+        // off) — an empty list, not an error.
+        if !cp.exists() {
+            return Ok(serde_json::json!({ "threads": [] }));
+        }
+        let store = ConversationStore::open(&cp).map_err(|e| format!("open conversations: {e}"))?;
+        let threads: Vec<serde_json::Value> = store
+            .recent_threads(limit)
+            .map_err(|e| format!("read conversations: {e}"))?
+            .iter()
+            .map(thread_json)
+            .collect();
+        Ok(serde_json::json!({ "threads": threads }))
+    });
+
+    let cp = paths.conversations_db();
+    let get_thread: fono_net::web_settings::GetThreadFn = Arc::new(move |id| {
+        let store = ConversationStore::open(&cp).map_err(|e| format!("open conversations: {e}"))?;
+        let turns: Vec<serde_json::Value> = store
+            .turns(id)
+            .map_err(|e| format!("read conversation: {e}"))?
+            .iter()
+            .map(turn_json)
+            .collect();
+        if turns.is_empty() {
+            return Err("no such conversation".to_string());
+        }
+        Ok(serde_json::json!({ "id": id, "turns": turns }))
+    });
+
+    let hp = paths.history_db();
+    let cp = paths.conversations_db();
+    let delete_history: fono_net::web_settings::DeleteHistoryFn = Arc::new(move |kind, id| {
+        if kind == "dictation" {
+            let db = HistoryDb::open(&hp).map_err(|e| format!("open history: {e}"))?;
+            return db.delete(id).map_err(|e| format!("delete history: {e}"));
+        }
+        delete_conversations(&cp, id)
+    });
+
+    (list_dictation, list_threads, get_thread, delete_history)
+}
+
+/// One dictation row as the history page wants it.
+fn dictation_json(t: &fono_core::history::Transcription) -> serde_json::Value {
+    serde_json::json!({
+        "id": t.id,
+        "ts": t.ts,
+        "duration_ms": t.duration_ms,
+        "raw": t.raw,
+        "cleaned": t.cleaned,
+        "app_class": t.app_class,
+        "app_title": t.app_title,
+        "stt_backend": t.stt_backend,
+        "polish_backend": t.polish_backend,
+        "language": t.language,
+        "speaker": t.speaker,
+    })
+}
+
+/// One conversation thread, summarised for the list view — enough to
+/// render a row without loading its turns.
+fn thread_json(s: &fono_core::conversations::ThreadSummary) -> serde_json::Value {
+    serde_json::json!({
+        "id": s.thread.id,
+        "started_at": s.thread.started_at,
+        "last_at": s.thread.last_at,
+        "ended": s.thread.ended_at.is_some(),
+        "turn_count": s.thread.turn_count,
+        "backend": s.thread.backend,
+        "model": s.thread.model,
+        "preview": s.preview,
+        "speakers": s.speakers,
+    })
+}
+
+/// One turn inside an expanded thread.
+fn turn_json(t: &fono_core::conversations::Turn) -> serde_json::Value {
+    serde_json::json!({
+        "ordinal": t.ordinal,
+        "role": t.role.as_str(),
+        "text": t.text,
+        "ts": t.ts,
+        "speaker": t.speaker,
+        "latency_ms": t.latency_ms,
+        "partial": t.partial,
+    })
+}
+
+/// Delete one conversation thread, or every one of them when `id` is
+/// `None`. A missing file means there is nothing to delete, not an error.
+fn delete_conversations(
+    path: &std::path::Path,
+    id: Option<i64>,
+) -> std::result::Result<usize, String> {
+    use fono_core::conversations::ConversationStore;
+
+    if !path.exists() {
+        return Ok(0);
+    }
+    let store = ConversationStore::open(path).map_err(|e| format!("open conversations: {e}"))?;
+    id.map_or_else(
+        || store.delete_all_threads().map_err(|e| format!("delete conversations: {e}")),
+        |id| {
+            store
+                .delete_thread(id)
+                .map(usize::from)
+                .map_err(|e| format!("delete conversation: {e}"))
+        },
+    )
 }
 
 /// `POST /api/llm/probe`: ask a self-hosted OpenAI-compatible server what

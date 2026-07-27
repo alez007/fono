@@ -260,6 +260,13 @@ so changes apply immediately — no daemon restart. API keys entered on
 the page land in `secrets.toml`, never in `config.toml` or any HTTP
 response.
 
+Two more views share the same page, reachable from the header icons:
+
+| View | URL | What it shows |
+|---|---|---|
+| Health | `#/doctor` | the same checks `fono doctor` prints |
+| History | `#/history` | what Fono has saved — dictation transcripts (searchable) and assistant conversations (expand a thread to read its turns), each tagged with the detected speaker where verification made a match. Delete a single entry or clear a whole store from here. |
+
 > **Security note:** the page can rewrite your whole config and store
 > API keys. It refuses non-loopback peers while `bind` is loopback; if
 > you widen `bind`, keep `auth = true` (the default) and create a key —
@@ -331,10 +338,35 @@ field matches the focused window's class id (`xprop WM_CLASS` on X11,
 ```toml
 [history]
 max_entries = 10_000        # rolling cap; older entries are pruned
+retention_days = 90         # transcripts older than this are dropped
 ```
 
 `fono history clear` truncates the table without touching the file;
 deleting `~/.local/share/fono/history.sqlite` wipes everything.
+
+### Assistant conversations
+
+Talking to the assistant is saved too, as *threads* of turns, so a
+restart mid-chat does not lose the thread of what you were discussing.
+Each turn records who spoke it when speaker verification made a match.
+
+```toml
+[conversations]
+enabled = true              # set false to keep conversations in memory only
+retention_days = 90         # threads older than this are dropped; 0 keeps forever
+idle_timeout_minutes = 5    # silence after which the next thing you say
+                            # starts a fresh conversation
+```
+
+Conversations live in `~/.local/share/fono/conversations.sqlite` (mode
+`0600`), separate from dictation so you can erase one without the other.
+Deleting the file wipes every saved conversation. The tray's **Forget
+conversation** entry ends the current thread rather than deleting it —
+the assistant starts fresh, but you can still read back what was said.
+
+Browse and delete both histories at
+**<http://127.0.0.1:10808/#/history>** — see
+[Settings in the browser](#settings-in-the-browser).
 
 ### Speaker verification (who is speaking)
 
@@ -763,9 +795,11 @@ learning corrections stays opt-in.
 | Vocabulary | `$XDG_CONFIG_HOME/fono/vocabulary.toml` |
 | Whisper models | `$XDG_CACHE_HOME/fono/models/whisper/` |
 | Polish models | `$XDG_CACHE_HOME/fono/models/polish/` |
-| History DB | `$XDG_DATA_HOME/fono/history.sqlite` |
+| History DB | `$XDG_DATA_HOME/fono/history.sqlite` (mode `0600`) |
+| Conversations DB (assistant chats) | `$XDG_DATA_HOME/fono/conversations.sqlite` (mode `0600`) |
 | Speakers DB (voiceprints) | `$XDG_DATA_HOME/fono/speakers.sqlite` (mode `0600`) |
 | Inbound API keys DB | `$XDG_DATA_HOME/fono/api_keys.sqlite` (mode `0600`) |
+| Tool catalogue DB | `$XDG_DATA_HOME/fono/tools.sqlite` (mode `0600`) |
 | IPC socket + PID | `$XDG_STATE_HOME/fono/` |
 
 Server mode uses `/etc/fono/`, `/var/lib/fono/`, `/var/cache/fono/`,

@@ -63,6 +63,13 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// wider bound is safe.
 const MAX_AUDIO_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// How many history records a `/api/history/*` list returns when the page
+/// doesn't ask for a specific `limit`.
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+/// Upper bound on `?limit=`, so a hand-crafted URL cannot ask the daemon
+/// to serialise the entire database into one response.
+const MAX_HISTORY_LIMIT: usize = 500;
+
 /// Embedded page assets. Design source: the 2026-07-02 search-first
 /// accordion handoff (see `plans/2026-07-02-web-config-ui-v2.md`).
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -217,6 +224,35 @@ pub type ProbeLlmFn = Arc<
         + Sync,
 >;
 
+/// List saved dictation transcripts for the history page (`GET
+/// /api/history/dictation?limit=&q=`). Args `(query, limit)`; an empty
+/// query returns the most recent entries, otherwise it is a full-text
+/// search. Returns `{"entries": [{id, ts, raw, cleaned, app_class,
+/// app_title, stt_backend, speaker, …}, …]}`, including the verified
+/// speaker when one was detected.
+pub type ListDictationFn =
+    Arc<dyn Fn(&str, usize) -> std::result::Result<serde_json::Value, String> + Send + Sync>;
+/// List assistant conversation threads newest-first (`GET
+/// /api/history/conversations?limit=`). Returns
+/// `{"threads": [{id, started_at, last_at, ended, turn_count, preview,
+/// speakers: [name, …], backend, model}, …]}` — enough to render the list
+/// without loading every turn.
+pub type ListThreadsFn =
+    Arc<dyn Fn(usize) -> std::result::Result<serde_json::Value, String> + Send + Sync>;
+/// Load one thread's turns in order (`GET
+/// /api/history/conversations/{id}`). Returns `{"turns": [{ordinal, role,
+/// text, ts, speaker, latency_ms, partial}, …]}`, where `role` is one of
+/// `user` / `assistant` / `tool_call` / `tool_result`.
+pub type GetThreadFn =
+    Arc<dyn Fn(i64) -> std::result::Result<serde_json::Value, String> + Send + Sync>;
+/// Delete history the user no longer wants kept (`DELETE
+/// /api/history/dictation[/{id}]`, `DELETE
+/// /api/history/conversations[/{id}]`). Args `(kind, id)` where `kind` is
+/// `"dictation"` or `"conversations"` and `id` is `None` for "clear all".
+/// Returns the number of records removed.
+pub type DeleteHistoryFn =
+    Arc<dyn Fn(&str, Option<i64>) -> std::result::Result<usize, String> + Send + Sync>;
+
 /// Hook closures supplied by the daemon layer. The server itself is a thin
 /// wire adapter with no config semantics.
 #[derive(Clone)]
@@ -258,6 +294,12 @@ pub struct WebSettingsHooks {
     /// Test a self-hosted OpenAI-compatible LLM endpoint and list its
     /// models (`POST /api/llm/probe`).
     pub probe_llm: ProbeLlmFn,
+    /// Browse what Fono has saved: dictation transcripts and assistant
+    /// conversations, both with the detected speaker where known.
+    pub list_dictation: ListDictationFn,
+    pub list_threads: ListThreadsFn,
+    pub get_thread: GetThreadFn,
+    pub delete_history: DeleteHistoryFn,
 }
 
 /// Configuration for [`WebSettingsServer::start`]. Built from
@@ -504,6 +546,7 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
         (m, p) if p == "/api/tools" || p == "/api/tools/discover" => {
             route_tools(m, p, req, &ctx).await
         }
+        (m, p) if p.starts_with("/api/history/") => route_history(m, p, req.uri().query(), &ctx),
         (&Method::POST, "/api/llm/probe") => route_llm_probe(req, &ctx).await,
         (&Method::POST, "/v1/audio/speech") => {
             let Some(body) = read_json_body(req).await else {
@@ -600,6 +643,105 @@ async fn route_api_keys(
         }
         _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
     }
+}
+
+/// `/api/history/*` — read back what Fono has saved: dictation
+/// transcripts and assistant conversations. Read-only apart from the
+/// delete verbs, and entirely local: both stores are on this machine.
+///
+/// Synchronous by design — SQLite reads of a page's worth of rows are
+/// sub-millisecond, so there is nothing to move off the accept loop.
+fn route_history(
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    ctx: &ServerCtx,
+) -> Response<ResBody> {
+    let limit = query_param(query, "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    match (method, path) {
+        (&Method::GET, "/api/history/dictation") => {
+            let q = query_param(query, "q").unwrap_or_default();
+            match (ctx.hooks.list_dictation)(&q, limit) {
+                Ok(v) => json_ok(&v),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            }
+        }
+        (&Method::GET, "/api/history/conversations") => match (ctx.hooks.list_threads)(limit) {
+            Ok(v) => json_ok(&v),
+            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
+        (&Method::GET, p) if p.starts_with("/api/history/conversations/") => {
+            let Ok(id) = p.trim_start_matches("/api/history/conversations/").parse::<i64>() else {
+                return error_response(StatusCode::BAD_REQUEST, "invalid conversation id");
+            };
+            match (ctx.hooks.get_thread)(id) {
+                Ok(v) => json_ok(&v),
+                Err(e) => error_response(StatusCode::NOT_FOUND, &e),
+            }
+        }
+        (&Method::DELETE, p) => {
+            let rest = p.trim_start_matches("/api/history/");
+            let (kind, id) = match rest.split_once('/') {
+                Some((kind, id_str)) => {
+                    let Ok(id) = id_str.parse::<i64>() else {
+                        return error_response(StatusCode::BAD_REQUEST, "invalid history id");
+                    };
+                    (kind, Some(id))
+                }
+                None => (rest, None),
+            };
+            if !matches!(kind, "dictation" | "conversations") {
+                return error_response(StatusCode::NOT_FOUND, "not found");
+            }
+            match (ctx.hooks.delete_history)(kind, id) {
+                Ok(n) => json_ok(&serde_json::json!({ "ok": true, "deleted": n })),
+                Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
+            }
+        }
+        _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+/// Pull one percent-decoded parameter out of a raw query string.
+fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    query?.split('&').find_map(|kv| kv.strip_prefix(&prefix)).map(percent_decode)
+}
+
+/// Minimal `application/x-www-form-urlencoded` decoding for query values:
+/// `+` is a space and `%XX` is a byte. Enough for a search box, and it
+/// keeps a URL-decoding crate out of the binary.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    // Not a valid escape — keep the literal `%`.
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `POST /api/llm/probe` — "Test connection" for a self-hosted LLM
@@ -912,14 +1054,16 @@ mod tests {
         assert_eq!(js, rust, "app.js auto-select order has drifted from fono-core");
     }
 
-    /// Every rendered `<button>` must carry at least one `data-` attribute
-    /// that the delegated click listener actually selects on.
+    /// Every rendered `<button>` must be reachable by a click handler.
     ///
-    /// The settings page routes all clicks through one `closest(...)` call
-    /// with an explicit list of attributes. Adding a button and forgetting to
-    /// extend that list produces a button that renders perfectly and silently
-    /// does nothing — no error, nothing in the console, nothing a Rust test
-    /// would otherwise notice. That exact bug shipped once; this is the guard.
+    /// Most of the settings page routes clicks through one delegated
+    /// `closest(...)` call with an explicit attribute list; views that
+    /// re-render wholesale (the history page) instead bind their buttons
+    /// directly with `querySelectorAll('[data-x]')` after each render.
+    /// Either wiring counts — what must never happen is a button that
+    /// renders perfectly and silently does nothing, with no error and
+    /// nothing in the console. That exact bug shipped once; this is the
+    /// guard.
     #[test]
     fn every_button_is_reachable_by_the_click_handler() {
         let selector = APP_JS
@@ -945,6 +1089,13 @@ mod tests {
             out
         };
 
+        // An attribute is handled if the delegated listener selects on it,
+        // or if some view binds it directly after rendering.
+        let handled = |a: &str| {
+            selector.contains(&format!("[{a}]"))
+                || APP_JS.contains(&format!("querySelectorAll('[{a}]')"))
+        };
+
         for (at, _) in APP_JS.match_indices("<button") {
             let window = &APP_JS[at..(at + 220).min(APP_JS.len())];
             // Stop at the end of the opening tag where we can find one, so a
@@ -959,7 +1110,7 @@ mod tests {
             }
             let found = attrs_near(head);
             assert!(
-                found.iter().any(|a| selector.contains(&format!("[{a}]"))),
+                found.iter().any(|a| handled(a)),
                 "button at byte {at} has no click-handled attribute (saw {found:?})"
             );
         }

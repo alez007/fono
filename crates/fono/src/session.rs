@@ -880,6 +880,8 @@ impl SessionOrchestrator {
         );
         orch.paths = Some(Arc::new(paths.clone()));
         orch.held_flags = held_flags;
+        orch.purge_expired_history();
+        orch.attach_conversation_log(paths);
         // Populate the assistant-side slots. Both are optional —
         // F8 surfaces a notification when either is missing. The
         // handle routes to the staged or the realtime slot depending
@@ -3439,6 +3441,68 @@ impl SessionOrchestrator {
         info!("assistant stop requested");
     }
 
+    /// Drop dictation transcripts past `[history].retention_days`.
+    ///
+    /// Runs once at startup, next to the conversation sweep in
+    /// [`Self::attach_conversation_log`]. A daemon that is never restarted
+    /// keeps rows a little past the cutoff, which is the same bargain the
+    /// conversation sweep makes; the alternative is a background timer
+    /// waking the process up for something with no deadline.
+    fn purge_expired_history(&self) {
+        let days = self.current_config().history.retention_days;
+        if days == 0 {
+            return;
+        }
+        let Ok(db) = self.history.try_lock() else {
+            warn!("history db busy at startup; retention sweep skipped");
+            return;
+        };
+        match db.purge_older_than(days) {
+            Ok(0) => {}
+            Ok(n) => debug!("purged {n} dictation transcript(s) past retention"),
+            Err(e) => warn!("dictation retention sweep failed: {e:#}"),
+        }
+    }
+
+    /// Attach the on-disk conversation log and, if the daemon was
+    /// restarted mid-conversation, pick up where it left off (ADR 0040).
+    ///
+    /// Called once during construction, before the orchestrator is shared,
+    /// so the session lock is guaranteed free.
+    fn attach_conversation_log(&self, paths: &Paths) {
+        let cfg = self.current_config();
+        let sink = crate::conversation_log::ConversationSink::open(
+            &paths.conversations_db(),
+            cfg.conversations.clone(),
+        );
+        let Ok(mut s) = self.assistant_session.try_lock() else {
+            warn!("assistant session busy at startup; conversations will not be saved");
+            return;
+        };
+        s.log = sink;
+        // Retention sweep, paired with the dictation one just above.
+        s.log.purge_expired();
+        // Rehydrate the rolling prompt window so a restart mid-chat does
+        // not lose the thread of the conversation.
+        let resumed = s.log.resume(cfg.assistant.history_max_turns as usize);
+        if resumed.is_empty() {
+            return;
+        }
+        let n = resumed.len();
+        for turn in resumed {
+            use fono_core::conversations::TurnRole;
+            match turn.role {
+                TurnRole::User => s.history.push_user(turn.text),
+                TurnRole::Assistant => s.history.push_assistant(turn.text),
+                // Tool traffic is recorded for the history page's audit
+                // trail, but replaying it into the prompt would need the
+                // original call IDs to stay paired — not worth it.
+                TurnRole::ToolCall | TurnRole::ToolResult => {}
+            }
+        }
+        info!("resumed the previous assistant conversation ({n} turns)");
+    }
+
     /// Stop the active assistant turn AND clear the rolling history.
     /// Backs the tray "Forget conversation" entry — a one-step
     /// "fresh start" without changing config.
@@ -3447,6 +3511,10 @@ impl SessionOrchestrator {
             let mut s = self.assistant_session.lock().await;
             s.stop_current_turn();
             s.history.clear();
+            // End the saved thread too, so the next thing said starts a
+            // fresh conversation on the history page. The past thread is
+            // kept — "forget" means "start over", not "erase" (ADR 0040).
+            s.log.close_thread();
         }
         info!("assistant history cleared");
     }

@@ -7,7 +7,9 @@ when you have explicitly chosen a cloud provider.
 
 * Raw audio buffers (they live in RAM, get handed to the STT backend,
   then dropped).
-* The SQLite history database (`~/.local/share/fono/history.sqlite`).
+* The SQLite history databases — dictation transcripts
+  (`~/.local/share/fono/history.sqlite`) and assistant conversations
+  (`~/.local/share/fono/conversations.sqlite`), both mode 0600.
 * API keys (`~/.config/fono/secrets.toml`, mode 0600, refuses to load if
   world-readable; `$ENV_VAR` references never touch disk).
 * Audio device names or application focus metadata.
@@ -68,10 +70,21 @@ link; please read before pasting a key.
 
 ## Deleting history
 
+The web settings page has a **History** view
+(<http://127.0.0.1:10808/#/history>) that browses both dictation and
+assistant conversations and can delete a single entry or clear either
+store. From the shell:
+
 ```sh
-fono history clear          # truncates the SQLite table
-rm ~/.local/share/fono/history.sqlite   # wipe the file entirely
+fono history clear          # truncates the dictation table
+rm ~/.local/share/fono/history.sqlite        # wipe dictation entirely
+rm ~/.local/share/fono/conversations.sqlite  # wipe assistant conversations
 ```
+
+The two are separate files on purpose, so erasing one leaves the other
+intact. Retention (`[history].retention_days` and
+`[conversations].retention_days`, both 90 days by default) drops older
+records automatically; set either to `0` to keep forever.
 
 ## Removing Fono
 

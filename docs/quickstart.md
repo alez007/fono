@@ -116,10 +116,13 @@ flags.
 | Whisper models | `~/.cache/fono/models/whisper/` |
 | Polish models | `~/.cache/fono/models/polish/` |
 | History DB | `~/.local/share/fono/history.sqlite` |
+| Conversations DB | `~/.local/share/fono/conversations.sqlite` |
 | IPC socket + PID | `~/.local/state/fono/` |
 
 All paths honour `XDG_*_HOME` overrides. Nothing leaves the machine
 unless you've chosen a cloud provider; see [privacy.md](privacy.md).
+Browse or delete what has been saved at
+<http://127.0.0.1:10808/#/history>.
 
 ## Where next
 

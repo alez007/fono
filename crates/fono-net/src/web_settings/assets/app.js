@@ -842,7 +842,10 @@ const FONO_SECTIONS = [
       return row('Save dictation history', '', toggle('history.enabled', true))
         + row('Retention', '', num('history.retention_days', 90, 'days'))
         + row('Redact secrets', 'Mask anything that looks like a key or password in history.', toggle('history.redact_secrets', true))
-        + '<p class="privacy-note">Audio never leaves this machine unless you pick a cloud provider.</p>';
+        + row('Save assistant conversations', 'Keep a transcript of what you asked the assistant and what it replied.', toggle('conversations.enabled', true))
+        + row('Conversation retention', '', num('conversations.retention_days', 90, 'days'))
+        + row('New conversation after', 'Silence this long starts a fresh conversation instead of continuing the last one.', num('conversations.idle_timeout_minutes', 5, 'min'))
+        + '<p class="privacy-note">Audio never leaves this machine unless you pick a cloud provider. Browse or delete everything saved here on the <a href="#/history">History page</a>.</p>';
     },
   },
   {
@@ -2295,17 +2298,24 @@ function toast(msg, isErr) {
 }
 
 // ---------- views (hash router) ----------
-// Two views share the page shell (header, toast, theme, token): the
-// settings editor (default) and the doctor report. Hash routing keeps
-// `?token=…` intact across navigation — a real path would drop it.
-function currentView() { return location.hash === '#/doctor' ? 'doctor' : 'settings'; }
+// Three views share the page shell (header, toast, theme, token): the
+// settings editor (default), the doctor report, and the history browser.
+// Hash routing keeps `?token=…` intact across navigation — a real path
+// would drop it.
+function currentView() {
+  if (location.hash === '#/doctor') return 'doctor';
+  if (location.hash === '#/history') return 'history';
+  return 'settings';
+}
 function showView() {
   const v = currentView();
   document.getElementById('view-settings').hidden = v !== 'settings';
   document.getElementById('view-doctor').hidden = v !== 'doctor';
+  document.getElementById('view-history').hidden = v !== 'history';
   document.getElementById('verchip').textContent =
     v + (meta && meta.version ? ' \u00b7 v' + meta.version : '');
   if (v === 'doctor') renderDoctor();
+  if (v === 'history') openHistory();
 }
 window.addEventListener('hashchange', showView);
 
@@ -2375,6 +2385,210 @@ function renderDoctor() {
   el.innerHTML = bar + body;
   const b = el.querySelector('#rerunbtn');
   if (b) b.addEventListener('click', fetchDoctor);
+}
+
+// ---------- history browser ----------
+// Two tabs over what Fono has saved locally: dictation transcripts
+// (GET /api/history/dictation) and assistant conversations
+// (GET /api/history/conversations). Both show the detected speaker when
+// speaker verification made a match. Loaded on first visit to #/history
+// and on explicit refresh — never polled.
+let histTab = 'dictation';
+let histDict = null, histThreads = null, histErr = null, histBusy = false;
+let histQuery = '';
+// Thread ids the user has expanded, mapped to their loaded turns.
+const histOpen = new Map();
+let histSearchTimer = null;
+
+function fmtWhen(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay ? d.toLocaleTimeString() : d.toLocaleString();
+}
+
+function openHistory() {
+  // Render immediately from cache so switching back is instant, then
+  // refresh in the background.
+  renderHistory();
+  if (histDict === null && histThreads === null) loadHistory();
+}
+
+async function loadHistory() {
+  if (histBusy) return;
+  histBusy = true;
+  renderHistory();
+  try {
+    if (histTab === 'dictation') {
+      const q = histQuery ? '&q=' + encodeURIComponent(histQuery) : '';
+      histDict = (await api('/api/history/dictation?limit=100' + q)).entries || [];
+    } else {
+      histThreads = (await api('/api/history/conversations?limit=100')).threads || [];
+    }
+    histErr = null;
+  } catch (err) {
+    histErr = err.message;
+  }
+  histBusy = false;
+  renderHistory();
+}
+
+async function toggleThread(id) {
+  if (histOpen.has(id)) { histOpen.delete(id); renderHistory(); return; }
+  histOpen.set(id, null); // placeholder → renders "loading"
+  renderHistory();
+  try {
+    const res = await api('/api/history/conversations/' + id);
+    histOpen.set(id, res.turns || []);
+  } catch (err) {
+    histOpen.set(id, []);
+    toast('Could not open that conversation: ' + err.message, true);
+  }
+  renderHistory();
+}
+
+async function deleteHistory(kind, id) {
+  const what = id ? 'this entry' : ('every saved ' + (kind === 'dictation' ? 'transcript' : 'conversation'));
+  if (!window.confirm('Permanently delete ' + what + '?')) return;
+  try {
+    const res = await api('/api/history/' + kind + (id ? '/' + id : ''), { method: 'DELETE' });
+    toast('Deleted ' + res.deleted + ' record' + (res.deleted === 1 ? '' : 's'));
+    if (kind === 'dictation') histDict = null; else { histThreads = null; histOpen.clear(); }
+    loadHistory();
+  } catch (err) {
+    toast('Could not delete: ' + err.message, true);
+  }
+}
+
+function speakerChip(name) {
+  return name ? '<span class="kbd" title="Detected speaker">' + esc(name) + '</span>' : '';
+}
+
+function renderDictationList() {
+  if (!histDict) return '<p class="hint">Loading\u2026</p>';
+  if (!histDict.length) {
+    return '<p class="hint">' + (histQuery
+      ? 'Nothing matches \u201c' + esc(histQuery) + '\u201d.'
+      : 'No dictation saved yet. Transcripts appear here once you dictate '
+        + '(unless you turned saving off in History &amp; Privacy).') + '</p>';
+  }
+  return histDict.map((e) => {
+    const where = [e.app_class, e.app_title].filter(Boolean).join(' \u00b7 ');
+    const backend = [e.stt_backend, e.language].filter(Boolean).join(' \u00b7 ');
+    return '<div class="row hrow"><div class="info">'
+      + '<div class="lbl">' + esc(e.cleaned || e.raw) + '</div>'
+      + (e.cleaned && e.cleaned !== e.raw
+        ? '<div class="desc mono">heard: ' + esc(e.raw) + '</div>' : '')
+      + '<div class="desc">' + esc(fmtWhen(e.ts)) + speakerChipSuffix(e.speaker)
+      + (where ? ' \u00b7 ' + esc(where) : '') + (backend ? ' \u00b7 ' + esc(backend) : '')
+      + '</div></div>'
+      + '<div class="ctl"><button class="btn ghost" type="button" data-hdel="' + e.id + '">Delete</button></div>'
+      + '</div>';
+  }).join('');
+}
+
+function speakerChipSuffix(name) {
+  return name ? ' \u00b7 ' + speakerChip(name) : '';
+}
+
+function renderTurns(turns) {
+  if (turns === null) return '<p class="hint">Loading\u2026</p>';
+  if (!turns.length) return '<p class="hint">This conversation has no turns.</p>';
+  const LABEL = {
+    user: 'You', assistant: 'Fono',
+    tool_call: 'Tool call', tool_result: 'Tool result',
+  };
+  return turns.map((t) => {
+    const who = t.speaker || LABEL[t.role] || t.role;
+    const meta = [fmtWhen(t.ts)];
+    if (t.latency_ms) meta.push(t.latency_ms + ' ms');
+    if (t.partial) meta.push('cut short');
+    return '<div class="turn ' + esc(t.role) + '">'
+      + '<div class="who">' + esc(who) + '</div>'
+      + '<div class="what">' + esc(t.text) + '</div>'
+      + '<div class="desc">' + esc(meta.join(' \u00b7 ')) + '</div></div>';
+  }).join('');
+}
+
+function renderThreadList() {
+  if (!histThreads) return '<p class="hint">Loading\u2026</p>';
+  if (!histThreads.length) {
+    return '<p class="hint">No conversations saved yet. They appear here after you talk to '
+      + 'the assistant (unless you turned saving off).</p>';
+  }
+  return histThreads.map((t) => {
+    const open = histOpen.has(t.id);
+    const who = (t.speakers || []).map(speakerChip).join(' ');
+    const bits = [fmtWhen(t.last_at), t.turn_count + ' turn' + (t.turn_count === 1 ? '' : 's')];
+    if (t.backend) bits.push(t.backend);
+    if (!t.ended) bits.push('still open');
+    return '<div class="hthread">'
+      + '<div class="row hrow"><div class="info">'
+      + '<div class="lbl"><button class="linkbtn" type="button" data-hthread="' + t.id + '">'
+      + (open ? '\u25bc ' : '\u25b6 ') + esc(t.preview || '(no user turn)') + '</button></div>'
+      + '<div class="desc">' + esc(bits.join(' \u00b7 ')) + (who ? ' \u00b7 ' + who : '') + '</div>'
+      + '</div><div class="ctl">'
+      + '<button class="btn ghost" type="button" data-hcdel="' + t.id + '">Delete</button>'
+      + '</div></div>'
+      + (open ? '<div class="turns">' + renderTurns(histOpen.get(t.id)) + '</div>' : '')
+      + '</div>';
+  }).join('');
+}
+
+function renderHistory() {
+  const el = document.getElementById('view-history');
+  const tab = (id, label) => '<button class="btn' + (histTab === id ? ' primary' : ' ghost')
+    + '" type="button" data-htab="' + id + '">' + label + '</button>';
+  const bar = '<div class="doctor-bar">'
+    + '<a class="btn ghost" href="#/settings">\u2190 Settings</a>'
+    + tab('dictation', 'Dictation') + tab('conversations', 'Conversations')
+    + '<span class="hint" style="margin-left:auto">' + (histBusy ? 'loading\u2026' : '') + '</span>'
+    + '<button class="btn ghost" type="button" id="hclear">Clear all</button>'
+    + '<button class="btn" type="button" id="hrefresh"' + (histBusy ? ' disabled' : '') + '>Refresh</button>'
+    + '</div>';
+  const search = histTab === 'dictation'
+    ? '<div class="search"><span style="color:var(--ink-dim)">\u2315</span>'
+      + '<input id="hq" placeholder="Search transcripts\u2026" autocomplete="off" value="'
+      + esc(histQuery) + '" /></div>'
+    : '';
+  const body = histErr
+    ? '<p class="privacy-note">Could not load history: ' + esc(histErr) + '</p>'
+    : histTab === 'dictation' ? renderDictationList() : renderThreadList();
+  el.innerHTML = bar + search
+    + '<div class="hlist">' + body + '</div>'
+    + '<p class="privacy-note" style="margin-top:20px;">Everything here is stored only on '
+    + 'this machine. Retention and secret redaction are configured under History &amp; Privacy.</p>';
+
+  el.querySelector('#hrefresh').addEventListener('click', () => {
+    if (histTab === 'dictation') histDict = null; else { histThreads = null; histOpen.clear(); }
+    loadHistory();
+  });
+  el.querySelector('#hclear').addEventListener('click', () => deleteHistory(histTab, null));
+  el.querySelectorAll('[data-htab]').forEach((b) => b.addEventListener('click', () => {
+    histTab = b.dataset.htab;
+    renderHistory();
+    if (histTab === 'dictation' ? histDict === null : histThreads === null) loadHistory();
+  }));
+  el.querySelectorAll('[data-hthread]').forEach((b) =>
+    b.addEventListener('click', () => toggleThread(Number(b.dataset.hthread))));
+  el.querySelectorAll('[data-hdel]').forEach((b) =>
+    b.addEventListener('click', () => deleteHistory('dictation', Number(b.dataset.hdel))));
+  el.querySelectorAll('[data-hcdel]').forEach((b) =>
+    b.addEventListener('click', () => deleteHistory('conversations', Number(b.dataset.hcdel))));
+  const q = el.querySelector('#hq');
+  if (q) {
+    q.addEventListener('input', (e) => {
+      histQuery = e.target.value;
+      clearTimeout(histSearchTimer);
+      histSearchTimer = setTimeout(() => { histDict = null; loadHistory(); }, 250);
+    });
+    // Re-rendering replaces the node, so restore focus + caret.
+    if (document.activeElement !== q && histQuery) {
+      q.focus();
+      q.setSelectionRange(histQuery.length, histQuery.length);
+    }
+  }
 }
 
 // ---------- search + theme ----------

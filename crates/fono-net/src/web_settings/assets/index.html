@@ -16,6 +16,7 @@
       <span class="hint mono" id="verchip">settings</span>
     </div>
     <div class="actions">
+      <a class="iconbtn" id="historybtn" href="#/history" title="Browse saved history" aria-label="Browse saved history">&#9776;</a>
       <a class="iconbtn" id="doctorbtn" href="#/doctor" title="System health" aria-label="System health">&hellip;</a>
       <button class="iconbtn" id="themebtn" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">&#9680;</button>
     </div>
@@ -30,6 +31,7 @@
   <p class="privacy-note" style="margin-top:20px;">Config lives at <span class="kbd" id="cfgpath">&hellip;</span> &mdash; audio never leaves this machine unless you pick a cloud provider.</p>
   </div>
   <div id="view-doctor" hidden></div>
+  <div id="view-history" hidden></div>
 </main>
 <div class="unsaved" id="unsaved" hidden>
   <span class="msg"><b id="dirtymsg">0 unsaved changes</b></span>

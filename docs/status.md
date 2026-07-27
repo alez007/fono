@@ -1,6 +1,41 @@
 # Fono — Project Status
 Last updated: 2026-07-27
 
+## 2026-07-27 — Assistant conversations are saved, and there is a page to read them
+
+Everything you dictate was already kept in `history.sqlite`; everything you
+*said to the assistant* was not. Conversation context lived only in the
+daemon's memory, so restarting Fono erased every exchange, and there was no way
+to look back at what the assistant had actually replied or which devices it had
+touched on your behalf. That gap is closed.
+
+**Conversations now live in `conversations.sqlite`.** A new store in
+`fono-core` keeps threads and turns, with the speaker recorded per turn rather
+than per thread — several people can talk to Fono in one sitting, and the
+transcript says who said what. Tool calls the assistant makes are written as
+their own rows, so there is an audit trail for anything that reached a real
+device. Names are stored as historical facts: deleting somebody's voice
+enrolment no longer silently rewrites the past. A conversation ends after an
+idle timeout, and the tray's "Forget conversation" now closes the thread
+instead of destroying it — deleting is an explicit choice you make on the page.
+
+**A new History page at `#/history`.** Reachable from the icon beside the
+doctor button, it has two tabs: Dictation, with full-text search and the
+detected speaker shown against each entry, and Conversations, listing threads
+you can expand into their turns. Delete a single entry, or clear the lot.
+Everything is behind the same auth gate as the rest of the settings server.
+
+**Two things the audit turned up on the way.** Dictation retention was
+configured but never actually enforced — `purge_older_than` existed and was
+only ever called by its own tests, so history grew forever regardless of the
+setting. Both dictation and conversation retention now run a sweep at startup.
+And `tools.sqlite` was world-readable at `0644` while its siblings were `0600`,
+which let any local user enumerate your smart-home devices and rooms; it is
+clamped to `0600` like the rest.
+
+The orphaned `notes_db()` accessor, declared but pointing at a file that never
+existed, has been removed.
+
 ## 2026-07-27 — "Turn on the light in the office" turned on the air conditioning
 
 Three separate bugs, all found in one trace

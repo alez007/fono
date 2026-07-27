@@ -25,6 +25,7 @@ pub mod api_key_auth;
 pub mod assistant;
 pub mod audio_recovery;
 pub mod cli;
+pub mod conversation_log;
 pub mod daemon;
 pub mod doctor;
 pub mod install;

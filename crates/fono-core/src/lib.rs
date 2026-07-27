@@ -5,6 +5,7 @@
 
 pub mod api_keys;
 pub mod config;
+pub mod conversations;
 pub mod correction;
 pub mod critical_notify;
 pub mod error;

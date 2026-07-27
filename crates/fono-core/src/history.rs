@@ -264,6 +264,19 @@ impl HistoryDb {
             .conn
             .query_row("SELECT COUNT(*) FROM transcriptions", [], |r| r.get::<_, i64>(0))?)
     }
+
+    /// Delete one entry by id, or every entry when `id` is `None`. Backs
+    /// the history page's per-row and "clear all" controls. Returns the
+    /// number of rows removed. The FTS index follows via its triggers.
+    pub fn delete(&self, id: Option<i64>) -> Result<usize> {
+        let n = match id {
+            Some(id) => {
+                self.conn.execute("DELETE FROM transcriptions WHERE id = ?1", params![id])?
+            }
+            None => self.conn.execute("DELETE FROM transcriptions", [])?,
+        };
+        Ok(n)
+    }
 }
 
 fn row_to_transcription(r: &rusqlite::Row<'_>) -> rusqlite::Result<Transcription> {

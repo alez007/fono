@@ -23,7 +23,12 @@ lightweight gate so only enrolled voices trigger certain flows.
 - The embedding is **never** attached to a cloud STT or LLM request —
   turning verification on does not change what is sent to a provider (a
   regression test enforces this). At most a matched speaker's **name** is
-  stored in the local history database.
+  stored in the local history databases.
+
+The name is recorded as a **historical fact** on each dictation and each
+conversation turn, so deleting someone's enrollment does not rewrite what
+was already saved. Browse the attributions at
+<http://127.0.0.1:10808/#/history>.
 
 See [privacy.md](privacy.md) for the full data-flow statement.
 

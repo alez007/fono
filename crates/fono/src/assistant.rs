@@ -41,6 +41,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info, warn};
 
+use crate::conversation_log::ConversationSink;
 use crate::session::{
     format_assistant_summary, AssistantToolMetric, AssistantToolOutcome, AssistantTurnMetrics,
 };
@@ -57,6 +58,13 @@ use crate::session::{
 /// pump to abort and drains the audio queue.
 pub struct AssistantSessionState {
     pub history: ConversationHistory,
+    /// Write-through mirror of `history` onto disk (ADR 0040). The
+    /// in-memory buffer above stays authoritative for prompt building —
+    /// it is on the latency-critical path — while this records the same
+    /// turns at turn boundaries so the conversation survives a restart
+    /// and can be reviewed in the history page. Disabled (and no file
+    /// created) when `[conversations].enabled = false`.
+    pub log: ConversationSink,
     pub current_turn: Option<Arc<Notify>>,
     pub playback: Option<AudioPlayback>,
     /// Active full-duplex live-conversation session, when one is open.
@@ -70,10 +78,19 @@ pub struct AssistantSessionState {
 }
 
 impl AssistantSessionState {
+    /// Construct with conversation persistence switched off. Used by
+    /// tests and by configurations without an assistant.
     #[must_use]
     pub fn new(history: ConversationHistory) -> Self {
+        Self::with_log(history, ConversationSink::disabled())
+    }
+
+    /// Construct with a persistence sink attached.
+    #[must_use]
+    pub fn with_log(history: ConversationHistory, log: ConversationSink) -> Self {
         Self {
             history,
+            log,
             current_turn: None,
             playback: None,
             #[cfg(feature = "realtime")]
@@ -481,6 +498,9 @@ pub async fn run_assistant_turn(
         let mut s = state.lock().await;
         let snapshot = s.history.snapshot();
         s.history.push_user(user_text.clone());
+        // Mirror the same turn to disk, carrying the verified speaker so
+        // the history page can show who was talking (ADR 0040).
+        s.log.record_user(&user_text, metrics.speaker.as_deref(), Some(assistant.name()));
         drop(s);
         if let Some(t) = &trace {
             t.duration_between(
@@ -601,6 +621,7 @@ pub async fn run_assistant_turn(
             turn_started,
             llm_started,
             trace.as_ref(),
+            assistant.name(),
         )
         .await;
     };
@@ -937,17 +958,27 @@ pub async fn run_assistant_turn(
     //    cancelled turn cannot leave history half-rebuilt.
     {
         let mut s = state.lock().await;
+        let provider = assistant.name();
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
+                    // Persist before the move: the rolling log takes
+                    // ownership, but the audit trail wants name + args.
+                    s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
+                    s.log.record_tool_result(&summary, Some(provider));
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
         }
         if !full_reply.trim().is_empty() {
+            // `aborted_mid_stream` marks a reply the user cancelled part
+            // way through. It is saved anyway, flagged partial — "what did
+            // it manage to say before I stopped it?" is exactly what
+            // someone reviews later.
+            s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
             s.history.push_assistant(full_reply.trim().to_string());
         }
     }
@@ -1093,6 +1124,8 @@ async fn drive_text_only_reply(
     turn_started: std::time::Instant,
     llm_started: std::time::Instant,
     trace: Option<&TurnTrace>,
+    // Backend name recorded against each persisted turn.
+    provider: &str,
 ) -> Result<bool> {
     let mut full_reply = String::new();
     let mut tool_event_log: Vec<ToolEvent> = Vec::new();
@@ -1180,14 +1213,17 @@ async fn drive_text_only_reply(
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
+                    s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
+                    s.log.record_tool_result(&summary, Some(provider));
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
         }
         if !full_reply.trim().is_empty() {
+            s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
             s.history.push_assistant(full_reply.trim().to_string());
         }
     }
@@ -1948,10 +1984,15 @@ pub async fn run_realtime_turn(
     // Record both turns under a single lock.
     {
         let mut s = state.lock().await;
+        let provider = realtime.name();
         if let Some(u) = reply.user_text.as_ref().map(|u| u.trim()).filter(|u| !u.is_empty()) {
+            // The realtime backend transcribes the user itself, so there
+            // is no verified speaker to attribute the turn to here.
+            s.log.record_user(u, None, Some(provider));
             s.history.push_user(u.to_string());
         }
         if !reply.reply_text.trim().is_empty() {
+            s.log.record_assistant(reply.reply_text.trim(), reply.aborted, None, Some(provider));
             s.history.push_assistant(reply.reply_text.trim().to_string());
         }
     }
@@ -2303,6 +2344,7 @@ pub async fn run_live_session(
         turns: 0,
         max_session,
         started_at: std::time::Instant::now(),
+        provider: realtime.name(),
     };
     let exit = pump.run().await;
     let turns = pump.turns;
@@ -2605,6 +2647,8 @@ struct LivePump<'a> {
     turns: u32,
     max_session: std::time::Duration,
     started_at: std::time::Instant,
+    /// Realtime provider name, recorded against each persisted turn.
+    provider: &'a str,
 }
 
 #[cfg(feature = "realtime")]
@@ -2732,10 +2776,15 @@ impl LivePump<'_> {
                                     .map(|u| u.trim().to_string())
                                     .filter(|u| !u.is_empty())
                                 {
+                                    // Live turns are transcribed by the
+                                    // provider, so no verified speaker.
+                                    st.log.record_user(&u, None, Some(self.provider));
                                     st.history.push_user(u);
                                 }
                                 if !reply_text.trim().is_empty() {
-                                    st.history.push_assistant(reply_text.trim().to_string());
+                                    let reply = reply_text.trim();
+                                    st.log.record_assistant(reply, false, None, Some(self.provider));
+                                    st.history.push_assistant(reply.to_string());
                                 }
                             }
                             reply_text.clear();
@@ -3103,6 +3152,7 @@ mod tests {
             // Timer disabled: drive the loop purely by the event script.
             max_session: std::time::Duration::ZERO,
             started_at: std::time::Instant::now(),
+            provider: "test",
         }
     }
 
