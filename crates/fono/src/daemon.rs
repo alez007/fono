@@ -109,6 +109,38 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
             config_dirty = true;
         }
     }
+    // Resolve "on, but nowhere chosen yet" for the two language-model
+    // roles. `none` on an *enabled* role is not a choice — it is the
+    // absence of one, and it used to leave the role silently dead. Pick
+    // the best thing actually available (a configured server, then a
+    // saved cloud key, then the on-device model) and write it down, so
+    // what the user sees in the tray and in `config.toml` is what is
+    // really running. A role that is switched **off** is left alone.
+    let secrets = Secrets::load(&paths.secrets_file()).context("load secrets")?;
+    for (role, enabled, backend, url) in [
+        ("cleanup", config.polish.enabled, &mut config.polish.backend, &config.polish.network.url),
+        (
+            "assistant",
+            config.assistant.enabled,
+            &mut config.assistant.backend,
+            &config.assistant.network.url,
+        ),
+    ] {
+        let resolved = fono_core::providers::resolve_llm_backend(
+            *backend,
+            enabled,
+            &secrets,
+            !url.trim().is_empty(),
+        );
+        if resolved != *backend {
+            info!(
+                "{role} is enabled with no backend chosen: defaulting to {}",
+                fono_core::providers::llm_backend_str(&resolved)
+            );
+            *backend = resolved;
+            config_dirty = true;
+        }
+    }
     if config_dirty {
         if let Err(e) = config.save(&config_path) {
             warn!("could not persist auto-populated config: {e:#}");
@@ -122,7 +154,6 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     // `"auto"` default so debug overrides via the shell still win.
     apply_inject_backend_env(&config.inject);
     let config = Arc::new(config);
-    let secrets = Secrets::load(&paths.secrets_file()).context("load secrets")?;
     print_banner(paths, &config, verbosity);
 
     // Best-effort, non-blocking voice-discovery refresh at daemon start.
@@ -478,24 +509,24 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         // to see it appear in the menu (v0.1 trade-off).
         let stt_backends: Vec<_> =
             fono_core::providers::configured_stt_backends(&secrets, &config.stt.backend);
-        let polish_backends: Vec<_> =
-            fono_core::providers::configured_polish_backends(&secrets, &config.polish.backend);
-        // Assistant + TTS submenus mirror the STT/LLM ones. We show
+        // Cleanup / assistant / TTS submenus mirror the STT one. We show
         // every "configured" backend (key present in secrets, plus
         // None / Local / Wyoming which never need a key) and the
         // active one even if its key is missing — same convention as
-        // STT/LLM. Snapshot at startup; users who add a key via
-        // `fono keys add` need a daemon restart to see it appear.
-        let assistant_backends: Vec<_> = fono_core::providers::all_assistant_backends()
-            .into_iter()
-            .filter(|b| {
-                let active = *b == config.assistant.backend;
-                let needs_key = fono_core::providers::assistant_requires_key(b);
-                active
-                    || !needs_key
-                    || secrets.resolve(fono_core::providers::assistant_key_env(b)).is_some()
-            })
-            .collect();
+        // STT. `network` only appears once the role actually has a
+        // server address, since a row pointing nowhere is a dead end.
+        // Snapshot at startup; users who add a key via `fono keys add`
+        // need a daemon restart to see it appear.
+        let polish_backends: Vec<_> = fono_core::providers::configured_llm_backends(
+            &secrets,
+            &config.polish.backend,
+            !config.polish.network.url.trim().is_empty(),
+        );
+        let assistant_backends: Vec<_> = fono_core::providers::configured_llm_backends(
+            &secrets,
+            &config.assistant.backend,
+            !config.assistant.network.url.trim().is_empty(),
+        );
         let tts_backends: Vec<_> = fono_core::providers::configured_tts_backends(
             &secrets,
             &config.tts.backend,
@@ -507,11 +538,20 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
             .collect();
         let polish_labels: Vec<String> = polish_backends
             .iter()
-            .map(|b| fono_core::providers::polish_backend_str(b).to_string())
+            .map(|b| {
+                llm_menu_label(*b, &config.polish.network, &config.polish.local.model, &secrets)
+            })
             .collect();
         let assistant_labels: Vec<String> = assistant_backends
             .iter()
-            .map(|b| fono_core::providers::assistant_backend_str(b).to_string())
+            .map(|b| {
+                llm_menu_label(
+                    *b,
+                    &config.assistant.network,
+                    &config.assistant.local.model,
+                    &secrets,
+                )
+            })
             .collect();
         let tts_labels: Vec<String> =
             tts_backends.iter().map(|b| tts_menu_label(b, &secrets)).collect();
@@ -540,9 +580,9 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                         .map(|c| {
                             (
                                 fono_core::providers::stt_backend_str(&c.stt.backend).to_string(),
-                                fono_core::providers::polish_backend_str(&c.polish.backend)
+                                fono_core::providers::llm_backend_str(&c.polish.backend)
                                     .to_string(),
-                                fono_core::providers::assistant_backend_str(&c.assistant.backend)
+                                fono_core::providers::llm_backend_str(&c.assistant.backend)
                                     .to_string(),
                                 fono_core::providers::tts_backend_str(&c.tts.backend).to_string(),
                             )
@@ -560,12 +600,12 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                 .unwrap_or(u8::MAX);
             let llm_idx = polish_backends
                 .iter()
-                .position(|b| fono_core::providers::polish_backend_str(b) == polish_str)
+                .position(|b| fono_core::providers::llm_backend_str(b) == polish_str)
                 .and_then(|i| u8::try_from(i).ok())
                 .unwrap_or(u8::MAX);
             let assistant_idx = assistant_backends
                 .iter()
-                .position(|b| fono_core::providers::assistant_backend_str(b) == assistant_str)
+                .position(|b| fono_core::providers::llm_backend_str(b) == assistant_str)
                 .and_then(|i| u8::try_from(i).ok())
                 .unwrap_or(u8::MAX);
             let tts_idx = tts_backends
@@ -1079,24 +1119,20 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         // user clicked (the indices come from the filtered submenu).
         let stt_backends_for_dispatch: Vec<_> =
             fono_core::providers::configured_stt_backends(&secrets, &config.stt.backend);
-        let llm_backends_for_dispatch: Vec<_> =
-            fono_core::providers::configured_polish_backends(&secrets, &config.polish.backend);
-        // Assistant + TTS dispatch lists mirror the tray's filter
-        // (active + key-present + no-key-needed) so a click resolves
-        // back to the same backend the user saw. Rebuilt here
-        // because the active_provider closure moved the original
-        // vectors when it was constructed.
-        let assistant_backends_for_dispatch: Vec<_> =
-            fono_core::providers::all_assistant_backends()
-                .into_iter()
-                .filter(|b| {
-                    let active = *b == config.assistant.backend;
-                    let needs_key = fono_core::providers::assistant_requires_key(b);
-                    active
-                        || !needs_key
-                        || secrets.resolve(fono_core::providers::assistant_key_env(b)).is_some()
-                })
-                .collect();
+        // Cleanup / assistant / TTS dispatch lists mirror the tray's
+        // filter exactly so a click resolves back to the same backend
+        // the user saw. Rebuilt here because the active_provider
+        // closure moved the original vectors when it was constructed.
+        let llm_backends_for_dispatch: Vec<_> = fono_core::providers::configured_llm_backends(
+            &secrets,
+            &config.polish.backend,
+            !config.polish.network.url.trim().is_empty(),
+        );
+        let assistant_backends_for_dispatch: Vec<_> = fono_core::providers::configured_llm_backends(
+            &secrets,
+            &config.assistant.backend,
+            !config.assistant.network.url.trim().is_empty(),
+        );
         let tts_backends_for_dispatch: Vec<_> = fono_core::providers::configured_tts_backends(
             &secrets,
             &config.tts.backend,
@@ -2337,6 +2373,61 @@ fn tts_menu_label(b: &fono_core::config::TtsBackend, secrets: &fono_core::Secret
     }
 }
 
+/// Render the tray submenu label for an LLM backend (cleanup or
+/// assistant — both roles share [`fono_core::config::LlmBackend`]).
+///
+/// The three non-cloud rows say what they actually are rather than
+/// echoing the config token: `local` names the GGUF it will load and
+/// `network` names the host it will call, so the menu answers "where
+/// does my text go?" at a glance instead of showing an opaque word.
+/// Cloud rows use the catalogue display name and are greyed-out via
+/// [`fono_tray::DISABLED_SENTINEL`] when their API key is missing.
+fn llm_menu_label(
+    b: fono_core::config::LlmBackend,
+    net: &fono_core::config::LlmNetwork,
+    local_model: &str,
+    secrets: &fono_core::Secrets,
+) -> String {
+    use fono_core::config::LlmBackend;
+    let canonical = fono_core::providers::llm_backend_str(&b);
+    match b {
+        LlmBackend::None => "Off (disabled)".to_string(),
+        LlmBackend::Local => {
+            if local_model.is_empty() {
+                "On this computer".to_string()
+            } else {
+                format!("On this computer ({local_model})")
+            }
+        }
+        LlmBackend::Network => network_host(&net.url).map_or_else(
+            || format!("{}My own server (no address set)", fono_tray::DISABLED_SENTINEL),
+            |host| format!("My own server ({host})"),
+        ),
+        _ => {
+            let display = fono_core::provider_catalog::find(canonical)
+                .map_or_else(|| canonical.to_string(), |p| p.display_name.to_string());
+            if secrets.has_in_file(fono_core::providers::llm_key_env(&b)) {
+                display
+            } else {
+                format!("{}{display} (no API key)", fono_tray::DISABLED_SENTINEL)
+            }
+        }
+    }
+}
+
+/// `host[:port]` from a configured network URL, for compact tray labels.
+/// Falls back to the trimmed URL when it has no recognisable authority,
+/// and to `None` when nothing is configured at all.
+fn network_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    Some(if authority.is_empty() { trimmed.to_string() } else { authority.to_string() })
+}
+
 fn local_wyoming_fullname(config: &Config) -> Option<String> {
     if !config.server.wyoming.enabled {
         return None;
@@ -2430,16 +2521,16 @@ async fn switch_discovered_stt_via_tray(
 async fn switch_llm_via_tray(
     paths: &fono_core::Paths,
     orch: Option<&Arc<crate::session::SessionOrchestrator>>,
-    backends: &[fono_core::config::PolishBackend],
+    backends: &[fono_core::config::LlmBackend],
     idx: u8,
 ) {
     let Some(backend) = backends.get(idx as usize) else {
         warn!("tray UsePolish({idx}): out of range (max={})", backends.len());
         return;
     };
-    let label = fono_core::providers::polish_backend_str(backend);
+    let label = fono_core::providers::llm_backend_str(backend);
     let config_path = paths.config_file();
-    let backend_clone = backend.clone();
+    let backend_clone = *backend;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let mut cfg = fono_core::Config::load(&config_path)?;
         crate::cli::set_active_llm(&mut cfg, backend_clone);
@@ -2450,7 +2541,7 @@ async fn switch_llm_via_tray(
     match result {
         Ok(Ok(())) => {
             info!("tray: switched LLM to {label}");
-            if matches!(backend, fono_core::config::PolishBackend::Local)
+            if matches!(backend, fono_core::config::LlmBackend::Local)
                 && !ensure_local_polish_with_notify(paths).await
             {
                 return;
@@ -2490,16 +2581,16 @@ async fn switch_llm_via_tray(
 async fn switch_assistant_via_tray(
     paths: &fono_core::Paths,
     orch: Option<&Arc<crate::session::SessionOrchestrator>>,
-    backends: &[fono_core::config::AssistantBackend],
+    backends: &[fono_core::config::LlmBackend],
     idx: u8,
 ) {
     let Some(backend) = backends.get(idx as usize) else {
         warn!("tray UseAssistant({idx}): out of range (max={})", backends.len());
         return;
     };
-    let label = fono_core::providers::assistant_backend_str(backend);
+    let label = fono_core::providers::llm_backend_str(backend);
     let config_path = paths.config_file();
-    let backend_clone = backend.clone();
+    let backend_clone = *backend;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let mut cfg = fono_core::Config::load(&config_path)?;
         crate::cli::set_active_assistant(&mut cfg, backend_clone);
@@ -2511,10 +2602,10 @@ async fn switch_assistant_via_tray(
         Ok(Ok(())) => {
             info!("tray: switched assistant to {label}");
             // Auto-download the embedded local GGUF before reloading, mirroring
-            // the STT/polish/TTS switch paths; skips silently for cloud/manual
+            // the STT/polish/TTS switch paths; skips silently for cloud/network
             // backends. Without this, switching to the local assistant would
             // reload straight into a "model not found" error.
-            if matches!(backend, fono_core::config::AssistantBackend::Ollama)
+            if matches!(backend, fono_core::config::LlmBackend::Local)
                 && !ensure_local_assistant_with_notify(paths).await
             {
                 return;
@@ -4029,9 +4120,10 @@ fn web_settings_hooks(
     let list_utterances = list_utterances_hook(paths);
     let delete_utterance = delete_utterance_hook(paths);
     let speak = speech_hook(config_path.clone(), secrets_path.clone(), paths.voices_dir());
-    let meta = meta_hook(config_path, secrets_path);
+    let meta = meta_hook(config_path, secrets_path, paths.polish_models_dir());
     let doctor = doctor_hook(paths);
     let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths);
+    let probe_llm = probe_llm_hook(paths);
 
     fono_net::WebSettingsHooks {
         get_config,
@@ -4056,7 +4148,79 @@ fn web_settings_hooks(
         list_tools,
         set_tool_enabled,
         discover_tools,
+        probe_llm,
     }
+}
+
+/// `POST /api/llm/probe`: ask a self-hosted OpenAI-compatible server what
+/// models it serves, so the settings page can prove the address works and
+/// offer a real model list instead of a free-text field.
+///
+/// Runs daemon-side because the server usually lives on the LAN, where the
+/// browser either cannot reach it or is blocked by CORS. Nothing is stored:
+/// the URL under test may be one the user has typed but not saved yet.
+fn probe_llm_hook(paths: &Paths) -> fono_net::web_settings::ProbeLlmFn {
+    let secrets_path = paths.secrets_file();
+    Arc::new(move |spec| {
+        let secrets_path = secrets_path.clone();
+        Box::pin(async move {
+            let net = fono_core::config::LlmNetwork {
+                url: spec.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                model: String::new(),
+                api_key_ref: spec
+                    .get("api_key_ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            };
+            let url = net.models_url();
+            if url.is_empty() {
+                return Err("enter a server address first".to_string());
+            }
+
+            let mut req = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?
+                .get(&url);
+            // Optional bearer, for gateways that require one. Most local
+            // servers need none, so a missing secret is not an error.
+            if !net.api_key_ref.is_empty() {
+                let secrets = Secrets::load(&secrets_path).unwrap_or_default();
+                if let Some(token) = secrets.resolve(&net.api_key_ref) {
+                    req = req.bearer_auth(token);
+                }
+            }
+
+            let resp = req.send().await.map_err(|e| format!("cannot reach {url}: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("{url} answered {status}"));
+            }
+            let body: serde_json::Value =
+                resp.json().await.map_err(|e| format!("{url} returned invalid JSON: {e}"))?;
+
+            // OpenAI shape is `{"data":[{"id":…}]}`; Ollama's native
+            // `/api/tags` uses `{"models":[{"name":…}]}`. Accept both so a
+            // pasted native URL still yields a useful list.
+            let rows = body
+                .get("data")
+                .or_else(|| body.get("models"))
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("{url} returned no model list"))?;
+            let mut models: Vec<String> = rows
+                .iter()
+                .filter_map(|m| {
+                    m.get("id")
+                        .or_else(|| m.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .collect();
+            models.sort_unstable();
+            Ok(serde_json::json!({ "ok": true, "count": models.len(), "models": models }))
+        })
+    })
 }
 
 /// `POST /api/secret/{name}`: store or clear one write-only secret.
@@ -4506,6 +4670,7 @@ fn stt_backend_from_token(token: &str) -> Option<fono_core::config::SttBackend> 
 fn meta_hook(
     config_path: std::path::PathBuf,
     secrets_path: std::path::PathBuf,
+    llm_models_dir: std::path::PathBuf,
 ) -> fono_net::web_settings::MetaFn {
     Arc::new(move || {
         use fono_core::providers as p;
@@ -4513,11 +4678,8 @@ fn meta_hook(
         for b in p::all_stt_backends() {
             names.insert(p::stt_key_env(&b));
         }
-        for b in p::all_polish_backends() {
-            names.insert(p::polish_key_env(&b));
-        }
-        for b in p::all_assistant_backends() {
-            names.insert(p::assistant_key_env(&b));
+        for b in p::all_llm_backends() {
+            names.insert(p::llm_key_env(&b));
         }
         for b in p::all_tts_backends() {
             names.insert(p::tts_key_env(&b));
@@ -4552,6 +4714,7 @@ fn meta_hook(
             },
             "tts_local": tts_local_meta(),
             "tts_cloud": tts_cloud_meta(&secrets),
+            "llm_local": llm_local_meta(&llm_models_dir),
             "defaults": {
                 "polish_prompt_main": fono_core::config::default_prompt_main(),
                 "polish_prompt_advanced": fono_core::config::default_prompt_advanced(),
@@ -4559,6 +4722,26 @@ fn meta_hook(
             },
         })
     })
+}
+
+/// On-device LLM catalogue for the settings UI: every GGUF the registry
+/// knows, whether it is already downloaded, and its approximate size.
+/// Feeds the Cleanup / Assistant "Local" model dropdown, so a typo can no
+/// longer hide until first use, and the user can see what a pick will cost
+/// to fetch before choosing it.
+fn llm_local_meta(models_dir: &std::path::Path) -> serde_json::Value {
+    let models: Vec<serde_json::Value> = fono_polish::LOCAL_LLM_MODELS
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.name,
+                "display_name": m.display_name,
+                "approx_mb": m.approx_mb,
+                "installed": models_dir.join(format!("{}.gguf", m.name)).exists(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "models": models })
 }
 
 /// Local-TTS engine + voice metadata for the settings UI: the engine picker

@@ -413,7 +413,7 @@ impl Tray {
 ///   transcriptions" submenu. Pass a noop (`|| Vec::new()`) to disable.
 /// * `stt_labels` / `polish_labels` — display strings for each STT / LLM
 ///   backend, in canonical order (the order the daemon also iterates
-///   when decoding indices back to `SttBackend` / `PolishBackend`).
+///   when decoding indices back to `SttBackend` / `LlmBackend`).
 /// * `active_provider` — invoked on the same poll; returns the indices
 ///   of the currently-active STT and LLM in the slices above. Used to
 ///   paint the active-marker (`●`) and migrate it on `Reload`.

@@ -687,19 +687,28 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
 
         writeln!(out, "{}", head("Providers (LLM):"))?;
         col.section("Providers (LLM)");
-        for b in fono_core::providers::all_polish_backends() {
+        for b in fono_core::providers::all_llm_backends() {
             let active = b == c.polish.backend;
             let mark = star(active);
-            let name = fono_core::providers::polish_backend_str(&b);
-            let needs_key = fono_core::providers::polish_requires_key(&b);
-            let key_env = fono_core::providers::polish_key_env(&b);
+            let name = fono_core::providers::llm_backend_str(&b);
+            let needs_key = fono_core::providers::llm_requires_key(&b);
+            let key_env = fono_core::providers::llm_key_env(&b);
             let (sev, key_status) = key_status(needs_key, key_env, &secrets, &probes);
-            let model = if matches!(b, fono_core::config::PolishBackend::None) {
-                "—".to_string()
-            } else if needs_key || matches!(b, fono_core::config::PolishBackend::Ollama) {
-                fono_polish::defaults::default_cloud_model(name).to_string()
-            } else {
-                c.polish.local.model.clone()
+            let model = match b {
+                fono_core::config::LlmBackend::None => "—".to_string(),
+                // The self-hosted server names its own model; show what
+                // the user actually configured, and where it points.
+                fono_core::config::LlmBackend::Network => {
+                    if c.polish.network.url.is_empty() {
+                        dim("url=(unset)")
+                    } else if c.polish.network.model.is_empty() {
+                        fono_polish::defaults::default_cloud_model(name).to_string()
+                    } else {
+                        c.polish.network.model.clone()
+                    }
+                }
+                fono_core::config::LlmBackend::Local => c.polish.local.model.clone(),
+                _ => fono_polish::defaults::default_cloud_model(name).to_string(),
             };
             writeln!(out, "  {mark} {name:<14} model: {model:<32} {key_status}")?;
             col.push(
@@ -712,15 +721,30 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
 
         writeln!(out, "{}", head("Providers (assistant):"))?;
         col.section("Providers (assistant)");
-        for b in fono_core::providers::all_assistant_backends() {
+        for b in fono_core::providers::all_llm_backends() {
             let active = b == c.assistant.backend;
             let mark = star(active);
-            let name = fono_core::providers::assistant_backend_str(&b);
-            let needs_key = fono_core::providers::assistant_requires_key(&b);
-            let key_env = fono_core::providers::assistant_key_env(&b);
+            let name = fono_core::providers::llm_backend_str(&b);
+            let needs_key = fono_core::providers::llm_requires_key(&b);
+            let key_env = fono_core::providers::llm_key_env(&b);
             let (sev, key_status) = key_status(needs_key, key_env, &secrets, &probes);
-            writeln!(out, "  {mark} {name:<14} {key_status}")?;
-            col.push(sev, name, &format!("{}{key_status}", if active { "(active) " } else { "" }));
+            // The two self-hosted rows say where they point / what they
+            // load; the key status alone would be meaningless for them.
+            let detail = match b {
+                fono_core::config::LlmBackend::Network => {
+                    if c.assistant.network.url.is_empty() {
+                        dim("url=(unset)")
+                    } else {
+                        format!("url={}", c.assistant.network.url)
+                    }
+                }
+                fono_core::config::LlmBackend::Local => {
+                    format!("model={}", c.assistant.local.model)
+                }
+                _ => key_status,
+            };
+            writeln!(out, "  {mark} {name:<14} {detail}")?;
+            col.push(sev, name, &format!("{}{detail}", if active { "(active) " } else { "" }));
         }
         writeln!(out)?;
 

@@ -137,8 +137,7 @@ impl Tool for SummarizeTool {
         }
         let voice = arguments.get("voice").and_then(|v| v.as_str()).map(String::from);
         let silent = arguments.get("silent").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        let assistant_backend =
-            fono_core::providers::assistant_backend_str(&self.cfg.assistant.backend);
+        let assistant_backend = fono_core::providers::llm_backend_str(&self.cfg.assistant.backend);
         let tts_backend = fono_core::providers::tts_backend_str(&self.cfg.tts.backend);
         let text_len = payload.message_text.len();
 

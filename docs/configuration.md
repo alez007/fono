@@ -404,7 +404,7 @@ switching it off breaks commands in any language your rooms are not
 named in. It is deliberately file-only, with no checkbox in the web UI.
 
 **Not every assistant backend can act.** Only the OpenAI-compatible
-chat backends (`openai`, `ollama`, and anything else speaking that wire
+chat backends (`openai`, `network`, and anything else speaking that wire
 format) can invoke tools today; the embedded local model and the
 Anthropic backend cannot. Rather than let a backend that cannot act
 reply "I'll turn the light on" while nothing happens, Fono withholds the

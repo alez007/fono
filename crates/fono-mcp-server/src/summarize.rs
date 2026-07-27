@@ -17,7 +17,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use fono_assistant::AssistantContext;
-use fono_core::config::{default_summarize_prompt, AssistantBackend, Config};
+use fono_core::config::{default_summarize_prompt, Config, LlmBackend};
 use fono_core::Secrets;
 
 /// Maximum number of `message_text` characters fed to the LLM. Inputs
@@ -55,33 +55,36 @@ const LOCAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const SUMMARY_MAX_NEW_TOKENS: u32 = 96;
 
 /// `(open, drain)` timeout pair for the given backend shape.
-/// `Ollama` covers both the embedded local model and a manually
-/// configured local server; everything else is a cloud provider.
-fn llm_timeouts(backend: &AssistantBackend) -> (Duration, Duration) {
-    match backend {
-        AssistantBackend::Ollama => (LOCAL_OPEN_TIMEOUT, LOCAL_DRAIN_TIMEOUT),
-        _ => (CLOUD_OPEN_TIMEOUT, CLOUD_DRAIN_TIMEOUT),
+/// `Local` (embedded GGUF) and `Network` (a self-hosted server) both get
+/// the long pair; every hosted cloud provider gets the short one.
+fn llm_timeouts(backend: LlmBackend) -> (Duration, Duration) {
+    if backend.is_cloud() {
+        (CLOUD_OPEN_TIMEOUT, CLOUD_DRAIN_TIMEOUT)
+    } else {
+        (LOCAL_OPEN_TIMEOUT, LOCAL_DRAIN_TIMEOUT)
     }
 }
 
-/// Fallback preference order: fast cheap clouds first, the local backend
-/// last (always "works" offline but is slow and weakest at instruction
-/// following). The configured backend is excluded by
-/// [`fallback_candidates`].
-const FALLBACK_ORDER: [AssistantBackend; 7] = [
-    AssistantBackend::Cerebras,
-    AssistantBackend::Groq,
-    AssistantBackend::OpenAI,
-    AssistantBackend::OpenRouter,
-    AssistantBackend::Gemini,
-    AssistantBackend::Anthropic,
-    AssistantBackend::Ollama,
+/// Fallback preference order: fast cheap clouds first, the embedded local
+/// backend last (always "works" offline but is slow and weakest at
+/// instruction following). `Network` is not in the chain — a self-hosted
+/// endpoint is only reachable with the user's own `[assistant.network]`
+/// settings, which a fallback attempt deliberately clears. The configured
+/// backend is excluded by [`fallback_candidates`].
+const FALLBACK_ORDER: [LlmBackend; 7] = [
+    LlmBackend::Cerebras,
+    LlmBackend::Groq,
+    LlmBackend::OpenAI,
+    LlmBackend::OpenRouter,
+    LlmBackend::Gemini,
+    LlmBackend::Anthropic,
+    LlmBackend::Local,
 ];
 
 /// Fallback candidates in preference order, excluding the configured
 /// primary backend.
-fn fallback_candidates(primary: &AssistantBackend) -> Vec<AssistantBackend> {
-    FALLBACK_ORDER.iter().filter(|b| *b != primary).cloned().collect()
+fn fallback_candidates(primary: LlmBackend) -> Vec<LlmBackend> {
+    FALLBACK_ORDER.iter().copied().filter(|b| *b != primary).collect()
 }
 
 /// Attachment metadata. v1 is metadata-only: paths/bytes are neither
@@ -288,15 +291,16 @@ pub async fn summarize_with_assistant(
     };
 
     // One fallback attempt on the first candidate that actually builds
-    // (a successful build implies a usable key / model file). `cloud =
-    // None` so the provider-specific `[assistant.cloud]` override block
-    // never leaks into a different provider's build — key resolution
-    // falls through to the canonical env var and the catalogue's
-    // default model.
-    for candidate in fallback_candidates(&cfg.assistant.backend) {
+    // (a successful build implies a usable key / model file). The
+    // `[assistant.cloud]` and `[assistant.network]` override blocks are
+    // cleared so they never leak into a different provider's build — key
+    // resolution falls through to the canonical env var and the
+    // catalogue's default model.
+    for candidate in fallback_candidates(cfg.assistant.backend) {
         let mut fb_cfg = cfg.clone();
-        fb_cfg.assistant.backend = candidate.clone();
-        fb_cfg.assistant.cloud = None;
+        fb_cfg.assistant.backend = candidate;
+        fb_cfg.assistant.cloud = Default::default();
+        fb_cfg.assistant.network = Default::default();
         let Ok(Some(fb)) =
             fono_assistant::build_assistant(&fb_cfg.assistant, secrets, assistant_models_dir)
         else {
@@ -360,7 +364,7 @@ pub async fn summarize_with(
     cfg: &Config,
     payload: &SummarizePayload,
 ) -> Result<String> {
-    summarize_with_timeouts(assistant, cfg, payload, llm_timeouts(&cfg.assistant.backend)).await
+    summarize_with_timeouts(assistant, cfg, payload, llm_timeouts(cfg.assistant.backend)).await
 }
 
 /// Core with an explicit `(open, drain)` timeout pair — the fallback
@@ -770,19 +774,19 @@ mod tests {
 
     #[test]
     fn llm_timeouts_local_vs_cloud() {
-        assert_eq!(
-            llm_timeouts(&AssistantBackend::Ollama),
-            (LOCAL_OPEN_TIMEOUT, LOCAL_DRAIN_TIMEOUT)
-        );
+        // Both self-hosted shapes get the patient pair.
+        for local in [LlmBackend::Local, LlmBackend::Network] {
+            assert_eq!(llm_timeouts(local), (LOCAL_OPEN_TIMEOUT, LOCAL_DRAIN_TIMEOUT));
+        }
         for cloud in [
-            AssistantBackend::OpenAI,
-            AssistantBackend::Anthropic,
-            AssistantBackend::Groq,
-            AssistantBackend::Cerebras,
-            AssistantBackend::OpenRouter,
-            AssistantBackend::None,
+            LlmBackend::OpenAI,
+            LlmBackend::Anthropic,
+            LlmBackend::Gemini,
+            LlmBackend::Groq,
+            LlmBackend::Cerebras,
+            LlmBackend::OpenRouter,
         ] {
-            assert_eq!(llm_timeouts(&cloud), (CLOUD_OPEN_TIMEOUT, CLOUD_DRAIN_TIMEOUT));
+            assert_eq!(llm_timeouts(cloud), (CLOUD_OPEN_TIMEOUT, CLOUD_DRAIN_TIMEOUT));
         }
         assert!(CLOUD_OPEN_TIMEOUT < LOCAL_OPEN_TIMEOUT);
         assert!(CLOUD_DRAIN_TIMEOUT < LOCAL_DRAIN_TIMEOUT);
@@ -792,16 +796,20 @@ mod tests {
 
     #[test]
     fn fallback_candidates_exclude_primary_and_keep_order() {
-        let candidates = fallback_candidates(&AssistantBackend::Cerebras);
-        assert_eq!(candidates.first(), Some(&AssistantBackend::Groq));
-        assert!(!candidates.contains(&AssistantBackend::Cerebras));
-        assert_eq!(candidates.last(), Some(&AssistantBackend::Ollama));
+        let candidates = fallback_candidates(LlmBackend::Cerebras);
+        assert_eq!(candidates.first(), Some(&LlmBackend::Groq));
+        assert!(!candidates.contains(&LlmBackend::Cerebras));
+        assert_eq!(candidates.last(), Some(&LlmBackend::Local));
         assert_eq!(candidates.len(), FALLBACK_ORDER.len() - 1);
 
         // A non-listed primary (None) keeps the full order.
-        let all = fallback_candidates(&AssistantBackend::None);
-        assert_eq!(all.first(), Some(&AssistantBackend::Cerebras));
+        let all = fallback_candidates(LlmBackend::None);
+        assert_eq!(all.first(), Some(&LlmBackend::Cerebras));
         assert_eq!(all.len(), FALLBACK_ORDER.len());
+
+        // `Network` is never a fallback: it needs user-supplied settings
+        // that the fallback path deliberately clears.
+        assert!(!all.contains(&LlmBackend::Network));
     }
 
     // ── summarize_with_retry ──────────────────────────────────────────

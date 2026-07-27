@@ -54,8 +54,10 @@ enum LlmProvider {
     Cerebras,
     Groq,
     Openai,
-    /// OpenAI-compatible Ollama endpoint (local or LAN-hosted).
-    Ollama,
+    /// Any OpenAI-compatible chat-completions server (local or LAN-hosted):
+    /// Ollama, llama.cpp server, LM Studio, vLLM, LiteLLM. Pair with
+    /// `--endpoint`.
+    Network,
     Openrouter,
     Anthropic,
     /// Fono's embedded llama.cpp backend over a local GGUF model file.
@@ -2019,8 +2021,8 @@ fn replay_model(args: &AssistantReplayArgs) -> Result<String> {
 fn replay_endpoint(provider: LlmProvider, endpoint: Option<&str>) -> Option<String> {
     match (provider, endpoint) {
         (LlmProvider::LlamaCpp, _) | (LlmProvider::None, _) | (LlmProvider::Fake, _) => None,
-        (LlmProvider::Ollama, Some(e)) => Some(e.to_string()),
-        (LlmProvider::Ollama, None) => {
+        (LlmProvider::Network, Some(e)) => Some(e.to_string()),
+        (LlmProvider::Network, None) => {
             Some("http://localhost:11434/v1/chat/completions".to_string())
         }
         (_, Some(e)) => Some(e.to_string()),
@@ -2035,7 +2037,9 @@ fn replay_api_key(provider: LlmProvider, override_env: Option<&str>) -> Result<O
         LlmProvider::Openai => Some("OPENAI_API_KEY"),
         LlmProvider::Openrouter => Some("OPENROUTER_API_KEY"),
         LlmProvider::Anthropic => Some("ANTHROPIC_API_KEY"),
-        LlmProvider::Ollama | LlmProvider::LlamaCpp | LlmProvider::None | LlmProvider::Fake => None,
+        LlmProvider::Network | LlmProvider::LlamaCpp | LlmProvider::None | LlmProvider::Fake => {
+            None
+        }
     });
     name.map(|name| std::env::var(name).with_context(|| format!("{name} not set"))).transpose()
 }
@@ -2047,7 +2051,7 @@ fn provider_label(provider: LlmProvider) -> String {
 async fn run_assistant_tool_use_cmd(args: AssistantToolUseArgs) -> Result<()> {
     if args.provider == LlmProvider::None || args.provider == LlmProvider::LlamaCpp {
         return Err(anyhow!(
-            "assistant-tool-use supports `fake`, `ollama`, or cloud OpenAI-compatible providers"
+            "assistant-tool-use supports `fake`, `network`, or cloud OpenAI-compatible providers"
         ));
     }
     let manifest_path = args.fixtures.clone().unwrap_or_else(default_assistant_tool_use_fixtures);
@@ -2062,7 +2066,7 @@ async fn run_assistant_tool_use_cmd(args: AssistantToolUseArgs) -> Result<()> {
         LlmProvider::Openai => Some(resolve_key(&secrets, "OPENAI_API_KEY")?),
         LlmProvider::Openrouter => Some(resolve_key(&secrets, "OPENROUTER_API_KEY")?),
         LlmProvider::Anthropic => Some(resolve_key(&secrets, "ANTHROPIC_API_KEY")?),
-        LlmProvider::Fake | LlmProvider::Ollama => None,
+        LlmProvider::Fake | LlmProvider::Network => None,
         LlmProvider::None | LlmProvider::LlamaCpp => unreachable!(),
     };
     let languages = parse_languages(&args.languages);
@@ -2966,10 +2970,10 @@ fn build_polish_with_options(
             let m = model.unwrap_or("gpt-5.4-nano").to_string();
             Some(Arc::new(OpenAiCompat::openai(key, m)))
         }
-        LlmProvider::Ollama => {
+        LlmProvider::Network => {
             let m = model.unwrap_or("llama3.2").to_string();
             let endpoint = endpoint.unwrap_or("http://localhost:11434/v1/chat/completions");
-            Some(Arc::new(OpenAiCompat::ollama(endpoint, m)))
+            Some(Arc::new(OpenAiCompat::network(endpoint, m, None)))
         }
         LlmProvider::Openrouter => {
             let key = resolve_key(&secrets, "OPENROUTER_API_KEY")?;
@@ -3044,10 +3048,12 @@ fn build_assistant_with_options(
             let m = options.model.unwrap_or("gpt-5.4-mini").to_string();
             Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::openai(key, m))
         }
-        LlmProvider::Ollama => {
+        LlmProvider::Network => {
             let m = options.model.unwrap_or("llama3.2").to_string();
             let endpoint = options.endpoint.unwrap_or("http://localhost:11434/v1/chat/completions");
-            Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::ollama(endpoint, m))
+            Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::network(
+                endpoint, m, None,
+            ))
         }
         LlmProvider::Openrouter => {
             let key = resolve_key(&secrets, "OPENROUTER_API_KEY")?;
@@ -3138,7 +3144,7 @@ fn default_assistant_model(provider: LlmProvider) -> String {
         LlmProvider::Cerebras => "zai-glm-4.7".to_string(),
         LlmProvider::Groq => "openai/gpt-oss-120b".to_string(),
         LlmProvider::Openai => "gpt-5.4-mini".to_string(),
-        LlmProvider::Ollama => "llama3.2".to_string(),
+        LlmProvider::Network => "llama3.2".to_string(),
         LlmProvider::Openrouter => "anthropic/claude-haiku-4.5".to_string(),
         LlmProvider::Anthropic => "claude-haiku-4-5-20251001".to_string(),
         LlmProvider::LlamaCpp => "llama-cpp".to_string(),
@@ -3164,7 +3170,7 @@ fn default_polish_model(provider: LlmProvider, model_path: Option<&std::path::Pa
         LlmProvider::Cerebras => "gpt-oss-120b".to_string(),
         LlmProvider::Groq => "openai/gpt-oss-20b".to_string(),
         LlmProvider::Openai => "gpt-5.4-nano".to_string(),
-        LlmProvider::Ollama => "llama3.2".to_string(),
+        LlmProvider::Network => "llama3.2".to_string(),
         LlmProvider::Openrouter => "openai/gpt-5.4-nano".to_string(),
         LlmProvider::Anthropic => "claude-haiku-4-5-20251001".to_string(),
         LlmProvider::LlamaCpp => model_path
@@ -3177,8 +3183,8 @@ fn default_polish_model(provider: LlmProvider, model_path: Option<&std::path::Pa
 
 fn resolve_polish_endpoint(provider: LlmProvider, endpoint: Option<&str>) -> Option<String> {
     match (provider, endpoint) {
-        (LlmProvider::Ollama, Some(e)) => Some(e.to_string()),
-        (LlmProvider::Ollama, None) => {
+        (LlmProvider::Network, Some(e)) => Some(e.to_string()),
+        (LlmProvider::Network, None) => {
             Some("http://localhost:11434/v1/chat/completions".to_string())
         }
         (LlmProvider::LlamaCpp, _) => None,

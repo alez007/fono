@@ -10,13 +10,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use fono_core::config::{Assistant as AssistantCfg, AssistantBackend};
+use fono_core::config::{Assistant as AssistantCfg, LlmBackend};
 #[cfg(any(feature = "openai-compat", feature = "anthropic", feature = "realtime"))]
 use fono_core::provider_catalog;
 #[cfg(any(feature = "openai-compat", feature = "anthropic"))]
 use fono_core::provider_catalog::WebSearchSupport;
 #[cfg(any(feature = "openai-compat", feature = "anthropic"))]
-use fono_core::providers::assistant_key_env;
+use fono_core::providers::llm_key_env;
 #[allow(unused_imports)]
 use fono_core::Secrets;
 
@@ -49,22 +49,17 @@ struct CloudResolution {
 fn resolve_cloud(
     cfg: &AssistantCfg,
     secrets: &Secrets,
-    backend: &AssistantBackend,
+    backend: LlmBackend,
     provider_name: &str,
 ) -> Result<CloudResolution> {
-    let canonical = assistant_key_env(backend);
-    let (key_ref, model_override) = cfg.cloud.as_ref().map_or_else(
-        || (canonical.to_string(), None),
-        |c| {
-            let key_ref = if c.api_key_ref.is_empty() {
-                canonical.to_string()
-            } else {
-                c.api_key_ref.clone()
-            };
-            let model_override = if c.model.is_empty() { None } else { Some(c.model.clone()) };
-            (key_ref, model_override)
-        },
-    );
+    let canonical = llm_key_env(&backend);
+    let key_ref = if cfg.cloud.api_key_ref.is_empty() {
+        canonical.to_string()
+    } else {
+        cfg.cloud.api_key_ref.clone()
+    };
+    let model_override =
+        if cfg.cloud.model.is_empty() { None } else { Some(cfg.cloud.model.clone()) };
     let key = secrets.resolve(&key_ref).ok_or_else(|| {
         anyhow!(
             "{provider_name} assistant API key {key_ref:?} not found in secrets.toml or environment; \
@@ -122,13 +117,13 @@ fn resolve_cloud(
 
 /// Default chat model per provider. Reads from the cloud-provider
 /// catalogue (`fono_core::provider_catalog`), which is the single
-/// source of truth for default model strings. Ollama is special-cased
-/// because it has no catalogue entry (it's a self-hosted local
-/// server, not a cloud provider). Returns an empty string for
-/// unknown ids — the factory surfaces that as a config error.
+/// source of truth for default model strings. The self-hosted `network`
+/// backend is special-cased because it has no catalogue entry — the
+/// model id is whatever the user's own server serves. Returns an empty
+/// string for unknown ids — the factory surfaces that as a config error.
 #[cfg(any(feature = "openai-compat", feature = "anthropic"))]
 fn default_cloud_model(provider: &str) -> &'static str {
-    if provider == "ollama" {
+    if provider == "network" {
         return fono_core::config::DEFAULT_POLISH_LOCAL_MODEL;
     }
     provider_catalog::find(provider).and_then(|p| p.assistant.as_ref()).map_or("", |a| a.text_model)
@@ -165,7 +160,7 @@ pub fn build_assistant_handle(
     secrets: &Secrets,
     assistant_models_dir: &Path,
 ) -> Result<Option<AssistantHandle>> {
-    if !cfg.enabled || matches!(cfg.backend, AssistantBackend::None) {
+    if !cfg.enabled || matches!(cfg.backend, LlmBackend::None) {
         return Ok(None);
     }
     #[cfg(feature = "realtime")]
@@ -184,10 +179,13 @@ pub fn build_assistant_handle(
 /// staged text model) yields `None`.
 #[cfg(feature = "realtime")]
 fn realtime_selection(cfg: &AssistantCfg) -> Option<provider_catalog::RealtimeProfile> {
-    if !matches!(cfg.backend, AssistantBackend::Gemini) {
+    if !matches!(cfg.backend, LlmBackend::Gemini) {
         return None;
     }
-    let model = cfg.cloud.as_ref().map(|c| c.model.trim()).filter(|m| !m.is_empty())?;
+    let model = cfg.cloud.model.trim();
+    if model.is_empty() {
+        return None;
+    }
     let profile = provider_catalog::find("gemini")?.assistant.as_ref()?.realtime?;
     (profile.model == model).then_some(profile)
 }
@@ -197,12 +195,9 @@ fn realtime_selection(cfg: &AssistantCfg) -> Option<provider_catalog::RealtimePr
 /// canonical `GEMINI_API_KEY`.
 #[cfg(feature = "realtime")]
 fn resolve_gemini_key(cfg: &AssistantCfg, secrets: &Secrets) -> Result<String> {
-    let key_ref = cfg
-        .cloud
-        .as_ref()
-        .map(|c| c.api_key_ref.trim())
-        .filter(|r| !r.is_empty())
-        .map_or_else(|| "GEMINI_API_KEY".to_string(), ToString::to_string);
+    let trimmed = cfg.cloud.api_key_ref.trim();
+    let key_ref =
+        if trimmed.is_empty() { "GEMINI_API_KEY".to_string() } else { trimmed.to_string() };
     secrets.resolve(&key_ref).ok_or_else(|| {
         anyhow!(
             "gemini realtime assistant API key {key_ref:?} not found in secrets.toml or \
@@ -244,18 +239,19 @@ pub fn build_assistant(
     secrets: &Secrets,
     assistant_models_dir: &Path,
 ) -> Result<Option<Arc<dyn Assistant>>> {
-    if !cfg.enabled || matches!(cfg.backend, AssistantBackend::None) {
+    if !cfg.enabled || matches!(cfg.backend, LlmBackend::None) {
         return Ok(None);
     }
     match &cfg.backend {
-        AssistantBackend::None => Ok(None),
-        AssistantBackend::Cerebras => build_cerebras(cfg, secrets).map(Some),
-        AssistantBackend::Groq => build_groq(cfg, secrets).map(Some),
-        AssistantBackend::OpenAI => build_openai(cfg, secrets).map(Some),
-        AssistantBackend::OpenRouter => build_openrouter(cfg, secrets).map(Some),
-        AssistantBackend::Gemini => build_gemini(cfg, secrets).map(Some),
-        AssistantBackend::Ollama => build_ollama(cfg, assistant_models_dir).map(Some),
-        AssistantBackend::Anthropic => build_anthropic(cfg, secrets).map(Some),
+        LlmBackend::None => Ok(None),
+        LlmBackend::Local => build_embedded_local(cfg, assistant_models_dir).map(Some),
+        LlmBackend::Network => build_network(cfg, secrets).map(Some),
+        LlmBackend::Cerebras => build_cerebras(cfg, secrets).map(Some),
+        LlmBackend::Groq => build_groq(cfg, secrets).map(Some),
+        LlmBackend::OpenAI => build_openai(cfg, secrets).map(Some),
+        LlmBackend::OpenRouter => build_openrouter(cfg, secrets).map(Some),
+        LlmBackend::Gemini => build_gemini(cfg, secrets).map(Some),
+        LlmBackend::Anthropic => build_anthropic(cfg, secrets).map(Some),
     }
 }
 
@@ -282,22 +278,17 @@ pub fn build_server_assistant_override(
     secrets: &Secrets,
     assistant_models_dir: &Path,
 ) -> Result<Option<Arc<dyn Assistant>>> {
-    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, AssistantBackend::None) {
+    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, LlmBackend::None) {
         return Ok(None);
     }
     // Case 1 — explicit override pins a staged text model regardless of
     // the primary assistant.
     if let Some(model) = server_model_override.map(str::trim).filter(|m| !m.is_empty()) {
         let mut cfg = assistant_cfg.clone();
-        if matches!(cfg.backend, AssistantBackend::Ollama) {
-            cfg.local.model = model.to_string();
-        } else if let Some(c) = cfg.cloud.as_mut() {
-            c.model = model.to_string();
-        } else {
-            cfg.cloud = Some(fono_core::config::AssistantCloud {
-                model: model.to_string(),
-                ..Default::default()
-            });
+        match cfg.backend {
+            LlmBackend::Local => cfg.local.model = model.to_string(),
+            LlmBackend::Network => cfg.network.model = model.to_string(),
+            _ => cfg.cloud.model = model.to_string(),
         }
         cfg.prefer_vision = false;
         return build_assistant(&cfg, secrets, assistant_models_dir);
@@ -309,9 +300,7 @@ pub fn build_server_assistant_override(
     {
         if realtime_selection(assistant_cfg).is_some() {
             let mut cfg = assistant_cfg.clone();
-            if let Some(c) = cfg.cloud.as_mut() {
-                c.model.clear();
-            }
+            cfg.cloud.model.clear();
             cfg.prefer_vision = false;
             return build_assistant(&cfg, secrets, assistant_models_dir);
         }
@@ -330,7 +319,7 @@ pub fn server_assistant_model_name(
     assistant_cfg: &AssistantCfg,
     server_model_override: Option<&str>,
 ) -> String {
-    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, AssistantBackend::None) {
+    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, LlmBackend::None) {
         return String::new();
     }
     if let Some(m) = server_model_override.map(str::trim).filter(|m| !m.is_empty()) {
@@ -340,7 +329,7 @@ pub fn server_assistant_model_name(
     #[cfg(feature = "realtime")]
     {
         if realtime_selection(assistant_cfg).is_some() {
-            let provider = fono_core::providers::assistant_backend_str(&assistant_cfg.backend);
+            let provider = fono_core::providers::llm_backend_str(&assistant_cfg.backend);
             return provider_catalog::find(provider)
                 .and_then(|p| p.assistant.as_ref())
                 .map_or_else(String::new, |a| a.text_model.to_string());
@@ -348,8 +337,9 @@ pub fn server_assistant_model_name(
     }
     // Staged primary → its own configured model id.
     match assistant_cfg.backend {
-        AssistantBackend::Ollama => assistant_cfg.local.model.clone(),
-        _ => assistant_cfg.cloud.as_ref().map_or_else(String::new, |c| c.model.clone()),
+        LlmBackend::Local => assistant_cfg.local.model.clone(),
+        LlmBackend::Network => assistant_cfg.network.model.clone(),
+        _ => assistant_cfg.cloud.model.clone(),
     }
 }
 
@@ -369,19 +359,20 @@ pub const GEMINI_CHAT_ENDPOINT: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 /// The OpenAI-compatible `/chat/completions` endpoint for a backend, or
-/// `None` for backends that are not OpenAI-shaped: Anthropic (its own
-/// Messages API), the local Ollama server (no cloud upstream), and
-/// `none`. This is the single decision point for "is this backend
-/// proxyable?" used by the local LLM server. See ADR 0036.
+/// `None` for backends that are not a proxyable cloud upstream:
+/// Anthropic (its own Messages API), the embedded local model, the
+/// user's own `network` server (already reachable directly), and `none`.
+/// This is the single decision point for "is this backend proxyable?"
+/// used by the local LLM server. See ADR 0036.
 #[must_use]
-pub fn chat_endpoint(backend: &AssistantBackend) -> Option<&'static str> {
+pub fn chat_endpoint(backend: &LlmBackend) -> Option<&'static str> {
     Some(match backend {
-        AssistantBackend::Cerebras => CEREBRAS_CHAT_ENDPOINT,
-        AssistantBackend::Groq => GROQ_CHAT_ENDPOINT,
-        AssistantBackend::OpenAI => OPENAI_CHAT_ENDPOINT,
-        AssistantBackend::OpenRouter => OPENROUTER_CHAT_ENDPOINT,
-        AssistantBackend::Gemini => GEMINI_CHAT_ENDPOINT,
-        AssistantBackend::Anthropic | AssistantBackend::Ollama | AssistantBackend::None => {
+        LlmBackend::Cerebras => CEREBRAS_CHAT_ENDPOINT,
+        LlmBackend::Groq => GROQ_CHAT_ENDPOINT,
+        LlmBackend::OpenAI => OPENAI_CHAT_ENDPOINT,
+        LlmBackend::OpenRouter => OPENROUTER_CHAT_ENDPOINT,
+        LlmBackend::Gemini => GEMINI_CHAT_ENDPOINT,
+        LlmBackend::Anthropic | LlmBackend::Local | LlmBackend::Network | LlmBackend::None => {
             return None;
         }
     })
@@ -418,7 +409,7 @@ pub fn cloud_chat_upstream(
     server_model_override: Option<&str>,
     secrets: &Secrets,
 ) -> Result<Option<CloudUpstream>> {
-    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, AssistantBackend::None) {
+    if !assistant_cfg.enabled || matches!(assistant_cfg.backend, LlmBackend::None) {
         return Ok(None);
     }
     let Some(chat_url) = chat_endpoint(&assistant_cfg.backend) else {
@@ -426,16 +417,12 @@ pub fn cloud_chat_upstream(
     };
     #[cfg(feature = "openai-compat")]
     {
-        let provider = fono_core::providers::assistant_backend_str(&assistant_cfg.backend);
+        let provider = fono_core::providers::llm_backend_str(&assistant_cfg.backend);
         // Key resolution mirrors `resolve_cloud`: explicit
         // `[assistant.cloud].api_key_ref`, else the canonical env var.
-        let canonical = assistant_key_env(&assistant_cfg.backend);
-        let key_ref = assistant_cfg
-            .cloud
-            .as_ref()
-            .map(|c| c.api_key_ref.trim())
-            .filter(|r| !r.is_empty())
-            .map_or_else(|| canonical.to_string(), ToString::to_string);
+        let canonical = llm_key_env(&assistant_cfg.backend);
+        let trimmed = assistant_cfg.cloud.api_key_ref.trim();
+        let key_ref = if trimmed.is_empty() { canonical.to_string() } else { trimmed.to_string() };
         let api_key = secrets.resolve(&key_ref).ok_or_else(|| {
             anyhow!(
                 "{provider} assistant API key {key_ref:?} not found in secrets.toml or \
@@ -459,7 +446,7 @@ pub fn cloud_chat_upstream(
 
 #[cfg(feature = "openai-compat")]
 fn build_cerebras(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::Cerebras, "cerebras")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::Cerebras, "cerebras")?;
     Ok(Arc::new(
         crate::openai_compat_chat::OpenAiCompatChat::cerebras(r.key, r.model)
             .with_web_search(r.web_search_tool),
@@ -468,7 +455,7 @@ fn build_cerebras(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assis
 
 #[cfg(feature = "openai-compat")]
 fn build_groq(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::Groq, "groq")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::Groq, "groq")?;
     Ok(Arc::new(
         crate::openai_compat_chat::OpenAiCompatChat::groq(r.key, r.model)
             .with_web_search(r.web_search_tool),
@@ -477,7 +464,7 @@ fn build_groq(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant
 
 #[cfg(feature = "openai-compat")]
 fn build_openai(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::OpenAI, "openai")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::OpenAI, "openai")?;
     Ok(Arc::new(
         crate::openai_compat_chat::OpenAiCompatChat::openai(r.key, r.model)
             .with_web_search(r.web_search_tool),
@@ -486,7 +473,7 @@ fn build_openai(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assista
 
 #[cfg(feature = "openai-compat")]
 fn build_openrouter(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::OpenRouter, "openrouter")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::OpenRouter, "openrouter")?;
     Ok(Arc::new(
         crate::openai_compat_chat::OpenAiCompatChat::openrouter(r.key, r.model)
             .with_web_search(r.web_search_tool),
@@ -495,7 +482,7 @@ fn build_openrouter(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Ass
 
 #[cfg(feature = "openai-compat")]
 fn build_gemini(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::Gemini, "gemini")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::Gemini, "gemini")?;
     // Gemini's OpenAI-compatible surface does not accept the native
     // `google_search` grounding tool, so we deliberately do not attach
     // `r.web_search_tool` here (ADR 0034); native search is a follow-up
@@ -503,37 +490,15 @@ fn build_gemini(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assista
     Ok(Arc::new(crate::openai_compat_chat::OpenAiCompatChat::gemini(r.key, r.model)))
 }
 
-fn manual_local_server_endpoint(cfg: &AssistantCfg) -> Option<String> {
-    cfg.cloud.as_ref().and_then(|c| {
-        let provider = c.provider.trim();
-        let explicitly_manual = matches!(provider, "ollama-server" | "openai-compatible-local");
-        let ref_str = &c.api_key_ref;
-        if explicitly_manual && (ref_str.starts_with("http://") || ref_str.starts_with("https://"))
-        {
-            Some(ref_str.clone())
-        } else {
-            None
-        }
-    })
-}
-
-/// True when `[assistant]` resolves to the embedded llama.cpp local model —
-/// the `ollama` backend *without* a manual server endpoint. This is exactly
-/// the case where [`build_ollama`] loads a local GGUF, so it is the condition
-/// under which a caller should ensure the model is downloaded before building
-/// the assistant. A manual Ollama/OpenAI-compatible server URL, any cloud
+/// True when `[assistant]` runs the embedded llama.cpp engine on a local
+/// GGUF — i.e. `backend = "local"`. This is exactly the case where
+/// [`build_embedded_local`] loads a model file, so it is the condition
+/// under which a caller should ensure the weights are downloaded before
+/// building the assistant. A self-hosted `network` server, any cloud
 /// backend, or `none` all return `false` (nothing to fetch locally).
 #[must_use]
-pub fn uses_embedded_local_model(cfg: &AssistantCfg) -> bool {
-    matches!(cfg.backend, AssistantBackend::Ollama) && manual_local_server_endpoint(cfg).is_none()
-}
-
-fn local_model(cfg: &AssistantCfg) -> String {
-    cfg.cloud
-        .as_ref()
-        .map(|c| c.model.clone())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| cfg.local.model.clone())
+pub const fn uses_embedded_local_model(cfg: &AssistantCfg) -> bool {
+    matches!(cfg.backend, LlmBackend::Local)
 }
 
 #[cfg(feature = "llama-local")]
@@ -590,22 +555,48 @@ fn build_embedded_local(
 #[cfg(not(feature = "llama-local"))]
 fn build_embedded_local(_: &AssistantCfg, _: &Path) -> Result<Arc<dyn Assistant>> {
     Err(anyhow!(
-        "local assistant requested but this binary was built without embedded local assistant support; rebuild with the `llama-local` feature or manually configure an Ollama/OpenAI-compatible local server URL"
+        "local assistant requested but this binary was built without embedded local assistant \
+         support; rebuild with the `llama-local` feature, or point the assistant at your own \
+         OpenAI-compatible server with `fono use llm network --url <URL> --model <ID>`"
     ))
 }
 
-// Returns Result for symmetry with the other build_* functions, even
-// though local-server construction can't currently fail (no key resolution).
+/// Any OpenAI-compatible chat-completions server on the network — the
+/// engine behind it is deliberately not Fono's concern. A bearer token
+/// is sent only when `[assistant.network].api_key_ref` names a stored
+/// secret.
 #[cfg(feature = "openai-compat")]
-#[allow(clippy::unnecessary_wraps)]
-fn build_ollama(cfg: &AssistantCfg, assistant_models_dir: &Path) -> Result<Arc<dyn Assistant>> {
-    if let Some(endpoint) = manual_local_server_endpoint(cfg) {
-        return Ok(Arc::new(crate::openai_compat_chat::OpenAiCompatChat::ollama(
-            endpoint,
-            local_model(cfg),
-        )));
+fn build_network(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
+    let url = cfg.network.chat_url();
+    if url.is_empty() {
+        return Err(anyhow!(
+            "the assistant is set to `network` but no server URL is configured; set it in \
+             `fono settings` or run `fono use assistant network --url <URL>`"
+        ));
     }
-    build_embedded_local(cfg, assistant_models_dir)
+    if cfg.network.model.trim().is_empty() {
+        return Err(anyhow!(
+            "the assistant is set to `network` but no model id is configured; set it in \
+             `fono settings` or run `fono use assistant network --url <URL> --model <ID>`"
+        ));
+    }
+    let token = if cfg.network.api_key_ref.is_empty() {
+        None
+    } else {
+        Some(secrets.resolve(&cfg.network.api_key_ref).ok_or_else(|| {
+            anyhow!(
+                "assistant server token {:?} not found in secrets.toml or environment; \
+                 run `fono keys add {}` to add it",
+                cfg.network.api_key_ref,
+                cfg.network.api_key_ref
+            )
+        })?)
+    };
+    Ok(Arc::new(crate::openai_compat_chat::OpenAiCompatChat::network(
+        url,
+        cfg.network.model.clone(),
+        token,
+    )))
 }
 
 #[cfg(not(feature = "openai-compat"))]
@@ -639,18 +630,16 @@ fn build_gemini(_cfg: &AssistantCfg, _secrets: &Secrets) -> Result<Arc<dyn Assis
     ))
 }
 #[cfg(not(feature = "openai-compat"))]
-fn build_ollama(cfg: &AssistantCfg, assistant_models_dir: &Path) -> Result<Arc<dyn Assistant>> {
-    if manual_local_server_endpoint(cfg).is_some() {
-        return Err(anyhow!(
-            "manual Ollama/OpenAI-compatible assistant server requested but this binary was built without the `openai-compat` feature"
-        ));
-    }
-    build_embedded_local(cfg, assistant_models_dir)
+fn build_network(_cfg: &AssistantCfg, _secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
+    Err(anyhow!(
+        "a self-hosted assistant server was requested but this binary was built without the \
+         `openai-compat` feature on `fono-assistant`"
+    ))
 }
 
 #[cfg(feature = "anthropic")]
 fn build_anthropic(cfg: &AssistantCfg, secrets: &Secrets) -> Result<Arc<dyn Assistant>> {
-    let r = resolve_cloud(cfg, secrets, &AssistantBackend::Anthropic, "anthropic")?;
+    let r = resolve_cloud(cfg, secrets, LlmBackend::Anthropic, "anthropic")?;
     Ok(Arc::new(
         crate::anthropic_chat::AnthropicChat::new(r.key, r.model)
             .with_web_search(r.web_search_tool),
@@ -667,13 +656,18 @@ fn build_anthropic(_cfg: &AssistantCfg, _secrets: &Secrets) -> Result<Arc<dyn As
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fono_core::config::{Assistant as AssistantCfg, AssistantBackend, AssistantCloud};
+    use fono_core::config::{Assistant as AssistantCfg, LlmCloud, LlmNetwork};
+
+    /// `[assistant.network]` pointing at a server, ready to build.
+    fn net(url: &str, model: &str) -> LlmNetwork {
+        LlmNetwork { url: url.into(), model: model.into(), api_key_ref: String::new() }
+    }
 
     #[test]
     fn disabled_returns_none() {
         let cfg = AssistantCfg {
             enabled: false,
-            backend: AssistantBackend::Anthropic,
+            backend: LlmBackend::Anthropic,
             ..AssistantCfg::default()
         };
         let secrets = Secrets::default();
@@ -682,11 +676,8 @@ mod tests {
 
     #[test]
     fn none_backend_returns_none_even_when_enabled() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::None, ..AssistantCfg::default() };
         assert!(build_assistant(&cfg, &Secrets::default(), Path::new(".")).unwrap().is_none());
     }
 
@@ -695,8 +686,8 @@ mod tests {
     fn anthropic_missing_key_errors_clearly() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Anthropic,
-            cloud: Some(AssistantCloud::default()),
+            backend: LlmBackend::Anthropic,
+            cloud: LlmCloud::default(),
             ..AssistantCfg::default()
         };
         let err =
@@ -709,8 +700,7 @@ mod tests {
     fn anthropic_with_env_key_succeeds() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Anthropic,
-            cloud: None,
+            backend: LlmBackend::Anthropic,
             ..AssistantCfg::default()
         };
         let mut secrets = Secrets::default();
@@ -721,63 +711,80 @@ mod tests {
     #[cfg(feature = "openai-compat")]
     #[test]
     fn openai_with_env_key_succeeds() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("OPENAI_API_KEY", "sk-test");
         assert!(build_assistant(&cfg, &secrets, Path::new(".")).unwrap().is_some());
     }
 
-    #[cfg(feature = "openai-compat")]
+    // `backend = local` loads a GGUF and nothing else. With a bogus
+    // models dir it must fail loudly rather than quietly reaching for a
+    // server the user never asked for.
     #[test]
-    fn local_assistant_uses_embedded_model_by_default() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::Ollama,
-            ..AssistantCfg::default()
-        };
+    fn local_assistant_uses_embedded_model() {
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::Local, ..AssistantCfg::default() };
         assert_eq!(cfg.local.model, fono_core::config::DEFAULT_POLISH_LOCAL_MODEL);
+        assert!(uses_embedded_local_model(&cfg));
         assert!(build_assistant(&cfg, &Secrets::default(), Path::new("/this/path/does/not/exist"))
             .is_err());
     }
 
-    #[cfg(feature = "openai-compat")]
+    // A leftover `[assistant.network]` block must not divert `local` to a
+    // server. The two backends are independent; only `backend` decides.
     #[test]
-    fn wizard_legacy_ollama_provider_ignores_stale_endpoint() {
+    fn local_ignores_a_leftover_network_block() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Ollama,
-            cloud: Some(AssistantCloud {
-                provider: "ollama".into(),
-                api_key_ref: "http://localhost:11434/v1/chat/completions".into(),
-                model: fono_core::config::DEFAULT_POLISH_LOCAL_MODEL.into(),
-            }),
+            backend: LlmBackend::Local,
+            network: net("http://localhost:11434", "gemma4:12b"),
             ..AssistantCfg::default()
         };
+        assert!(uses_embedded_local_model(&cfg));
         assert!(build_assistant(&cfg, &Secrets::default(), Path::new("/this/path/does/not/exist"))
             .is_err());
     }
 
+    // `backend = network` talks to the configured server and needs no
+    // local weights, no API key, and no catalogue entry.
     #[cfg(feature = "openai-compat")]
     #[test]
-    fn manual_ollama_endpoint_still_builds_without_model_file() {
+    fn network_builds_without_a_local_model_file() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Ollama,
-            cloud: Some(AssistantCloud {
-                provider: "ollama-server".into(),
-                api_key_ref: "http://localhost:11434/v1/chat/completions".into(),
-                model: "gemma3:1b".into(),
-            }),
+            backend: LlmBackend::Network,
+            network: net("http://192.168.0.200:11434", "gemma4:12b"),
             ..AssistantCfg::default()
         };
+        assert!(!uses_embedded_local_model(&cfg));
         assert!(build_assistant(&cfg, &Secrets::default(), Path::new("/this/path/does/not/exist"))
             .unwrap()
             .is_some());
+    }
+
+    // Half-configured `network` must name what is missing.
+    #[test]
+    fn network_without_url_or_model_errors_clearly() {
+        let no_url =
+            AssistantCfg { enabled: true, backend: LlmBackend::Network, ..AssistantCfg::default() };
+        let err = build_assistant(&no_url, &Secrets::default(), Path::new("."))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no server URL"), "{err}");
+
+        let no_model = AssistantCfg {
+            enabled: true,
+            backend: LlmBackend::Network,
+            network: net("http://localhost:11434", ""),
+            ..AssistantCfg::default()
+        };
+        let err = build_assistant(&no_model, &Secrets::default(), Path::new("."))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no model id"), "{err}");
     }
 
     // ── Phase E4 + E5: resolve_cloud unit tests ───────────────────
@@ -793,12 +800,12 @@ mod tests {
     fn prefer_vision_swaps_to_multimodal_when_available() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Anthropic,
+            backend: LlmBackend::Anthropic,
             prefer_vision: true,
             ..AssistantCfg::default()
         };
         let secrets = make_secrets("ANTHROPIC_API_KEY");
-        let r = resolve_cloud(&cfg, &secrets, &AssistantBackend::Anthropic, "anthropic").unwrap();
+        let r = resolve_cloud(&cfg, &secrets, LlmBackend::Anthropic, "anthropic").unwrap();
         // Anthropic catalogue entry's multimodal_model is the same as
         // the text model (Haiku 4.5 is multimodal); the swap is still
         // a no-op-equivalent — but we assert the field source is the
@@ -812,12 +819,12 @@ mod tests {
         // Cerebras catalogue entry: multimodal_model = None.
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Cerebras,
+            backend: LlmBackend::Cerebras,
             prefer_vision: true,
             ..AssistantCfg::default()
         };
         let secrets = make_secrets("CEREBRAS_API_KEY");
-        let r = resolve_cloud(&cfg, &secrets, &AssistantBackend::Cerebras, "cerebras").unwrap();
+        let r = resolve_cloud(&cfg, &secrets, LlmBackend::Cerebras, "cerebras").unwrap();
         // Cerebras has no multimodal model — must fall back to the
         // text model and emit a warning (warning verified manually;
         // tracing infra differs across test contexts).
@@ -830,12 +837,12 @@ mod tests {
     fn prefer_web_search_surfaces_native_tool_id() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Anthropic,
+            backend: LlmBackend::Anthropic,
             prefer_web_search: true,
             ..AssistantCfg::default()
         };
         let secrets = make_secrets("ANTHROPIC_API_KEY");
-        let r = resolve_cloud(&cfg, &secrets, &AssistantBackend::Anthropic, "anthropic").unwrap();
+        let r = resolve_cloud(&cfg, &secrets, LlmBackend::Anthropic, "anthropic").unwrap();
         assert_eq!(r.web_search_tool, Some("web_search_20250305"));
     }
 
@@ -844,18 +851,18 @@ mod tests {
     fn prefer_web_search_is_none_for_groq() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Groq,
+            backend: LlmBackend::Groq,
             prefer_web_search: true,
             ..AssistantCfg::default()
         };
         let secrets = make_secrets("GROQ_API_KEY");
-        let r = resolve_cloud(&cfg, &secrets, &AssistantBackend::Groq, "groq").unwrap();
+        let r = resolve_cloud(&cfg, &secrets, LlmBackend::Groq, "groq").unwrap();
         // Groq's catalogue entry advertises WebSearchSupport::None —
         // toggle is a no-op there.
         assert!(r.web_search_tool.is_none());
     }
 
-    // ── Realtime dispatch (Path B) ────────────────────────────────
+    // ── Realtime dispatch (Path B) ──────────────────────────────
     #[cfg(feature = "realtime")]
     fn gemini_realtime_model() -> &'static str {
         provider_catalog::find("gemini")
@@ -868,17 +875,19 @@ mod tests {
             .model
     }
 
+    /// `[assistant.cloud]` pinned to a specific model, no explicit key ref.
+    #[cfg(any(feature = "realtime", feature = "openai-compat"))]
+    fn cloud_model(model: &str) -> LlmCloud {
+        LlmCloud { model: model.into(), api_key_ref: String::new() }
+    }
+
     #[cfg(feature = "realtime")]
     #[test]
     fn realtime_model_selects_realtime_handle() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         let mut secrets = Secrets::default();
@@ -892,12 +901,8 @@ mod tests {
     fn realtime_model_without_key_errors_clearly() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         let err = build_assistant_handle(&cfg, &Secrets::default(), Path::new("."))
@@ -910,12 +915,8 @@ mod tests {
     #[cfg(all(feature = "realtime", feature = "openai-compat"))]
     #[test]
     fn default_gemini_model_selects_staged() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::Gemini, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("GEMINI_API_KEY", "test-key");
         let handle = build_assistant_handle(&cfg, &secrets, Path::new(".")).unwrap().unwrap();
@@ -929,12 +930,8 @@ mod tests {
         // never selects the realtime path.
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: Some(AssistantCloud {
-                provider: "openai".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::OpenAI,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         let mut secrets = Secrets::default();
@@ -955,12 +952,8 @@ mod tests {
     fn server_model_name_override_wins() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: "some-other-model".into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: LlmCloud { model: "some-other-model".into(), api_key_ref: String::new() },
             ..AssistantCfg::default()
         };
         assert_eq!(server_assistant_model_name(&cfg, Some("pinned-model")), "pinned-model");
@@ -968,17 +961,32 @@ mod tests {
         assert_eq!(server_assistant_model_name(&cfg, Some("   ")), "some-other-model");
     }
 
+    // The served model id comes from whichever block the backend uses,
+    // so a `network` assistant advertises the server's model, not a
+    // stale cloud one.
+    #[test]
+    fn server_model_name_reads_the_active_backends_block() {
+        let network = AssistantCfg {
+            enabled: true,
+            backend: LlmBackend::Network,
+            network: net("http://localhost:11434", "gemma4:12b"),
+            cloud: LlmCloud { model: "gpt-stale".into(), api_key_ref: String::new() },
+            ..AssistantCfg::default()
+        };
+        assert_eq!(server_assistant_model_name(&network, None), "gemma4:12b");
+
+        let local =
+            AssistantCfg { enabled: true, backend: LlmBackend::Local, ..AssistantCfg::default() };
+        assert_eq!(server_assistant_model_name(&local, None), local.local.model);
+    }
+
     #[cfg(feature = "realtime")]
     #[test]
     fn server_model_name_realtime_falls_back_to_text_sibling() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         // Realtime primary → advertise the catalogue text model, not the
@@ -993,12 +1001,8 @@ mod tests {
     fn build_server_assistant_realtime_builds_text_sibling() {
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         let mut secrets = Secrets::default();
@@ -1014,12 +1018,8 @@ mod tests {
     fn build_server_assistant_staged_primary_reuses_it() {
         // A normal staged primary needs no extra assistant — the server
         // reuses the primary directly, so this returns None.
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("OPENAI_API_KEY", "sk-test");
         let built = build_server_assistant_override(&cfg, None, &secrets, Path::new(".")).unwrap();
@@ -1029,12 +1029,8 @@ mod tests {
     #[cfg(feature = "openai-compat")]
     #[test]
     fn build_server_assistant_override_builds_pinned_model() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("OPENAI_API_KEY", "sk-test");
         let built =
@@ -1046,28 +1042,25 @@ mod tests {
     #[test]
     fn chat_endpoint_marks_proxyable_backends() {
         // OpenAI-compat cloud backends are proxyable (Some).
-        assert!(chat_endpoint(&AssistantBackend::OpenAI).is_some());
-        assert!(chat_endpoint(&AssistantBackend::Gemini).is_some());
-        assert!(chat_endpoint(&AssistantBackend::Groq).is_some());
-        assert!(chat_endpoint(&AssistantBackend::Cerebras).is_some());
-        assert!(chat_endpoint(&AssistantBackend::OpenRouter).is_some());
-        // Non-OpenAI-shaped / local / disabled backends are not.
-        assert!(chat_endpoint(&AssistantBackend::Anthropic).is_none());
-        assert!(chat_endpoint(&AssistantBackend::Ollama).is_none());
-        assert!(chat_endpoint(&AssistantBackend::None).is_none());
+        assert!(chat_endpoint(&LlmBackend::OpenAI).is_some());
+        assert!(chat_endpoint(&LlmBackend::Gemini).is_some());
+        assert!(chat_endpoint(&LlmBackend::Groq).is_some());
+        assert!(chat_endpoint(&LlmBackend::Cerebras).is_some());
+        assert!(chat_endpoint(&LlmBackend::OpenRouter).is_some());
+        // Non-OpenAI-shaped / self-hosted / disabled backends are not.
+        assert!(chat_endpoint(&LlmBackend::Anthropic).is_none());
+        assert!(chat_endpoint(&LlmBackend::Local).is_none());
+        assert!(chat_endpoint(&LlmBackend::Network).is_none());
+        assert!(chat_endpoint(&LlmBackend::None).is_none());
         // Gemini uses its OpenAI-compat layer, not native generateContent.
-        assert!(chat_endpoint(&AssistantBackend::Gemini).unwrap().contains("/openai/"));
+        assert!(chat_endpoint(&LlmBackend::Gemini).unwrap().contains("/openai/"));
     }
 
     #[cfg(feature = "openai-compat")]
     #[test]
     fn cloud_upstream_resolves_for_openai_compat_backend() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("OPENAI_API_KEY", "sk-test");
         let up = cloud_chat_upstream(&cfg, None, &secrets).unwrap();
@@ -1081,31 +1074,23 @@ mod tests {
     #[cfg(feature = "openai-compat")]
     #[test]
     fn cloud_upstream_honours_explicit_override_model() {
-        let cfg = AssistantCfg {
-            enabled: true,
-            backend: AssistantBackend::OpenAI,
-            cloud: None,
-            ..AssistantCfg::default()
-        };
+        let cfg =
+            AssistantCfg { enabled: true, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         let mut secrets = Secrets::default();
         secrets.insert("OPENAI_API_KEY", "sk-test");
         let up = cloud_chat_upstream(&cfg, Some("gpt-pinned"), &secrets).unwrap().unwrap();
         assert_eq!(up.model, "gpt-pinned");
     }
 
-    #[cfg(feature = "openai-compat")]
+    #[cfg(all(feature = "realtime", feature = "openai-compat"))]
     #[test]
     fn cloud_upstream_gemini_live_falls_back_to_text_sibling() {
         // A realtime Gemini Live primary is still proxyable — it resolves
         // to the same-provider text sibling on Gemini's compat endpoint.
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".into(),
-                api_key_ref: String::new(),
-                model: gemini_realtime_model().into(),
-            }),
+            backend: LlmBackend::Gemini,
+            cloud: cloud_model(gemini_realtime_model()),
             ..AssistantCfg::default()
         };
         let mut secrets = Secrets::default();
@@ -1117,21 +1102,30 @@ mod tests {
     }
 
     #[test]
-    fn cloud_upstream_none_for_anthropic_and_disabled() {
+    fn cloud_upstream_none_for_anthropic_local_network_and_disabled() {
         let secrets = Secrets::default();
         // Anthropic is not OpenAI-shaped → not proxyable.
         let anthropic = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Anthropic,
+            backend: LlmBackend::Anthropic,
             ..AssistantCfg::default()
         };
         assert!(cloud_chat_upstream(&anthropic, None, &secrets).unwrap().is_none());
-        // Disabled assistant → not proxyable.
-        let disabled = AssistantCfg {
-            enabled: false,
-            backend: AssistantBackend::OpenAI,
+        // The embedded engine has no upstream to proxy to.
+        let local =
+            AssistantCfg { enabled: true, backend: LlmBackend::Local, ..AssistantCfg::default() };
+        assert!(cloud_chat_upstream(&local, None, &secrets).unwrap().is_none());
+        // Neither does the user's own server — clients can reach it directly.
+        let network = AssistantCfg {
+            enabled: true,
+            backend: LlmBackend::Network,
+            network: net("http://localhost:11434", "gemma4:12b"),
             ..AssistantCfg::default()
         };
+        assert!(cloud_chat_upstream(&network, None, &secrets).unwrap().is_none());
+        // Disabled assistant → not proxyable.
+        let disabled =
+            AssistantCfg { enabled: false, backend: LlmBackend::OpenAI, ..AssistantCfg::default() };
         assert!(cloud_chat_upstream(&disabled, None, &secrets).unwrap().is_none());
     }
 }

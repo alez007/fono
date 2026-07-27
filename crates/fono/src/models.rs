@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use fono_core::config::{AssistantBackend, Config, PolishBackend, SttBackend};
+use fono_core::config::{Config, LlmBackend, SttBackend};
 use fono_core::Paths;
 use fono_stt::{ModelInfo, ModelRegistry, Quantization, QuantizationPref};
 use tracing::{debug, info, warn};
@@ -253,11 +253,13 @@ fn pending_downloads(paths: &Paths, config: &Config) -> Vec<Pending> {
         }
     }
     // The cleanup and assistant LLMs are often the same GGUF; list it once.
+    // Both are gated on `enabled`: a role switched off must never pull a
+    // multi-gigabyte model down for something that will not run.
     let mut llms: Vec<(&str, &String)> = Vec::new();
-    if config.polish.backend == PolishBackend::Local {
+    if config.polish.enabled && config.polish.backend == LlmBackend::Local {
         llms.push(("cleanup model", &config.polish.local.model));
     }
-    if config.assistant.enabled && config.assistant.backend == AssistantBackend::Ollama {
+    if config.assistant.enabled && config.assistant.backend == LlmBackend::Local {
         llms.push(("assistant model", &config.assistant.local.model));
     }
     let mut seen: Vec<String> = Vec::new();
@@ -357,14 +359,14 @@ pub async fn ensure_models(paths: &Paths, config: &Config) -> Result<()> {
             warn!("auto-download of whisper model failed: {e:#}");
         }
     }
-    if config.polish.backend == PolishBackend::Local {
+    if config.polish.enabled && config.polish.backend == LlmBackend::Local {
         // Boxed: the LLM-ensure future may carry registry/download state
         // large enough to trip stack-frame lints when inlined here.
         if let Err(e) = Box::pin(ensure_local_llm(paths, &config.polish.local.model)).await {
             warn!("auto-download of LLM model failed: {e:#}");
         }
     }
-    if config.assistant.enabled && config.assistant.backend == AssistantBackend::Ollama {
+    if config.assistant.enabled && config.assistant.backend == LlmBackend::Local {
         // Boxed for the same reason as the polish LLM ensure above; local
         // assistant and cleanup share the registry/download path.
         if let Err(e) = Box::pin(ensure_local_llm(paths, &config.assistant.local.model)).await {

@@ -1981,7 +1981,7 @@ fn apply_backend_overrides(
     stt: Option<&str>,
     polish: Option<&str>,
 ) -> Result<()> {
-    use fono_core::providers::{parse_polish_backend, parse_stt_backend};
+    use fono_core::providers::{parse_llm_backend, parse_stt_backend};
     if let Some(s) = stt {
         let backend = parse_stt_backend(s).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1992,10 +1992,10 @@ fn apply_backend_overrides(
         set_active_stt(cfg, backend);
     }
     if let Some(l) = polish {
-        let backend = parse_polish_backend(l).ok_or_else(|| {
+        let backend = parse_llm_backend(l).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown polish backend {l:?}; valid: none, local, cerebras, groq, \
-                 openai, anthropic, openrouter, ollama, gemini"
+                "unknown polish backend {l:?}; valid: none, local, network, cerebras, \
+                 groq, openai, anthropic, openrouter, gemini"
             )
         })?;
         set_active_llm(cfg, backend);
@@ -2016,12 +2016,16 @@ pub fn set_active_stt(cfg: &mut Config, backend: fono_core::config::SttBackend) 
 /// Atomically swap the active assistant backend, mirroring
 /// [`set_active_llm`]. Enables the assistant when a real backend is
 /// selected and disables it on `None`.
-pub fn set_active_assistant(cfg: &mut Config, backend: fono_core::config::AssistantBackend) {
-    use fono_core::config::AssistantBackend;
-    let none = matches!(backend, AssistantBackend::None);
+pub fn set_active_assistant(cfg: &mut Config, backend: fono_core::config::LlmBackend) {
+    use fono_core::config::LlmBackend;
     cfg.assistant.backend = backend;
-    cfg.assistant.enabled = !none;
-    cfg.assistant.cloud = None;
+    cfg.assistant.enabled = !matches!(backend, LlmBackend::None);
+    // Clear the stale cloud sub-block so the factory falls through to
+    // the canonical env var and the catalogue's default model. The
+    // `[assistant.network]` block is deliberately kept: it holds the
+    // user's own server address, which is expensive to retype and is
+    // simply ignored while another backend is active.
+    cfg.assistant.cloud = fono_core::config::LlmCloud::default();
 }
 
 /// Atomically swap the active TTS backend. `wyoming_uri` populates
@@ -2062,20 +2066,21 @@ pub fn set_active_tts(
 
 /// Atomically swap the active polish backend. Enables/disables cleanup as
 /// appropriate (None → disabled, anything else → enabled).
-pub fn set_active_llm(cfg: &mut Config, backend: fono_core::config::PolishBackend) {
-    use fono_core::config::PolishBackend;
-    let none = matches!(backend, PolishBackend::None);
+pub fn set_active_llm(cfg: &mut Config, backend: fono_core::config::LlmBackend) {
+    use fono_core::config::LlmBackend;
     cfg.polish.backend = backend;
-    cfg.polish.enabled = !none;
-    cfg.polish.cloud = None;
+    cfg.polish.enabled = !matches!(backend, LlmBackend::None);
+    // Same reasoning as `set_active_assistant`: drop the cloud override,
+    // keep the user's own server address.
+    cfg.polish.cloud = fono_core::config::LlmCloud::default();
 }
 
 #[allow(clippy::too_many_lines)]
 async fn use_cmd(paths: &Paths, action: UseCmd) -> Result<()> {
-    use fono_core::config::{PolishBackend, SttBackend};
+    use fono_core::config::{LlmBackend, SttBackend};
     use fono_core::providers::{
-        assistant_backend_str, cloud_pair, parse_assistant_backend, parse_polish_backend,
-        parse_stt_backend, parse_tts_backend, polish_backend_str, stt_backend_str, tts_backend_str,
+        cloud_pair, llm_backend_str, parse_llm_backend, parse_stt_backend, parse_tts_backend,
+        stt_backend_str, tts_backend_str,
     };
 
     let path = paths.config_file();
@@ -2090,25 +2095,26 @@ async fn use_cmd(paths: &Paths, action: UseCmd) -> Result<()> {
             format!("stt = {}", stt_backend_str(&b))
         }
         UseCmd::Polish { backend } => {
-            let b = parse_polish_backend(&backend).ok_or_else(|| {
+            let b = parse_llm_backend(&backend).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "unknown polish backend {backend:?}; try none, cerebras, groq, openai, …"
+                    "unknown polish backend {backend:?}; try none, local, network, \
+                     cerebras, groq, openai, …"
                 )
             })?;
-            set_active_llm(&mut cfg, b.clone());
+            set_active_llm(&mut cfg, b);
             cfg.save(&path)?;
-            format!("polish = {}", polish_backend_str(&b))
+            format!("polish = {}", llm_backend_str(&b))
         }
         UseCmd::Assistant { backend } => {
-            let b = parse_assistant_backend(&backend).ok_or_else(|| {
+            let b = parse_llm_backend(&backend).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "unknown assistant backend {backend:?}; try none, anthropic, cerebras, \
-                     openai, groq, openrouter, ollama, local"
+                    "unknown assistant backend {backend:?}; try none, local, network, \
+                     anthropic, cerebras, openai, groq, openrouter, gemini"
                 )
             })?;
-            set_active_assistant(&mut cfg, b.clone());
+            set_active_assistant(&mut cfg, b);
             cfg.save(&path)?;
-            format!("assistant = {}", assistant_backend_str(&b))
+            format!("assistant = {}", llm_backend_str(&b))
         }
         UseCmd::Tts { backend, uri } => {
             let b = parse_tts_backend(&backend).ok_or_else(|| {
@@ -2155,17 +2161,17 @@ async fn use_cmd(paths: &Paths, action: UseCmd) -> Result<()> {
                 )
             })?;
             set_active_stt(&mut cfg, s.clone());
-            set_active_llm(&mut cfg, l.clone());
+            set_active_llm(&mut cfg, l);
             cfg.save(&path)?;
             format!(
                 "cloud preset {provider}: stt = {}, polish = {}",
                 stt_backend_str(&s),
-                polish_backend_str(&l),
+                llm_backend_str(&l),
             )
         }
         UseCmd::Local => {
             set_active_stt(&mut cfg, SttBackend::Local);
-            set_active_llm(&mut cfg, PolishBackend::None);
+            set_active_llm(&mut cfg, LlmBackend::None);
             cfg.save(&path)?;
             "local: stt = local (whisper), polish = none".to_string()
         }
@@ -2203,20 +2209,34 @@ async fn use_cmd(paths: &Paths, action: UseCmd) -> Result<()> {
 }
 
 async fn print_show(paths: &Paths, cfg: &Config) {
-    use fono_core::providers::{
-        assistant_backend_str, polish_backend_str, stt_backend_str, tts_backend_str,
-    };
+    use fono_core::config::LlmBackend;
+    use fono_core::providers::{llm_backend_str, stt_backend_str, tts_backend_str};
+    // A `network` backend is meaningless without its endpoint, so show it.
+    fn llm_line(backend: LlmBackend, url: &str, enabled: bool) -> String {
+        use std::fmt::Write as _;
+        let mut s = llm_backend_str(&backend).to_string();
+        if matches!(backend, LlmBackend::Network) {
+            let url = url.trim();
+            if url.is_empty() {
+                s.push_str(" (no url set)");
+            } else {
+                let _ = write!(s, " ({url})");
+            }
+        }
+        if !enabled {
+            s.push_str(" (disabled)");
+        }
+        s
+    }
     println!("config: {}", paths.config_file().display());
     println!("  stt      : {}", stt_backend_str(&cfg.stt.backend));
     println!(
-        "  polish      : {}{}",
-        polish_backend_str(&cfg.polish.backend),
-        if cfg.polish.enabled { "" } else { " (disabled)" }
+        "  polish   : {}",
+        llm_line(cfg.polish.backend, &cfg.polish.network.url, cfg.polish.enabled)
     );
     println!(
-        "  assistant: {}{}",
-        assistant_backend_str(&cfg.assistant.backend),
-        if cfg.assistant.enabled { "" } else { " (disabled)" }
+        "  assistant: {}",
+        llm_line(cfg.assistant.backend, &cfg.assistant.network.url, cfg.assistant.enabled)
     );
     println!("  tts      : {}", tts_backend_str(&cfg.tts.backend));
     match fono_ipc::request_any(&paths.client_ipc_socket_candidates(), &fono_ipc::Request::Status)
@@ -2634,7 +2654,7 @@ fn vocabulary_cmd(paths: &Paths, action: VocabularyCmd) -> Result<()> {
 
 fn print_keys_list(secrets: &Secrets) {
     use fono_core::providers::{
-        all_polish_backends, all_stt_backends, polish_key_env, polish_requires_key, stt_key_env,
+        all_llm_backends, all_stt_backends, llm_key_env, llm_requires_key, stt_key_env,
         stt_requires_key,
     };
     println!("api keys (config + environment):");
@@ -2645,11 +2665,11 @@ fn print_keys_list(secrets: &Secrets) {
         }
         seen.insert(stt_key_env(&b).to_string());
     }
-    for b in all_polish_backends() {
-        if !polish_requires_key(&b) {
+    for b in all_llm_backends() {
+        if !llm_requires_key(&b) {
             continue;
         }
-        seen.insert(polish_key_env(&b).to_string());
+        seen.insert(llm_key_env(&b).to_string());
     }
     for name in seen {
         let from_secrets = secrets.keys.get(&name).cloned();
@@ -2670,11 +2690,9 @@ fn print_keys_list(secrets: &Secrets) {
 }
 
 fn is_canonical_key(name: &str) -> bool {
-    use fono_core::providers::{
-        all_polish_backends, all_stt_backends, polish_key_env, stt_key_env,
-    };
+    use fono_core::providers::{all_llm_backends, all_stt_backends, llm_key_env, stt_key_env};
     all_stt_backends().iter().any(|b| stt_key_env(b) == name)
-        || all_polish_backends().iter().any(|b| polish_key_env(b) == name)
+        || all_llm_backends().iter().any(|b| llm_key_env(b) == name)
 }
 
 /// Live-probe every configured API key in parallel and print a

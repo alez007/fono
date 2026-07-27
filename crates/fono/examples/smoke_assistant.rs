@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use fono_assistant::{AssistantContext, ConversationHistory};
 use fono_core::config::{
-    Assistant as AssistantCfg, AssistantBackend, AssistantCloud, General, Stt as SttCfg,
-    SttBackend, SttCloud, Tts as TtsCfg, TtsBackend, TtsCloud,
+    Assistant as AssistantCfg, General, LlmBackend, LlmCloud, Stt as SttCfg, SttBackend, SttCloud,
+    Tts as TtsCfg, TtsBackend, TtsCloud,
 };
 use fono_core::{Paths, Secrets};
 use futures::stream::StreamExt;
@@ -56,7 +56,7 @@ fn is_429(msg: &str) -> bool {
 }
 
 struct Provider {
-    backend: AssistantBackend,
+    backend: LlmBackend,
     label: &'static str,
     key_env: &'static str,
     model: &'static str,
@@ -69,14 +69,14 @@ struct Provider {
 fn providers() -> Vec<Provider> {
     vec![
         Provider {
-            backend: AssistantBackend::Anthropic,
+            backend: LlmBackend::Anthropic,
             label: "anthropic",
             key_env: "ANTHROPIC_API_KEY",
             model: "claude-haiku-4-5-20251001",
             ci: false,
         },
         Provider {
-            backend: AssistantBackend::Cerebras,
+            backend: LlmBackend::Cerebras,
             label: "cerebras",
             key_env: "CEREBRAS_API_KEY",
             // Mirrors the user-facing default in
@@ -85,14 +85,14 @@ fn providers() -> Vec<Provider> {
             ci: true,
         },
         Provider {
-            backend: AssistantBackend::Groq,
+            backend: LlmBackend::Groq,
             label: "groq",
             key_env: "GROQ_API_KEY",
             model: "openai/gpt-oss-120b",
             ci: true,
         },
         Provider {
-            backend: AssistantBackend::OpenAI,
+            backend: LlmBackend::OpenAI,
             label: "openai",
             key_env: "OPENAI_API_KEY",
             model: "gpt-5.4-mini",
@@ -152,12 +152,8 @@ async fn main() -> Result<()> {
 
         let cfg = AssistantCfg {
             enabled: true,
-            backend: p.backend.clone(),
-            cloud: Some(AssistantCloud {
-                provider: p.label.to_string(),
-                api_key_ref: p.key_env.to_string(),
-                model: p.model.to_string(),
-            }),
+            backend: p.backend,
+            cloud: LlmCloud { api_key_ref: p.key_env.to_string(), model: p.model.to_string() },
             ..AssistantCfg::default()
         };
 
@@ -410,12 +406,8 @@ async fn exercise_groq_e2e(secrets: &Secrets) -> Result<()> {
     //    completion and stream-collect the reply.
     let llm_cfg = AssistantCfg {
         enabled: true,
-        backend: AssistantBackend::Groq,
-        cloud: Some(AssistantCloud {
-            provider: "groq".into(),
-            api_key_ref: "GROQ_API_KEY".into(),
-            model: "openai/gpt-oss-120b".into(),
-        }),
+        backend: LlmBackend::Groq,
+        cloud: LlmCloud { api_key_ref: "GROQ_API_KEY".into(), model: "openai/gpt-oss-120b".into() },
         ..AssistantCfg::default()
     };
     let assistant = fono_assistant::build_assistant(&llm_cfg, secrets, Path::new("."))

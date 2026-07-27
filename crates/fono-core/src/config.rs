@@ -9,7 +9,15 @@ use crate::error::{Error, Result};
 
 /// Highest config schema version supported by this binary. Bump when adding
 /// breaking fields and add a migration arm in [`Config::migrate`].
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// v2 unified how the two language-model roles (`[polish]`, `[assistant]`)
+/// name where they run: one `backend` key holding
+/// `none` / `local` / `network` / a cloud provider, with `[<role>.local]`,
+/// `[<role>.cloud]` and `[<role>.network]` sub-tables. The old `ollama`
+/// value is gone: an embedded model is now `local` and a self-hosted
+/// OpenAI-compatible server is `network`. A stale `backend = "ollama"`
+/// fails to parse with a message listing the accepted values.
+pub const CURRENT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -924,9 +932,15 @@ pub struct TtsWyoming {
 #[serde(default)]
 pub struct Polish {
     pub enabled: bool,
-    pub backend: PolishBackend,
+    pub backend: LlmBackend,
+    /// `[polish.local]` — used when `backend = "local"`.
     pub local: PolishLocal,
-    pub cloud: Option<PolishCloud>,
+    /// `[polish.cloud]` — used when `backend` names a cloud provider.
+    #[serde(skip_serializing_if = "LlmCloud::is_empty")]
+    pub cloud: LlmCloud,
+    /// `[polish.network]` — used when `backend = "network"`.
+    #[serde(skip_serializing_if = "LlmNetwork::is_empty")]
+    pub network: LlmNetwork,
     pub prompt: Prompt,
     /// Skip the polish roundtrip when the raw STT output has
     /// fewer than this many words (whitespace-split). 0 = never skip.
@@ -962,9 +976,10 @@ impl Default for Polish {
             // and configures a model. Avoids "first dictation crashes
             // because LlamaLocal is a stub" trap.
             enabled: false,
-            backend: PolishBackend::None,
+            backend: LlmBackend::None,
             local: PolishLocal::default(),
-            cloud: None,
+            cloud: LlmCloud::default(),
+            network: LlmNetwork::default(),
             prompt: Prompt::default(),
             skip_if_words_lt: 3,
             stream_injection: true,
@@ -972,19 +987,56 @@ impl Default for Polish {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Where a language-model role (dictation cleanup or assistant chat)
+/// actually runs. One enum for both roles: their provider sets are
+/// identical, and sharing it makes it impossible for the two to drift
+/// into contradictory vocabularies.
+///
+/// The four shapes are deliberately distinct, because they differ in
+/// *how* the model is reached, not merely in who hosts it:
+///
+/// * `None` — role disabled.
+/// * `Local` — embedded `llama.cpp` running a GGUF in this process. No
+///   network, no key. Configured by `[<role>.local]`.
+/// * `Network` — **any** OpenAI-compatible chat-completions server over
+///   HTTP: Ollama, `llama.cpp` server, LM Studio, vLLM, LocalAI,
+///   LiteLLM, a self-hosted gateway. Wire-format compatibility is the
+///   only contract — Fono deliberately does not name an engine.
+///   Configured by `[<role>.network]`.
+/// * a provider — a hosted cloud API reached over HTTPS with an API
+///   key. Configured by `[<role>.cloud]`.
+///
+/// The serialised (lowercase) name is also the canonical string shown in
+/// the tray, `fono use show`, and `fono doctor`, so what the user reads
+/// on screen is always exactly what is in `config.toml`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum PolishBackend {
+pub enum LlmBackend {
     #[default]
-    Local,
     None,
+    /// Embedded `llama.cpp` + a local GGUF. Never issues a request.
+    Local,
+    /// Any OpenAI-compatible HTTP server. Never loads a GGUF.
+    Network,
     OpenAI,
     Anthropic,
+    /// Google Gemini via the OpenAI-compatible surface
+    /// (`/v1beta/openai/chat/completions`), single `GEMINI_API_KEY`,
+    /// free tier (ADR 0034). `google_search` grounding is not exposed
+    /// through the compat layer; native search is a follow-up.
     Gemini,
     Groq,
     Cerebras,
     OpenRouter,
-    Ollama,
+}
+
+impl LlmBackend {
+    /// True for backends that reach a hosted cloud API with an API key —
+    /// i.e. everything that is not off, embedded, or a self-hosted server.
+    #[must_use]
+    pub const fn is_cloud(self) -> bool {
+        !matches!(self, Self::None | Self::Local | Self::Network)
+    }
 }
 
 pub const DEFAULT_POLISH_LOCAL_MODEL: &str = "gemma-4-e2b";
@@ -1019,11 +1071,104 @@ impl Default for PolishLocal {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolishCloud {
-    pub provider: String,
-    pub api_key_ref: String,
+/// `[<role>.cloud]` — settings for a hosted cloud provider. Which
+/// provider is *not* stored here: `backend` is the single source of
+/// truth, so the two can never disagree.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LlmCloud {
+    /// Model id. Empty = the catalogue default for the active provider.
     pub model: String,
+    /// Name of the secret holding the API key — never the key itself,
+    /// and never a URL. Empty = the canonical env var for the provider.
+    pub api_key_ref: String,
+}
+
+impl LlmCloud {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.model.is_empty() && self.api_key_ref.is_empty()
+    }
+}
+
+/// `[<role>.network]` — a self-hosted OpenAI-compatible chat-completions
+/// server. Engine-agnostic on purpose: Ollama, `llama.cpp` server, LM
+/// Studio, vLLM, LocalAI and LiteLLM all speak this and are all equally
+/// supported. If it accepts an OpenAI-shaped request, it works.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LlmNetwork {
+    /// Full endpoint URL, e.g.
+    /// `http://localhost:11434/v1/chat/completions`. A bare origin or a
+    /// `/v1` root is completed automatically; see [`Self::chat_url`].
+    pub url: String,
+    /// Model id as served by that endpoint (e.g. `gemma4:12b`).
+    pub model: String,
+    /// Optional: name of the secret holding a bearer token, for gateways
+    /// that require auth. Most local servers need none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub api_key_ref: String,
+}
+
+impl LlmNetwork {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.url.is_empty() && self.model.is_empty() && self.api_key_ref.is_empty()
+    }
+
+    /// The chat-completions endpoint to POST to.
+    ///
+    /// People paste what their server prints at startup — usually a bare
+    /// origin (`http://localhost:11434`) or the API root
+    /// (`http://localhost:11434/v1`). Both are completed here rather than
+    /// failing deep in the HTTP client with a 404, which is the single
+    /// most common way this setting goes wrong. An explicit path that
+    /// already names an endpoint is left untouched.
+    #[must_use]
+    pub fn chat_url(&self) -> String {
+        let trimmed = self.url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.ends_with("/chat/completions") {
+            return trimmed.to_owned();
+        }
+        if trimmed.ends_with("/v1") {
+            return format!("{trimmed}/chat/completions");
+        }
+        let has_path = trimmed
+            .find("://")
+            .and_then(|i| trimmed.get(i + 3..))
+            .is_some_and(|rest| rest.contains('/'));
+        if has_path {
+            trimmed.to_owned()
+        } else {
+            format!("{trimmed}/v1/chat/completions")
+        }
+    }
+
+    /// The model-list endpoint (`…/v1/models`), used by the settings
+    /// page's "Test connection" control to prove the server is reachable
+    /// and to offer its models as a dropdown instead of free text.
+    /// Derived from [`Self::chat_url`] so both agree about the API root.
+    #[must_use]
+    pub fn models_url(&self) -> String {
+        let chat = self.chat_url();
+        match chat.strip_suffix("/chat/completions") {
+            Some(root) => format!("{root}/models"),
+            // A custom path we could not decompose: ask the origin.
+            None if chat.is_empty() => String::new(),
+            None => format!("{}/v1/models", self.url.trim().trim_end_matches('/')),
+        }
+    }
+
+    /// Origin + port, for compact status labels (tray, `fono use show`).
+    #[must_use]
+    pub fn host_label(&self) -> String {
+        let t = self.url.trim();
+        let after = t.find("://").map_or(t, |i| &t[i + 3..]);
+        after.split('/').next().unwrap_or(after).to_owned()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1135,9 +1280,15 @@ a term in the personal dictionary, prefer that exact spelling.",
 #[allow(clippy::struct_excessive_bools)]
 pub struct Assistant {
     pub enabled: bool,
-    pub backend: AssistantBackend,
+    pub backend: LlmBackend,
+    /// `[assistant.local]` — used when `backend = "local"`.
     pub local: AssistantLocal,
-    pub cloud: Option<AssistantCloud>,
+    /// `[assistant.cloud]` — used when `backend` names a cloud provider.
+    #[serde(skip_serializing_if = "LlmCloud::is_empty")]
+    pub cloud: LlmCloud,
+    /// `[assistant.network]` — used when `backend = "network"`.
+    #[serde(skip_serializing_if = "LlmNetwork::is_empty")]
+    pub network: LlmNetwork,
     /// System prompt sent on every turn. Distinct from `[polish].prompt`
     /// — the cleanup prompt forbids chat-style replies, this one
     /// invites them, capped to 1-3 sentences for low TTS latency.
@@ -1322,9 +1473,10 @@ impl Default for Assistant {
     fn default() -> Self {
         Self {
             enabled: false,
-            backend: AssistantBackend::None,
+            backend: LlmBackend::None,
             local: AssistantLocal::default(),
-            cloud: None,
+            cloud: LlmCloud::default(),
+            network: LlmNetwork::default(),
             prompt_main: default_assistant_prompt().into(),
             history_window_minutes: 5,
             history_max_turns: 12,
@@ -1334,28 +1486,6 @@ impl Default for Assistant {
             tools: AssistantTools::default(),
         }
     }
-}
-
-/// Backend selector for the assistant. Same provider set as
-/// [`PolishBackend`] minus a shape change: assistant defaults to `None`
-/// (off) rather than `Local`, because turning on the assistant
-/// without picking a backend would be a footgun.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AssistantBackend {
-    #[default]
-    None,
-    OpenAI,
-    Anthropic,
-    Groq,
-    Cerebras,
-    OpenRouter,
-    /// Google Gemini via the OpenAI-compatible surface
-    /// (`/v1beta/openai/chat/completions`), single `GEMINI_API_KEY`,
-    /// free tier (ADR 0034). `google_search` grounding is not exposed
-    /// through the compat layer; native search is a follow-up.
-    Gemini,
-    Ollama,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1377,14 +1507,6 @@ impl Default for AssistantLocal {
             context: 8192,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AssistantCloud {
-    pub provider: String,
-    pub api_key_ref: String,
-    pub model: String,
 }
 
 /// Default chat-style system prompt for the voice assistant. Designed
@@ -1529,8 +1651,8 @@ pub struct Overlay {
     /// path is byte-for-byte the same as before the feature existed.
     /// When `true`, capture is sparse (a few keyframes per second of
     /// TTS playback) and self-limits to < 1 % decode overhead.
-    /// Cloud/Ollama-server backends have no brain data to capture and
-    /// ignore this flag. Takes effect on daemon start or config
+    /// Cloud and network-server backends have no brain data to capture
+    /// and ignore this flag. Takes effect on daemon start or config
     /// reload.
     pub brain_capture: bool,
 }
@@ -2492,6 +2614,71 @@ mod tests {
 
         // Wyoming's port (10300) is independent of the LLM port.
         assert_ne!(cfg.server.llm.port, cfg.server.wyoming.port);
+    }
+
+    // ----- [<role>.network] URL completion ----------------------------
+
+    /// People paste whatever their server printed at startup. Every one
+    /// of these spellings must reach the same endpoint, because a 404
+    /// deep inside the HTTP client is the single most common way this
+    /// setting goes wrong.
+    #[test]
+    fn network_chat_url_completes_the_common_spellings() {
+        let cases = [
+            // Bare origin — what Ollama/llama-server print.
+            ("http://localhost:11434", "http://localhost:11434/v1/chat/completions"),
+            // Trailing slash must not double up.
+            ("http://localhost:11434/", "http://localhost:11434/v1/chat/completions"),
+            // Surrounding whitespace from a copy-paste.
+            ("  http://localhost:11434  ", "http://localhost:11434/v1/chat/completions"),
+            // API root.
+            ("http://host:8080/v1", "http://host:8080/v1/chat/completions"),
+            ("http://host:8080/v1/", "http://host:8080/v1/chat/completions"),
+            // Already complete — must be left exactly as given.
+            (
+                "http://192.168.0.200:11434/v1/chat/completions",
+                "http://192.168.0.200:11434/v1/chat/completions",
+            ),
+            // A reverse-proxied custom path is honoured, not "corrected".
+            ("http://gw.lan/llm/v1/chat/completions", "http://gw.lan/llm/v1/chat/completions"),
+            // https and a bare hostname (no port) still complete.
+            ("https://llm.example.com", "https://llm.example.com/v1/chat/completions"),
+        ];
+        for (input, want) in cases {
+            let net = LlmNetwork { url: input.to_string(), ..LlmNetwork::default() };
+            assert_eq!(net.chat_url(), want, "chat_url({input})");
+        }
+    }
+
+    /// An unset URL must yield an empty string, never a bare "/v1/…"
+    /// that would look like a valid relative endpoint to the caller.
+    #[test]
+    fn network_urls_are_empty_when_unset() {
+        for blank in ["", "   "] {
+            let net = LlmNetwork { url: blank.to_string(), ..LlmNetwork::default() };
+            assert!(net.chat_url().is_empty(), "chat_url({blank:?})");
+            assert!(net.models_url().is_empty(), "models_url({blank:?})");
+        }
+    }
+
+    /// The "Test connection" probe must hit the model list that belongs
+    /// to the *same* API root the chat request will use, or the dropdown
+    /// it fills in would advertise models the chat call cannot reach.
+    #[test]
+    fn network_models_url_shares_the_chat_api_root() {
+        let cases = [
+            ("http://localhost:11434", "http://localhost:11434/v1/models"),
+            ("http://host:8080/v1", "http://host:8080/v1/models"),
+            (
+                "http://192.168.0.200:11434/v1/chat/completions",
+                "http://192.168.0.200:11434/v1/models",
+            ),
+            ("http://gw.lan/llm/v1/chat/completions", "http://gw.lan/llm/v1/models"),
+        ];
+        for (input, want) in cases {
+            let net = LlmNetwork { url: input.to_string(), ..LlmNetwork::default() };
+            assert_eq!(net.models_url(), want, "models_url({input})");
+        }
     }
 
     #[test]

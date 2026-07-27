@@ -77,10 +77,18 @@ impl OpenAiCompat {
         )
     }
 
-    /// Ollama exposes an OpenAI-compatible endpoint on `/v1/chat/completions`
-    /// by default; `endpoint` should point at the local instance.
-    pub fn ollama(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new(endpoint, "", model, "ollama")
+    /// A self-hosted, OpenAI-compatible chat-completions server reached
+    /// over the network: Ollama, llama.cpp-server, LM Studio, vLLM,
+    /// LiteLLM, … Fono does not care which engine answers, only that the
+    /// wire format matches. `endpoint` is the full chat-completions URL;
+    /// `token` is sent as a bearer only when the server needs one (most
+    /// self-hosted setups do not).
+    pub fn network(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        token: Option<String>,
+    ) -> Self {
+        Self::new(endpoint, token.unwrap_or_default(), model, "network")
     }
 }
 
@@ -177,9 +185,12 @@ pub(crate) fn uses_default_sampling_only(backend_name: &str, model: &str) -> boo
     backend_name == "openai" && model.to_ascii_lowercase().contains("gpt-5")
 }
 
+/// True for self-hosted OpenAI-compatible servers, which get a larger
+/// token budget (no per-token billing) and the thinking-suppression
+/// switches that hosted APIs reject.
 #[must_use]
 pub(crate) fn is_local_backend(backend_name: &str) -> bool {
-    backend_name == "ollama"
+    backend_name == "network"
 }
 
 #[derive(Serialize)]
@@ -477,7 +488,7 @@ mod tests {
 
     #[test]
     fn local_backends_disable_thinking() {
-        assert!(is_local_backend("ollama"));
+        assert!(is_local_backend("network"));
         assert!(!is_local_backend("groq"));
         assert!(!is_local_backend("openai"));
     }
@@ -521,6 +532,6 @@ mod tests {
         assert!(uses_default_sampling_only("openai", "gpt-5.5-mini"));
         assert!(!uses_default_sampling_only("openai", "gpt-4.1-mini"));
         assert!(!uses_default_sampling_only("groq", "openai/gpt-oss-20b"));
-        assert!(!uses_default_sampling_only("ollama", "gpt-5-local-test"));
+        assert!(!uses_default_sampling_only("network", "gpt-5-local-test"));
     }
 }

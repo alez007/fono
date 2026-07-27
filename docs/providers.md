@@ -59,7 +59,7 @@ The smallest valid cloud config is two lines plus one key:
 [stt]
 backend = "groq"     # or openai, deepgram, …
 [polish]
-backend = "cerebras" # or none, openai, anthropic, groq, openrouter, ollama, local
+backend = "cerebras" # or none, local, network, openai, anthropic, groq, openrouter
 enabled = true
 ```
 
@@ -320,7 +320,7 @@ entries are accepted for forward compatibility but unused on the wire.
 | Backend            | Type         | Default model                 | API key env var        |
 |--------------------|--------------|-------------------------------|------------------------|
 | `local`            | embedded GGUF (llama.cpp) | `gemma-4-e2b` (q4_0) | —                  |
-| `ollama`           | local/remote HTTP server (manual) | `[polish.cloud].model` | — |
+| `network`          | any OpenAI-compatible server | `[polish.network].model` | — (optional bearer) |
 | Cerebras           | cloud HTTP   | `llama-3.3-70b`               | `CEREBRAS_API_KEY`     |
 | Groq               | cloud HTTP   | `llama-3.3-70b-versatile`     | `GROQ_API_KEY`         |
 | OpenAI-compatible  | cloud HTTP   | `gpt-4o-mini` (configurable)  | `OPENAI_API_KEY`       |
@@ -333,15 +333,80 @@ local GGUF — it never talks to an Ollama server. The GGUF is downloaded to
 Fono surfaces a one-shot notification pointing at `fono models install
 <model>` and injects the raw transcript until the model is present.
 
-To use an Ollama (or any OpenAI-compatible) **server** for cleanup instead,
-set `backend = "ollama"` and point `[polish.cloud].api_key_ref` at the
-endpoint URL (default `http://localhost:11434/v1/chat/completions`) with the
-served model in `[polish.cloud].model`. This is a manual opt-in; the setup
-wizard never configures a server for the "local polish" choice.
+To use a **server you run yourself** for cleanup instead — Ollama,
+`llama-server`, LM Studio, vLLM, LiteLLM, or anything else speaking the
+OpenAI chat wire format — set `backend = "network"` and fill in
+`[polish.network]`:
+
+```toml
+[polish]
+backend = "network"
+
+[polish.network]
+url   = "http://192.168.0.200:11434/v1/chat/completions"
+model = "qwen2.5-3b-instruct"
+# api_key_ref = "MY_SERVER_TOKEN"   # optional; only if your server requires a bearer
+```
+
+Fono does not care which engine is behind the URL — compatibility is the
+only requirement. A bare origin like `http://host:11434` is completed to
+`/v1/chat/completions` automatically. The **Test connection** button on
+the web settings page probes the server and turns its model list into a
+dropdown. `api_key_ref` names a secret, never a URL.
+
+This is a manual opt-in; the setup wizard never configures a server for
+the "local polish" choice.
 
 The `enabled` flag in
 `[polish]` can be set to `false` to skip cleanup entirely — in which case Fono
 types the raw STT output verbatim.
+
+### The four ways to pick an LLM
+
+Both LLM roles — `[polish]` (transcript cleanup) and `[assistant]` (the
+F8 voice assistant) — use the **same** `backend` vocabulary, so what you
+learn once applies to both:
+
+| `backend`   | Where the model runs                     | Configured in        |
+|-------------|------------------------------------------|----------------------|
+| `none`      | nowhere — the role is off                | —                    |
+| `local`     | embedded llama.cpp, in the Fono process  | `[<role>.local]`     |
+| `network`   | a server you run (LAN or localhost)      | `[<role>.network]`   |
+| a provider name (`openai`, `anthropic`, `groq`, `cerebras`, `openrouter`, `gemini`) | that vendor's cloud API | `[<role>.cloud]` |
+
+`local` is always the embedded engine — it never opens a socket.
+`network` never loads a GGUF. The two are separate words for separate
+things, and the tray, the CLI (`fono use`), and `config.toml` all use
+that one vocabulary.
+
+`network` is deliberately **engine-agnostic**: Fono only requires an
+OpenAI-compatible `/v1/chat/completions` endpoint. Ollama,
+`llama-server`, LM Studio, vLLM, LiteLLM, text-generation-webui, and
+anything else speaking that format all work, and none of them are named
+in the config.
+
+`api_key_ref` always names a **secret** (an entry in `secrets.toml` or an
+environment variable) — never a URL. For `[<role>.network]` it is
+optional and only needed if your server demands a bearer token.
+
+#### Switching a role on without picking a backend
+
+`none` means "this role is switched off", and Fono only leaves it there
+if that is genuinely what you asked for. If you turn a role **on**
+without saying where it should run — most often by hand-editing
+`config.toml` — Fono picks the best thing you already have, writes the
+choice into `config.toml`, and logs it, so the tray, the settings page
+and the file never disagree about what is running:
+
+1. a server, if `[<role>.network].url` is filled in;
+2. a cloud provider whose API key is already in `secrets.toml`, in the
+   order Groq, Cerebras, OpenAI, Anthropic, Gemini, OpenRouter;
+3. `local` — the on-device model, which needs no key and no network and
+   therefore always works.
+
+Only keys saved in `secrets.toml` count here; a key exported in one
+shell will not silently change where a role runs. A role you have
+switched **off** is never touched, and an explicit backend always wins.
 
 ### Gemini (single key, free tier)
 
@@ -769,7 +834,8 @@ Two config flags in `[assistant]` drive the runtime behaviour:
   the flag is a no-op (no tool is injected). Each invocation logs a
   one-line `info!` at target `fono.assistant` when the tool is active.
 
-Both flags default to **`true`** in `[assistant]` and are no-ops for
+In `[assistant]`, `prefer_vision` defaults to **`true`** and
+`prefer_web_search` defaults to **`false`**; both are no-ops for
 providers whose catalogue entry doesn't carry the matching capability
 (e.g. Cerebras gets neither). The wizard auto-enables them as part of
 the assistant fast path and reports the resulting set on a single

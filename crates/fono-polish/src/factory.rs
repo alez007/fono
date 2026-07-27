@@ -8,41 +8,32 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 #[cfg(test)]
 use fono_core::config::DEFAULT_POLISH_LOCAL_MODEL;
-use fono_core::config::{Polish, PolishBackend};
-use fono_core::providers::polish_key_env;
+use fono_core::config::{LlmBackend, Polish};
+use fono_core::providers::{llm_backend_str, llm_key_env};
 use fono_core::Secrets;
 
 use crate::traits::TextFormatter;
 
 /// Resolve `(key, model)` for a cloud polish backend, falling through to
-/// the canonical env var when `cfg.cloud` is missing or fields blank.
-fn resolve_cloud(
-    cfg: &Polish,
-    secrets: &Secrets,
-    backend: &PolishBackend,
-    provider_name: &str,
-) -> Result<(String, String)> {
-    let canonical = polish_key_env(backend);
-    let (key_ref, model_override) = cfg.cloud.as_ref().map_or_else(
-        || (canonical.to_string(), None),
-        |c| {
-            let key_ref = if c.api_key_ref.is_empty() {
-                canonical.to_string()
-            } else {
-                c.api_key_ref.clone()
-            };
-            let model_override = if c.model.is_empty() { None } else { Some(c.model.clone()) };
-            (key_ref, model_override)
-        },
-    );
+/// the canonical env var when `[polish.cloud]` fields are blank.
+fn resolve_cloud(cfg: &Polish, secrets: &Secrets, backend: LlmBackend) -> Result<(String, String)> {
+    let provider_name = llm_backend_str(&backend);
+    let key_ref = if cfg.cloud.api_key_ref.is_empty() {
+        llm_key_env(&backend).to_string()
+    } else {
+        cfg.cloud.api_key_ref.clone()
+    };
     let key = secrets.resolve(&key_ref).ok_or_else(|| {
         anyhow!(
             "{provider_name} LLM API key {key_ref:?} not found in secrets.toml or environment; \
              run `fono keys add {key_ref}` to add it"
         )
     })?;
-    let model = model_override
-        .unwrap_or_else(|| crate::defaults::default_cloud_model(provider_name).to_string());
+    let model = if cfg.cloud.model.is_empty() {
+        crate::defaults::default_cloud_model(provider_name).to_string()
+    } else {
+        cfg.cloud.model.clone()
+    };
     Ok((key, model))
 }
 
@@ -53,63 +44,50 @@ fn resolve_cloud(
 ///
 /// `polish_models_dir` is the on-disk directory where local LLM GGUF weights
 /// live (typically `~/.local/share/fono/models/polish/`). It is only consulted
-/// when `cfg.backend == PolishBackend::Local`.
+/// when `cfg.backend == LlmBackend::Local`.
 pub fn build_polish(
     cfg: &Polish,
     secrets: &Secrets,
     polish_models_dir: &Path,
 ) -> Result<Option<Arc<dyn TextFormatter>>> {
-    if !cfg.enabled || matches!(cfg.backend, PolishBackend::None) {
+    if !cfg.enabled || matches!(cfg.backend, LlmBackend::None) {
         return Ok(None);
     }
 
-    match &cfg.backend {
-        PolishBackend::Cerebras => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::Cerebras, "cerebras")?;
+    match cfg.backend {
+        // Off is handled by the early return above; keeping the arm
+        // exhaustive (rather than `unreachable!()`) means a future caller
+        // that skips the guard degrades to "no cleanup" instead of panicking
+        // mid-dictation.
+        LlmBackend::None => return Ok(None),
+        LlmBackend::Local => build_local(cfg, polish_models_dir),
+        LlmBackend::Network => build_network(cfg, secrets),
+        LlmBackend::Cerebras => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::Cerebras)?;
             build_cerebras(k, m)
         }
-        PolishBackend::Groq => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::Groq, "groq")?;
+        LlmBackend::Groq => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::Groq)?;
             build_oa_groq(k, m)
         }
-        PolishBackend::OpenAI => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::OpenAI, "openai")?;
+        LlmBackend::OpenAI => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::OpenAI)?;
             build_oa_openai(k, m)
         }
-        PolishBackend::OpenRouter => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::OpenRouter, "openrouter")?;
+        LlmBackend::OpenRouter => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::OpenRouter)?;
             build_oa_openrouter(k, m)
         }
-        PolishBackend::Ollama => {
-            let model = cfg
-                .cloud
-                .as_ref()
-                .map(|c| c.model.clone())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| crate::defaults::default_cloud_model("ollama").to_string());
-            build_oa_ollama(cfg, model)
-        }
-        PolishBackend::Anthropic => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::Anthropic, "anthropic")?;
+        LlmBackend::Anthropic => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::Anthropic)?;
             build_anthropic(k, m)
         }
-        PolishBackend::Local => build_local(cfg, polish_models_dir),
-        PolishBackend::Gemini => {
-            let (k, m) = resolve_cloud(cfg, secrets, &PolishBackend::Gemini, "gemini")?;
+        LlmBackend::Gemini => {
+            let (k, m) = resolve_cloud(cfg, secrets, LlmBackend::Gemini)?;
             build_oa_gemini(k, m)
         }
-        PolishBackend::None => unreachable!(),
     }
     .map(Some)
-}
-
-#[cfg(feature = "openai-compat")]
-fn local_openai_endpoint(cfg: &Polish) -> String {
-    cfg.cloud
-        .as_ref()
-        .map(|c| c.api_key_ref.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http://localhost:11434/v1/chat/completions".to_string())
 }
 
 /// Resolve the model name in `cfg.local.model` to a `<polish_models_dir>/<name>.gguf`
@@ -158,13 +136,38 @@ fn build_oa_gemini(key: String, model: String) -> Result<Arc<dyn TextFormatter>>
     Ok(Arc::new(crate::openai_compat::OpenAiCompat::gemini(key, model)))
 }
 
+/// Any OpenAI-compatible chat-completions server, named by URL rather
+/// than by engine. Most local servers need no credentials; a bearer
+/// token is sent only when `[polish.network].api_key_ref` names a stored
+/// secret, which covers authenticated gateways like LiteLLM.
 #[cfg(feature = "openai-compat")]
-#[allow(clippy::unnecessary_wraps)]
-fn build_oa_ollama(cfg: &Polish, model: String) -> Result<Arc<dyn TextFormatter>> {
-    // Ollama / llama.cpp-server don't need an API key; the endpoint is the local URL stored
-    // in the cloud.api_key_ref slot when configured. Fall back to the
-    // upstream default.
-    Ok(Arc::new(crate::openai_compat::OpenAiCompat::ollama(local_openai_endpoint(cfg), model)))
+fn build_network(cfg: &Polish, secrets: &Secrets) -> Result<Arc<dyn TextFormatter>> {
+    let url = cfg.network.chat_url();
+    if url.is_empty() {
+        return Err(anyhow!(
+            "cleanup is set to `network` but no server URL is configured; set it in \
+             `fono settings` or run `fono use llm network --url <URL>`"
+        ));
+    }
+    if cfg.network.model.trim().is_empty() {
+        return Err(anyhow!(
+            "cleanup is set to `network` but no model id is configured; set it in \
+             `fono settings` or run `fono use llm network --url <URL> --model <ID>`"
+        ));
+    }
+    let token = if cfg.network.api_key_ref.is_empty() {
+        None
+    } else {
+        Some(secrets.resolve(&cfg.network.api_key_ref).ok_or_else(|| {
+            anyhow!(
+                "cleanup server token {:?} not found in secrets.toml or environment; \
+                 run `fono keys add {}` to add it",
+                cfg.network.api_key_ref,
+                cfg.network.api_key_ref
+            )
+        })?)
+    };
+    Ok(Arc::new(crate::openai_compat::OpenAiCompat::network(url, cfg.network.model.clone(), token)))
 }
 
 #[cfg(not(feature = "openai-compat"))]
@@ -190,8 +193,11 @@ fn build_oa_gemini(_: String, _: String) -> Result<Arc<dyn TextFormatter>> {
 }
 
 #[cfg(not(feature = "openai-compat"))]
-fn build_oa_ollama(_: &Polish, _: String) -> Result<Arc<dyn TextFormatter>> {
-    Err(anyhow!("Ollama LLM not compiled in (enable the `openai-compat` feature on `fono-polish`)"))
+fn build_network(_: &Polish, _: &Secrets) -> Result<Arc<dyn TextFormatter>> {
+    Err(anyhow!(
+        "a self-hosted cleanup server was requested but this binary was built without the \
+         `openai-compat` feature on `fono-polish`"
+    ))
 }
 
 #[cfg(feature = "anthropic")]
@@ -205,20 +211,20 @@ fn build_anthropic(_: String, _: String) -> Result<Arc<dyn TextFormatter>> {
     Err(anyhow!("Anthropic LLM not compiled in (enable the `anthropic` feature on `fono-polish`)"))
 }
 
-// `PolishBackend::Local` always means the embedded `llama-cpp-2` engine
-// running a local GGUF — never an Ollama / OpenAI-compatible *server*.
-// The server path is reached only via the explicit `PolishBackend::Ollama`
-// backend (see `build_oa_ollama`). This mirrors the assistant factory
-// (`fono-assistant/src/factory.rs` `build_embedded_local`); a missing
-// model file fails loudly with `fono models install` guidance rather than
-// silently degrading to no cleanup.
+// `LlmBackend::Local` always means the embedded `llama-cpp-2` engine
+// running a local GGUF: it never opens a socket. A self-hosted server is
+// the separate `LlmBackend::Network` backend (see `build_network`). This
+// mirrors the assistant factory (`fono-assistant/src/factory.rs`
+// `build_embedded_local`); a missing model file fails loudly with
+// `fono models install` guidance rather than silently degrading to no
+// cleanup.
 #[cfg(feature = "llama-local")]
 fn build_local(cfg: &Polish, polish_models_dir: &Path) -> Result<Arc<dyn TextFormatter>> {
     let model_path = resolve_local_model_path(cfg, polish_models_dir);
     if !model_path.exists() {
         return Err(anyhow!(
             "local polish model not found at {model_path:?}; run `fono models install {}` \
-             or pick a cloud/Ollama polish backend in `fono setup`",
+             or pick a cloud or network cleanup backend in `fono setup`",
             cfg.local.model
         ));
     }
@@ -246,7 +252,7 @@ fn build_local(_: &Polish, _: &Path) -> Result<Arc<dyn TextFormatter>> {
     Err(anyhow!(
         "local polish requested but this binary was built without the \
          `llama-local` feature; rebuild with `cargo build --features llama-local` \
-         or pick a cloud/Ollama polish backend in `fono setup`"
+         or pick a cloud or network cleanup backend in `fono setup`"
     ))
 }
 
@@ -264,7 +270,7 @@ mod tests {
 
     #[test]
     fn backend_none_returns_none() {
-        let cfg = LlmCfg { backend: PolishBackend::None, enabled: true, ..LlmCfg::default() };
+        let cfg = LlmCfg { backend: LlmBackend::None, enabled: true, ..LlmCfg::default() };
         let s = Secrets::default();
         assert!(build_polish(&cfg, &s, Path::new("/nonexistent")).unwrap().is_none());
     }
@@ -284,50 +290,83 @@ mod tests {
     }
 
     // `backend = local` with the default (Gemma) model must resolve to
-    // the embedded engine, NOT an Ollama HTTP client. With a nonexistent
-    // models dir (and regardless of the `llama-local` feature) it must
-    // fail loudly rather than silently producing a server-backed
-    // formatter. Regression guard for the "local cleanup silently POSTs
-    // to localhost:11434" bug.
+    // the embedded engine, NOT an HTTP client. With a nonexistent models
+    // dir (and regardless of the `llama-local` feature) it must fail
+    // loudly rather than silently producing a server-backed formatter.
+    // Regression guard for the "local cleanup silently POSTs to
+    // localhost:11434" bug.
     #[test]
     fn local_polish_uses_embedded_model_by_default() {
         let cfg = LlmCfg {
             enabled: true,
-            backend: PolishBackend::Local,
+            backend: LlmBackend::Local,
             local: fono_core::config::PolishLocal {
                 model: DEFAULT_POLISH_LOCAL_MODEL.into(),
                 ..fono_core::config::PolishLocal::default()
             },
-            // A stale Ollama cloud block must NOT activate a server when
+            // A leftover network block must NOT activate a server when
             // the backend is `local`.
-            cloud: Some(fono_core::config::PolishCloud {
-                provider: "ollama".into(),
-                api_key_ref: "http://localhost:11434/v1/chat/completions".into(),
+            network: fono_core::config::LlmNetwork {
+                url: "http://localhost:11434/v1/chat/completions".into(),
                 model: DEFAULT_POLISH_LOCAL_MODEL.into(),
-            }),
+                api_key_ref: String::new(),
+            },
             ..LlmCfg::default()
         };
         let s = Secrets::default();
         assert!(build_polish(&cfg, &s, Path::new("/this/path/does/not/exist")).is_err());
     }
 
-    // The Ollama / OpenAI-compatible server path is reached only via the
-    // explicit `PolishBackend::Ollama` backend, and builds without any
-    // local model file on disk.
+    // The self-hosted server path is reached only via the explicit
+    // `network` backend, and builds without any local model file on disk.
     #[cfg(feature = "openai-compat")]
     #[test]
-    fn explicit_ollama_server_still_builds() {
+    fn explicit_network_server_still_builds() {
         let cfg = LlmCfg {
             enabled: true,
-            backend: PolishBackend::Ollama,
-            cloud: Some(fono_core::config::PolishCloud {
-                provider: "ollama".into(),
-                api_key_ref: "http://localhost:11434/v1/chat/completions".into(),
-                model: "gemma3:1b".into(),
-            }),
+            backend: LlmBackend::Network,
+            network: fono_core::config::LlmNetwork {
+                url: "http://localhost:11434".into(),
+                model: "gemma4:12b".into(),
+                api_key_ref: String::new(),
+            },
             ..LlmCfg::default()
         };
         let s = Secrets::default();
         assert!(build_polish(&cfg, &s, Path::new("/this/path/does/not/exist")).unwrap().is_some());
+    }
+
+    /// `build_polish` returns a trait object that is not `Debug`, so
+    /// `unwrap_err()` is unavailable; pull the message out by hand.
+    fn err_of(cfg: &LlmCfg) -> String {
+        match build_polish(cfg, &Secrets::default(), Path::new("/nonexistent")) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    // A `network` backend with no URL must say so, rather than POSTing to
+    // a hardcoded localhost guess the user never configured.
+    #[test]
+    fn network_without_url_errors() {
+        let cfg = LlmCfg { enabled: true, backend: LlmBackend::Network, ..LlmCfg::default() };
+        let err = err_of(&cfg);
+        assert!(err.contains("no server URL"), "unexpected error: {err}");
+    }
+
+    // Same for a URL with no model id: the server cannot pick one for us.
+    #[test]
+    fn network_without_model_errors() {
+        let cfg = LlmCfg {
+            enabled: true,
+            backend: LlmBackend::Network,
+            network: fono_core::config::LlmNetwork {
+                url: "http://localhost:11434".into(),
+                ..fono_core::config::LlmNetwork::default()
+            },
+            ..LlmCfg::default()
+        };
+        let err = err_of(&cfg);
+        assert!(err.contains("no model id"), "unexpected error: {err}");
     }
 }

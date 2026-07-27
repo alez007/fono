@@ -3,6 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-07-01
 - **Supersedes:** none
+- **Partially superseded by:** [ADR 0039 — One LLM backend vocabulary](0039-unified-llm-backend-selection.md),
+  which replaces the outbound `ollama-server` / `openai-compatible-local`
+  marker-string convention with a first-class `network` backend. The inbound
+  `[server.llm]` API described here is unchanged.
 - **Related:** [ADR 0030 — Fono as an MCP server for coding agents](0030-fono-as-mcp-server-for-coding-agents.md),
   [ADR 0004 — Default models](0004-default-models.md)
 - **Plan:** [`plans/2026-07-01-local-llm-openai-ollama-server-v1.md`](../plans/2026-07-01-local-llm-openai-ollama-server-v1.md),

@@ -111,6 +111,9 @@ fn stub_hooks() -> WebSettingsHooks {
         discover_tools: Arc::new(|_probe| {
             Box::pin(async { Err("no MCP server reachable in test".to_string()) })
         }),
+        probe_llm: Arc::new(|_spec| {
+            Box::pin(async { Err("no LLM server reachable in test".to_string()) })
+        }),
     }
 }
 

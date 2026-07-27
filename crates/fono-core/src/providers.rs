@@ -10,7 +10,7 @@
 //! Provider-switching plan S2 — keep changes here in sync with the
 //! `defaults` modules in `fono-stt` / `fono-polish` for model strings.
 
-use crate::config::{AssistantBackend, PolishBackend, SttBackend, TtsBackend};
+use crate::config::{LlmBackend, SttBackend, TtsBackend};
 
 /// Canonical lower-case identifier for a STT backend (matches serde
 /// rename and what users type on the CLI: `fono use stt groq`).
@@ -57,36 +57,72 @@ pub fn parse_stt_backend(s: &str) -> Option<SttBackend> {
     }
 }
 
-/// Canonical lower-case identifier for a polish backend.
+/// Canonical lower-case identifier for a language-model backend, shared
+/// by dictation cleanup and assistant chat.
+///
+/// This is deliberately identical to the serde representation, so the
+/// string in the tray, in `fono use show`, in `fono doctor` and in
+/// `config.toml` is always the same word. (Before v2 the assistant
+/// printed "local" for a backend the file called "ollama" — the two
+/// must never drift again; see the `backend_str_matches_serde` test.)
 #[must_use]
-pub const fn polish_backend_str(b: &PolishBackend) -> &'static str {
+pub const fn llm_backend_str(b: &LlmBackend) -> &'static str {
     match b {
-        PolishBackend::Local => "local",
-        PolishBackend::None => "none",
-        PolishBackend::OpenAI => "openai",
-        PolishBackend::Anthropic => "anthropic",
-        PolishBackend::Gemini => "gemini",
-        PolishBackend::Groq => "groq",
-        PolishBackend::Cerebras => "cerebras",
-        PolishBackend::OpenRouter => "openrouter",
-        PolishBackend::Ollama => "ollama",
+        LlmBackend::None => "none",
+        LlmBackend::Local => "local",
+        LlmBackend::Network => "network",
+        LlmBackend::OpenAI => "openai",
+        LlmBackend::Anthropic => "anthropic",
+        LlmBackend::Gemini => "gemini",
+        LlmBackend::Groq => "groq",
+        LlmBackend::Cerebras => "cerebras",
+        LlmBackend::OpenRouter => "openrouter",
+    }
+}
+
+/// Parse a CLI-style backend string. Beyond the canonical names this
+/// accepts a few things people reasonably type: `off`/`skip` for `none`,
+/// and the name of a server engine (`ollama`, `llamacpp`, `lmstudio`,
+/// `vllm`, `localai`) for `network` — Fono does not care which engine is
+/// behind the URL, only that it speaks the OpenAI chat-completions API.
+#[must_use]
+pub fn parse_llm_backend(s: &str) -> Option<LlmBackend> {
+    match s.to_ascii_lowercase().as_str() {
+        "none" | "off" | "skip" => Some(LlmBackend::None),
+        "local" | "embedded" => Some(LlmBackend::Local),
+        "network" | "server" | "ollama" | "llamacpp" | "llama.cpp" | "lmstudio" | "lm-studio"
+        | "vllm" | "localai" | "litellm" => Some(LlmBackend::Network),
+        "openai" => Some(LlmBackend::OpenAI),
+        "anthropic" => Some(LlmBackend::Anthropic),
+        "gemini" => Some(LlmBackend::Gemini),
+        "groq" => Some(LlmBackend::Groq),
+        "cerebras" => Some(LlmBackend::Cerebras),
+        "openrouter" => Some(LlmBackend::OpenRouter),
+        _ => None,
+    }
+}
+
+/// Canonical environment-variable name where the API key for a cloud
+/// language-model backend is read from. Empty for the backends that
+/// need no key (`none`, `local`, `network`); check [`llm_requires_key`]
+/// first. Cleanup and the assistant share these names on purpose, so a
+/// single stored key serves both and the wizard never prompts twice.
+#[must_use]
+pub const fn llm_key_env(b: &LlmBackend) -> &'static str {
+    match b {
+        LlmBackend::None | LlmBackend::Local | LlmBackend::Network => "",
+        LlmBackend::OpenAI => "OPENAI_API_KEY",
+        LlmBackend::Anthropic => "ANTHROPIC_API_KEY",
+        LlmBackend::Gemini => "GEMINI_API_KEY",
+        LlmBackend::Groq => "GROQ_API_KEY",
+        LlmBackend::Cerebras => "CEREBRAS_API_KEY",
+        LlmBackend::OpenRouter => "OPENROUTER_API_KEY",
     }
 }
 
 #[must_use]
-pub fn parse_polish_backend(s: &str) -> Option<PolishBackend> {
-    match s.to_ascii_lowercase().as_str() {
-        "local" => Some(PolishBackend::Local),
-        "none" | "off" | "skip" => Some(PolishBackend::None),
-        "openai" => Some(PolishBackend::OpenAI),
-        "anthropic" => Some(PolishBackend::Anthropic),
-        "gemini" => Some(PolishBackend::Gemini),
-        "groq" => Some(PolishBackend::Groq),
-        "cerebras" => Some(PolishBackend::Cerebras),
-        "openrouter" => Some(PolishBackend::OpenRouter),
-        "ollama" => Some(PolishBackend::Ollama),
-        _ => None,
-    }
+pub const fn llm_requires_key(b: &LlmBackend) -> bool {
+    b.is_cloud()
 }
 
 /// Canonical environment-variable name where the API key for a given
@@ -115,26 +151,8 @@ pub const fn stt_key_env(b: &SttBackend) -> &'static str {
 }
 
 #[must_use]
-pub const fn polish_key_env(b: &PolishBackend) -> &'static str {
-    match b {
-        PolishBackend::Local | PolishBackend::None | PolishBackend::Ollama => "",
-        PolishBackend::OpenAI => "OPENAI_API_KEY",
-        PolishBackend::Anthropic => "ANTHROPIC_API_KEY",
-        PolishBackend::Gemini => "GEMINI_API_KEY",
-        PolishBackend::Groq => "GROQ_API_KEY",
-        PolishBackend::Cerebras => "CEREBRAS_API_KEY",
-        PolishBackend::OpenRouter => "OPENROUTER_API_KEY",
-    }
-}
-
-#[must_use]
 pub const fn stt_requires_key(b: &SttBackend) -> bool {
     !matches!(b, SttBackend::Local | SttBackend::Wyoming)
-}
-
-#[must_use]
-pub const fn polish_requires_key(b: &PolishBackend) -> bool {
-    !matches!(b, PolishBackend::Local | PolishBackend::None | PolishBackend::Ollama)
 }
 
 /// Canonical lower-case identifier for a TTS backend.
@@ -206,60 +224,7 @@ pub const fn tts_requires_key(b: &TtsBackend) -> bool {
     )
 }
 
-/// Canonical lower-case identifier for an assistant chat backend.
-#[must_use]
-pub const fn assistant_backend_str(b: &AssistantBackend) -> &'static str {
-    match b {
-        AssistantBackend::None => "none",
-        AssistantBackend::OpenAI => "openai",
-        AssistantBackend::Anthropic => "anthropic",
-        AssistantBackend::Groq => "groq",
-        AssistantBackend::Cerebras => "cerebras",
-        AssistantBackend::OpenRouter => "openrouter",
-        AssistantBackend::Gemini => "gemini",
-        AssistantBackend::Ollama => "local",
-    }
-}
-
-#[must_use]
-pub fn parse_assistant_backend(s: &str) -> Option<AssistantBackend> {
-    match s.to_ascii_lowercase().as_str() {
-        "none" | "off" | "skip" => Some(AssistantBackend::None),
-        "openai" => Some(AssistantBackend::OpenAI),
-        "anthropic" => Some(AssistantBackend::Anthropic),
-        "groq" => Some(AssistantBackend::Groq),
-        "cerebras" => Some(AssistantBackend::Cerebras),
-        "openrouter" => Some(AssistantBackend::OpenRouter),
-        "gemini" => Some(AssistantBackend::Gemini),
-        "local" | "ollama" => Some(AssistantBackend::Ollama),
-        _ => None,
-    }
-}
-
-/// Canonical environment-variable name for the API key of a cloud
-/// assistant backend. Reuses the same env vars as the polish
-/// path (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.), so a single
-/// stored key serves both consumers without duplicate prompts in
-/// the wizard.
-#[must_use]
-pub const fn assistant_key_env(b: &AssistantBackend) -> &'static str {
-    match b {
-        AssistantBackend::None | AssistantBackend::Ollama => "",
-        AssistantBackend::OpenAI => "OPENAI_API_KEY",
-        AssistantBackend::Anthropic => "ANTHROPIC_API_KEY",
-        AssistantBackend::Groq => "GROQ_API_KEY",
-        AssistantBackend::Cerebras => "CEREBRAS_API_KEY",
-        AssistantBackend::OpenRouter => "OPENROUTER_API_KEY",
-        AssistantBackend::Gemini => "GEMINI_API_KEY",
-    }
-}
-
-#[must_use]
-pub const fn assistant_requires_key(b: &AssistantBackend) -> bool {
-    !matches!(b, AssistantBackend::None | AssistantBackend::Ollama)
-}
-
-/// Paired cloud preset for `fono use cloud <name>`. Returns `(stt, polish)`
+/// Paired cloud preset for `fono use cloud <name>`. Returns `(stt, llm)`
 /// for the preset, or `None` if the name isn't a known pair.
 ///
 /// Looks up [`crate::provider_catalog::CLOUD_PROVIDERS`] as the source of
@@ -270,7 +235,7 @@ pub const fn assistant_requires_key(b: &AssistantBackend) -> bool {
 /// capability (Deepgram, AssemblyAI), the pair falls back to Cerebras
 /// for cleanup.
 #[must_use]
-pub fn cloud_pair(name: &str) -> Option<(SttBackend, PolishBackend)> {
+pub fn cloud_pair(name: &str) -> Option<(SttBackend, LlmBackend)> {
     let id = name.to_ascii_lowercase();
     let entry = crate::provider_catalog::find(&id)?;
     // Resolve STT: prefer the entry's own STT capability, otherwise
@@ -279,12 +244,9 @@ pub fn cloud_pair(name: &str) -> Option<(SttBackend, PolishBackend)> {
     // Resolve LLM: prefer the entry's own LLM capability, otherwise
     // fall back to Cerebras for cleanup (for STT-only providers like
     // Deepgram and AssemblyAI).
-    let polish = if entry.polish.is_some() {
-        parse_polish_backend(entry.id)?
-    } else {
-        PolishBackend::Cerebras
-    };
-    Some((stt, polish))
+    let llm =
+        if entry.polish.is_some() { parse_llm_backend(entry.id)? } else { LlmBackend::Cerebras };
+    Some((stt, llm))
 }
 
 /// Iterator over every STT backend (for doctor enumeration etc.).
@@ -308,32 +270,19 @@ pub fn all_stt_backends() -> [SttBackend; 14] {
     ]
 }
 
+/// Canonical lower-case identifier for an assistant chat backend.
 #[must_use]
-pub fn all_polish_backends() -> [PolishBackend; 9] {
+pub fn all_llm_backends() -> [LlmBackend; 9] {
     [
-        PolishBackend::None,
-        PolishBackend::Local,
-        PolishBackend::Cerebras,
-        PolishBackend::Groq,
-        PolishBackend::OpenAI,
-        PolishBackend::Anthropic,
-        PolishBackend::OpenRouter,
-        PolishBackend::Ollama,
-        PolishBackend::Gemini,
-    ]
-}
-
-#[must_use]
-pub fn all_assistant_backends() -> [AssistantBackend; 8] {
-    [
-        AssistantBackend::None,
-        AssistantBackend::Cerebras,
-        AssistantBackend::Groq,
-        AssistantBackend::OpenAI,
-        AssistantBackend::Anthropic,
-        AssistantBackend::OpenRouter,
-        AssistantBackend::Gemini,
-        AssistantBackend::Ollama,
+        LlmBackend::None,
+        LlmBackend::Local,
+        LlmBackend::Network,
+        LlmBackend::Cerebras,
+        LlmBackend::Groq,
+        LlmBackend::OpenAI,
+        LlmBackend::Anthropic,
+        LlmBackend::OpenRouter,
+        LlmBackend::Gemini,
     ]
 }
 
@@ -385,36 +334,98 @@ pub fn configured_stt_backends(secrets: &crate::Secrets, active: &SttBackend) ->
         .collect()
 }
 
-/// Same idea as [`configured_stt_backends`] but for polish backends.
-/// Always includes `None` and `Local` (no key required). Ollama is
-/// included only if `OLLAMA_HOST` appears in `secrets.toml` (or it's
-/// the active backend), so users without a local Ollama server don't
-/// see it in the tray menu. Like its STT cousin, the process
-/// environment is ignored — only keys saved in `secrets.toml` count.
+/// Same idea as [`configured_stt_backends`] but for the language-model
+/// roles (cleanup and assistant chat). Always includes `None` and
+/// `Local` (neither needs a key or a server). `Network` appears only
+/// once the role actually has a server URL configured — a bare
+/// "network" row that points nowhere is a dead end, so
+/// `has_network_url` gates it, exactly as `[tts.wyoming]` gates the
+/// Wyoming row. Like its STT cousin, the process environment is
+/// ignored: only keys saved in `secrets.toml` count.
 #[must_use]
-pub fn configured_polish_backends(
+pub fn configured_llm_backends(
     secrets: &crate::Secrets,
-    active: &PolishBackend,
-) -> Vec<PolishBackend> {
-    all_polish_backends()
+    active: &LlmBackend,
+    has_network_url: bool,
+) -> Vec<LlmBackend> {
+    all_llm_backends()
         .into_iter()
         .filter(|b| {
-            if std::mem::discriminant(b) == std::mem::discriminant(active) {
+            if b == active {
                 return true;
             }
-            // Ollama doesn't have an API key but still needs an explicit
-            // opt-in so users without an Ollama server don't see it in
-            // the tray menu. Treat OLLAMA_HOST in secrets.toml as the
-            // opt-in marker.
-            if matches!(b, PolishBackend::Ollama) {
-                return secrets.has_in_file("OLLAMA_HOST");
+            if matches!(b, LlmBackend::Network) {
+                return has_network_url;
             }
-            if !polish_requires_key(b) {
+            if !llm_requires_key(b) {
                 return true;
             }
-            secrets.has_in_file(polish_key_env(b))
+            secrets.has_in_file(llm_key_env(b))
         })
         .collect()
+}
+
+/// Preference order used by [`resolve_llm_backend`] when a role has no
+/// explicit backend. Cloud first, cheapest-and-fastest first, because a
+/// user who has saved a key has already told us where they want to run.
+/// Only providers that actually serve both LLM roles appear here.
+const LLM_AUTOSELECT_ORDER: [LlmBackend; 6] = [
+    LlmBackend::Groq,
+    LlmBackend::Cerebras,
+    LlmBackend::OpenAI,
+    LlmBackend::Anthropic,
+    LlmBackend::Gemini,
+    LlmBackend::OpenRouter,
+];
+
+/// The auto-select preference order, for callers that must reproduce it
+/// (the web settings page duplicates it in JavaScript, and a test in
+/// `fono-net` asserts the two stay identical).
+#[must_use]
+pub const fn llm_autoselect_order() -> [LlmBackend; 6] {
+    LLM_AUTOSELECT_ORDER
+}
+
+/// Decide what a role should actually run when its configured backend
+/// is `None`.
+///
+/// `None` used to mean two different things: "the user switched this
+/// off" and "nobody has chosen yet". Those deserve opposite treatment —
+/// the first must be obeyed, the second should just work. Fono now
+/// distinguishes them with `enabled`: a role that is **off** stays off,
+/// and `None` is only ever inferred for a role the user has switched
+/// **on** without saying where it should run.
+///
+/// Resolution order, best-available first:
+///
+/// 1. an explicit backend — always wins, including an explicit `None`
+///    on a disabled role,
+/// 2. a self-hosted server, if one is configured,
+/// 3. a cloud provider whose key is in `secrets.toml`, in
+///    [`LLM_AUTOSELECT_ORDER`],
+/// 4. `Local` — the on-device model, which needs no key and no network
+///    and is therefore always a working answer.
+///
+/// The process environment is deliberately ignored (only `secrets.toml`
+/// counts), matching [`configured_llm_backends`], so a stray exported
+/// key in one shell cannot silently change where a role runs.
+#[must_use]
+pub fn resolve_llm_backend(
+    configured: LlmBackend,
+    enabled: bool,
+    secrets: &crate::Secrets,
+    has_network_url: bool,
+) -> LlmBackend {
+    if !matches!(configured, LlmBackend::None) || !enabled {
+        return configured;
+    }
+    if has_network_url {
+        return LlmBackend::Network;
+    }
+    LLM_AUTOSELECT_ORDER
+        .into_iter()
+        .find(|b| secrets.has_in_file(llm_key_env(b)))
+        .unwrap_or(LlmBackend::Local)
 }
 
 /// Same idea as [`configured_stt_backends`] but for TTS backends.
@@ -488,51 +499,77 @@ mod tests {
 
     #[test]
     fn llm_roundtrip() {
-        for b in all_polish_backends() {
-            let s = polish_backend_str(&b);
-            assert_eq!(parse_polish_backend(s).unwrap(), b);
+        for b in all_llm_backends() {
+            let s = llm_backend_str(&b);
+            assert_eq!(parse_llm_backend(s).unwrap(), b);
         }
+    }
+
+    /// The string the user READS (tray, `fono use show`, doctor) must be
+    /// byte-identical to the string WRITTEN to `config.toml`. Before v2
+    /// the assistant displayed "local" for a backend serialised as
+    /// "ollama", so the tray and the config file disagreed on screen.
+    /// This test is the guard that stops that class of bug returning.
+    #[test]
+    fn backend_str_matches_serde() {
+        for b in all_llm_backends() {
+            let serialised = toml::Value::try_from(b).expect("backend serialises");
+            assert_eq!(
+                serialised.as_str().expect("backend serialises to a string"),
+                llm_backend_str(&b),
+                "display string and config value must not drift for {b:?}"
+            );
+        }
+    }
+
+    /// `ollama` is no longer a backend value: an embedded model is
+    /// `local` and a self-hosted server is `network`. The CLI still
+    /// accepts engine names as a convenience, all pointing at `network`,
+    /// because which engine serves the URL is irrelevant to Fono.
+    #[test]
+    fn engine_names_parse_to_network() {
+        for name in ["ollama", "llamacpp", "lmstudio", "vllm", "localai", "server"] {
+            assert_eq!(parse_llm_backend(name), Some(LlmBackend::Network), "{name}");
+        }
+        assert_eq!(parse_llm_backend("local"), Some(LlmBackend::Local));
+        assert_eq!(parse_llm_backend("embedded"), Some(LlmBackend::Local));
+        // ...but the canonical spelling is what gets written back.
+        assert_eq!(llm_backend_str(&LlmBackend::Network), "network");
     }
 
     #[test]
     fn unknown_returns_none() {
         assert!(parse_stt_backend("nope").is_none());
-        assert!(parse_polish_backend("nope").is_none());
-    }
-
-    #[test]
-    fn assistant_local_backend_is_user_facing_local_with_manual_ollama_alias() {
-        assert_eq!(assistant_backend_str(&AssistantBackend::Ollama), "local");
-        assert_eq!(parse_assistant_backend("local"), Some(AssistantBackend::Ollama));
-        assert_eq!(parse_assistant_backend("ollama"), Some(AssistantBackend::Ollama));
+        assert!(parse_llm_backend("nope").is_none());
     }
 
     #[test]
     fn key_env_matches_provider() {
         assert_eq!(stt_key_env(&SttBackend::Groq), "GROQ_API_KEY");
-        assert_eq!(polish_key_env(&PolishBackend::Cerebras), "CEREBRAS_API_KEY");
+        assert_eq!(llm_key_env(&LlmBackend::Cerebras), "CEREBRAS_API_KEY");
         assert!(stt_key_env(&SttBackend::Local).is_empty());
-        assert!(polish_key_env(&PolishBackend::None).is_empty());
+        assert!(llm_key_env(&LlmBackend::None).is_empty());
     }
 
     #[test]
     fn requires_key_flags() {
         assert!(!stt_requires_key(&SttBackend::Local));
         assert!(stt_requires_key(&SttBackend::Groq));
-        assert!(!polish_requires_key(&PolishBackend::None));
-        assert!(!polish_requires_key(&PolishBackend::Local));
-        assert!(!polish_requires_key(&PolishBackend::Ollama));
-        assert!(polish_requires_key(&PolishBackend::Cerebras));
+        // Off, embedded and self-hosted all need no API key.
+        assert!(!llm_requires_key(&LlmBackend::None));
+        assert!(!llm_requires_key(&LlmBackend::Local));
+        assert!(!llm_requires_key(&LlmBackend::Network));
+        assert!(llm_requires_key(&LlmBackend::Cerebras));
     }
 
     #[test]
     fn cloud_pairs() {
         let (s, l) = cloud_pair("groq").unwrap();
         assert!(matches!(s, SttBackend::Groq));
-        assert!(matches!(l, PolishBackend::Groq));
+        assert!(matches!(l, LlmBackend::Groq));
         let (s, l) = cloud_pair("cerebras").unwrap();
         assert!(matches!(s, SttBackend::Groq));
-        assert!(matches!(l, PolishBackend::Cerebras));
+        assert!(matches!(l, LlmBackend::Cerebras));
         assert!(cloud_pair("nope").is_none());
     }
 
@@ -544,17 +581,17 @@ mod tests {
         std::env::set_var("CEREBRAS_API_KEY", "leaky-env-value");
         let secrets = crate::Secrets::default(); // empty file
         let stt = configured_stt_backends(&secrets, &SttBackend::Local);
-        let polish = configured_polish_backends(&secrets, &PolishBackend::None);
+        let llm = configured_llm_backends(&secrets, &LlmBackend::None, false);
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("CEREBRAS_API_KEY");
         // Only key-free backends + the active one should be present.
         assert_eq!(stt, vec![SttBackend::Local], "env vars should not expand the STT menu");
         assert!(
-            !polish.iter().any(|b| matches!(b, PolishBackend::OpenAI)),
+            !llm.iter().any(|b| matches!(b, LlmBackend::OpenAI)),
             "env-only OPENAI_API_KEY should not show OpenAI in the LLM menu"
         );
         assert!(
-            !polish.iter().any(|b| matches!(b, PolishBackend::Cerebras)),
+            !llm.iter().any(|b| matches!(b, LlmBackend::Cerebras)),
             "env-only CEREBRAS_API_KEY should not show Cerebras in the LLM menu"
         );
     }
@@ -565,31 +602,145 @@ mod tests {
         secrets.insert("GROQ_API_KEY", "gsk-explicit");
         secrets.insert("CEREBRAS_API_KEY", "cs-explicit");
         let stt = configured_stt_backends(&secrets, &SttBackend::Local);
-        let polish = configured_polish_backends(&secrets, &PolishBackend::None);
+        let llm = configured_llm_backends(&secrets, &LlmBackend::None, false);
         assert!(stt.iter().any(|b| matches!(b, SttBackend::Groq)));
-        assert!(polish.iter().any(|b| matches!(b, PolishBackend::Cerebras)));
+        assert!(llm.iter().any(|b| matches!(b, LlmBackend::Cerebras)));
         // Backends without explicit keys must remain hidden.
         assert!(!stt.iter().any(|b| matches!(b, SttBackend::OpenAI)));
-        assert!(!polish.iter().any(|b| matches!(b, PolishBackend::Anthropic)));
+        assert!(!llm.iter().any(|b| matches!(b, LlmBackend::Anthropic)));
     }
 
+    /// `network` is only offered once a server URL exists — otherwise the
+    /// menu row leads nowhere. Embedded `local` is always offered.
     #[test]
-    fn configured_filter_hides_ollama_without_host() {
-        // Ollama has no API key but must still be opt-in via OLLAMA_HOST.
+    fn configured_filter_gates_network_on_url() {
         let secrets = crate::Secrets::default();
-        let polish = configured_polish_backends(&secrets, &PolishBackend::None);
+        let without = configured_llm_backends(&secrets, &LlmBackend::None, false);
         assert!(
-            !polish.iter().any(|b| matches!(b, PolishBackend::Ollama)),
-            "Ollama must be hidden until OLLAMA_HOST is configured"
+            !without.iter().any(|b| matches!(b, LlmBackend::Network)),
+            "network must be hidden until a server URL is configured"
         );
+        assert!(without.iter().any(|b| matches!(b, LlmBackend::Local)));
 
-        let mut with_host = crate::Secrets::default();
-        with_host.insert("OLLAMA_HOST", "http://localhost:11434");
-        let polish = configured_polish_backends(&with_host, &PolishBackend::None);
+        let with = configured_llm_backends(&secrets, &LlmBackend::None, true);
         assert!(
-            polish.iter().any(|b| matches!(b, PolishBackend::Ollama)),
-            "Ollama must appear once OLLAMA_HOST is configured"
+            with.iter().any(|b| matches!(b, LlmBackend::Network)),
+            "network must appear once a server URL is configured"
         );
+    }
+
+    /// The active backend is always listed, even when it would otherwise
+    /// be filtered out, so the tray never misrepresents the live state.
+    #[test]
+    fn configured_filter_always_includes_active() {
+        let secrets = crate::Secrets::default();
+        let llm = configured_llm_backends(&secrets, &LlmBackend::Network, false);
+        assert!(llm.contains(&LlmBackend::Network));
+        let llm = configured_llm_backends(&secrets, &LlmBackend::Anthropic, false);
+        assert!(llm.contains(&LlmBackend::Anthropic));
+    }
+
+    /// A role the user switched OFF stays off. `None` on a disabled
+    /// role is an explicit choice and must never be second-guessed.
+    #[test]
+    fn resolve_respects_a_disabled_role() {
+        let mut secrets = crate::Secrets::default();
+        secrets.insert("GROQ_API_KEY", "gsk-explicit");
+        assert_eq!(
+            resolve_llm_backend(LlmBackend::None, false, &secrets, true),
+            LlmBackend::None,
+            "a disabled role must stay off even with a key and a server available"
+        );
+    }
+
+    /// An explicitly chosen backend always wins over auto-selection.
+    #[test]
+    fn resolve_never_overrides_an_explicit_choice() {
+        let mut secrets = crate::Secrets::default();
+        secrets.insert("GROQ_API_KEY", "gsk-explicit");
+        for b in [LlmBackend::Local, LlmBackend::Network, LlmBackend::Anthropic] {
+            assert_eq!(resolve_llm_backend(b, true, &secrets, true), b);
+        }
+    }
+
+    /// With nothing configured, an enabled role falls back to the
+    /// on-device model — the one answer that always works.
+    #[test]
+    fn resolve_falls_back_to_local() {
+        let secrets = crate::Secrets::default();
+        assert_eq!(resolve_llm_backend(LlmBackend::None, true, &secrets, false), LlmBackend::Local);
+    }
+
+    /// A saved cloud key beats the on-device model: the user has already
+    /// said where they want to run.
+    #[test]
+    fn resolve_prefers_a_saved_cloud_key_over_local() {
+        let mut secrets = crate::Secrets::default();
+        secrets.insert("ANTHROPIC_API_KEY", "sk-ant");
+        assert_eq!(
+            resolve_llm_backend(LlmBackend::None, true, &secrets, false),
+            LlmBackend::Anthropic
+        );
+    }
+
+    /// A self-hosted server beats every cloud key: it is the more
+    /// deliberate act of configuration.
+    #[test]
+    fn resolve_prefers_a_configured_server_over_cloud() {
+        let mut secrets = crate::Secrets::default();
+        secrets.insert("GROQ_API_KEY", "gsk-explicit");
+        assert_eq!(
+            resolve_llm_backend(LlmBackend::None, true, &secrets, true),
+            LlmBackend::Network
+        );
+    }
+
+    /// Ties are broken by `LLM_AUTOSELECT_ORDER`, not by chance.
+    #[test]
+    fn resolve_is_deterministic_across_several_keys() {
+        let mut secrets = crate::Secrets::default();
+        secrets.insert("OPENAI_API_KEY", "sk-openai");
+        secrets.insert("ANTHROPIC_API_KEY", "sk-ant");
+        secrets.insert("GROQ_API_KEY", "gsk-groq");
+        assert_eq!(
+            resolve_llm_backend(LlmBackend::None, true, &secrets, false),
+            LlmBackend::Groq,
+            "must follow LLM_AUTOSELECT_ORDER, which puts Groq first"
+        );
+    }
+
+    /// Auto-selection must only ever land on something buildable —
+    /// never `None` (which would leave an enabled role dead) and never
+    /// `Network` without a URL.
+    #[test]
+    fn resolve_never_yields_an_unusable_backend() {
+        let mut secrets = crate::Secrets::default();
+        for env in all_llm_backends().iter().filter(|b| llm_requires_key(b)) {
+            secrets.insert(llm_key_env(env), "k");
+        }
+        for has_url in [false, true] {
+            for enabled in [false, true] {
+                let got = resolve_llm_backend(LlmBackend::None, enabled, &secrets, has_url);
+                if !enabled {
+                    assert_eq!(got, LlmBackend::None);
+                    continue;
+                }
+                assert_ne!(got, LlmBackend::None, "an enabled role must resolve to something");
+                if got == LlmBackend::Network {
+                    assert!(has_url, "must not pick network without a server URL");
+                }
+            }
+        }
+    }
+
+    /// Every entry in the auto-select order must be a cloud provider
+    /// with a key env — otherwise the `has_in_file` probe is nonsense.
+    #[test]
+    fn autoselect_order_is_all_keyed_cloud() {
+        for b in LLM_AUTOSELECT_ORDER {
+            assert!(b.is_cloud(), "{b:?} is not a cloud provider");
+            assert!(!llm_key_env(&b).is_empty(), "{b:?} has no key env");
+        }
     }
 
     /// Phase F regression: every TTS backend variant must round-trip

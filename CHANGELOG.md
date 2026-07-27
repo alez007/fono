@@ -30,8 +30,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could add a server, watch it list everything it could do, and still have
   nothing happen, because a separate switch had quietly stayed off.
 
+### Changed
+
+- **Choosing where the assistant and cleanup models run is now clear and
+  consistent.** Both now offer the same four choices — off, on this computer,
+  a server on your network, or a cloud provider — using the same words in
+  Settings, in the tray menu, and in the config file. Previously "ollama"
+  could mean either the model running inside Fono or a server elsewhere,
+  depending on hidden details, and the tray could say "local" while the file
+  said something else. Picking a server on your network no longer assumes any
+  particular software: Ollama, llama-server, LM Studio, vLLM and anything else
+  speaking the same common format all work — you just give Fono the address.
+  There is a **Test connection** button that checks the server is reachable
+  and fills in a list of the models it offers, so you can pick one instead of
+  typing its name.
+- **Breaking:** if your config file has `backend = "ollama"` under `[polish]`
+  or `[assistant]`, Fono will not start until you change it. Use `local` if
+  you meant the model that runs inside Fono, or `network` if you meant a
+  server — in which case put its address and model under `[polish.network]`
+  or `[assistant.network]`. The startup error lists the valid choices;
+  Settings and `fono use` will set this for you.
+- **Switching on cleanup or the assistant without saying where it should run
+  now just works.** Turning a role on and leaving the choice blank used to
+  leave it silently doing nothing. Fono now picks the best option you already
+  have — a server on your network if you have given it an address, otherwise
+  a cloud provider whose API key you have already saved, otherwise the model
+  that runs on this computer — and writes the choice down, so what you see in
+  the tray, in Settings and in the config file always agree. Switching a role
+  **off** is still respected exactly as before, and a choice you made yourself
+  is never overridden.
+
 ### Fixed
 
+- **A switched-off cleanup step no longer downloads a several-gigabyte model
+  it will never use.** Fono checked which model cleanup was set to before
+  checking whether cleanup was switched on at all.
 - **The assistant no longer throws away its head start when it recognises who is
   speaking.** Fono prepares the assistant in the background so your first
   question doesn't wait on setup. On turns where voice recognition identified

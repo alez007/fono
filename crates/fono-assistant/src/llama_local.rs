@@ -939,6 +939,7 @@ impl LlamaLocalAssistant {
                             "elapsed_ms": elapsed_ms,
                             "reply_chars": text.chars().count(),
                             "deltas": deltas_emitted,
+                            "reply": prompt_for_trace(&text),
                         }),
                     );
                 }
@@ -2190,6 +2191,7 @@ impl Assistant for LlamaLocalAssistant {
                             "elapsed_ms": elapsed_ms,
                             "reply_chars": text.chars().count(),
                             "deltas": deltas_emitted,
+                            "reply": prompt_for_trace(&text),
                         }),
                     );
                 }
@@ -2283,15 +2285,7 @@ fn sha256_text(text: &str) -> String {
 }
 
 fn prompt_for_trace(prompt: &str) -> Option<&str> {
-    match std::env::var("FONO_ASSISTANT_TRACE_PROMPT") {
-        Ok(v) if env_bool(&v) == Some(false) => return None,
-        Ok(v) if env_bool(&v) == Some(true) => return Some(prompt),
-        _ => {}
-    }
-    match std::env::var("FONO_ASSISTANT_TRACE") {
-        Ok(v) if env_bool(&v) != Some(false) && !v.trim().is_empty() => Some(prompt),
-        _ => None,
-    }
+    fono_core::turn_trace::transcript_enabled().then_some(prompt)
 }
 
 fn env_bool(value: &str) -> Option<bool> {

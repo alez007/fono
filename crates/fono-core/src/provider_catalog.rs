@@ -21,8 +21,8 @@
 //! keep the two in lockstep — the unit tests in this module fail if a
 //! cloud `*Backend` variant ever lacks a catalogue entry.
 
-use crate::config::{PolishBackend, SttBackend};
-use crate::providers::{parse_polish_backend, parse_stt_backend};
+use crate::config::{LlmBackend, SttBackend};
+use crate::providers::{parse_llm_backend, parse_stt_backend};
 use crate::voice_palette::{Gender, PaletteEntry};
 
 /// Defaults for a provider's speech-to-text capability.
@@ -1030,29 +1030,28 @@ pub fn tts_discovery(id: &str) -> Option<VoiceDiscovery> {
     find(id).and_then(|p| p.tts.as_ref()).and_then(|t| t.discovery)
 }
 
-/// Construct a `(stt, polish)` pair from a catalogue entry, mapping the
-/// entry id back through [`parse_stt_backend`] /
-/// [`parse_polish_backend`]. Returns `None` if the entry lacks either
-/// capability or the id doesn't round-trip through the parsers.
+/// Construct a `(stt, llm)` pair from a catalogue entry, mapping the
+/// entry id back through [`parse_stt_backend`] / [`parse_llm_backend`].
+/// Returns `None` if the entry lacks either capability or the id
+/// doesn't round-trip through the parsers.
 #[must_use]
-pub fn cloud_pair_from_catalog(id: &str) -> Option<(SttBackend, PolishBackend)> {
+pub fn cloud_pair_from_catalog(id: &str) -> Option<(SttBackend, LlmBackend)> {
     let entry = find(id)?;
     if entry.stt.is_none() || entry.polish.is_none() {
         return None;
     }
     let stt_backend = parse_stt_backend(entry.id)?;
-    let polish_backend = parse_polish_backend(entry.id)?;
-    Some((stt_backend, polish_backend))
+    let llm_backend = parse_llm_backend(entry.id)?;
+    Some((stt_backend, llm_backend))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AssistantBackend, TtsBackend};
+    use crate::config::TtsBackend;
     use crate::providers::{
-        assistant_backend_str, assistant_key_env, parse_assistant_backend, parse_tts_backend,
-        polish_backend_str, polish_key_env, stt_backend_str, stt_key_env, tts_backend_str,
-        tts_key_env,
+        llm_backend_str, llm_key_env, parse_tts_backend, stt_backend_str, stt_key_env,
+        tts_backend_str, tts_key_env,
     };
 
     /// Test 1 — key_env on every entry matches the canonical
@@ -1072,19 +1071,14 @@ mod tests {
                     }
                 }
             }
-            if p.polish.is_some() {
-                if let Some(b) = parse_polish_backend(p.id) {
-                    let expected = polish_key_env(&b);
+            // Cleanup and the assistant share `LlmBackend` and therefore
+            // share one key per provider — that is the whole point of the
+            // shared env-var names, so one check covers both roles.
+            if p.polish.is_some() || p.assistant.is_some() {
+                if let Some(b) = parse_llm_backend(p.id) {
+                    let expected = llm_key_env(&b);
                     if !expected.is_empty() {
                         assert_eq!(p.key_env, expected, "LLM key_env mismatch for {}", p.id);
-                    }
-                }
-            }
-            if p.assistant.is_some() {
-                if let Some(b) = parse_assistant_backend(p.id) {
-                    let expected = assistant_key_env(&b);
-                    if !expected.is_empty() {
-                        assert_eq!(p.key_env, expected, "Assistant key_env mismatch for {}", p.id);
                     }
                 }
             }
@@ -1115,17 +1109,10 @@ mod tests {
                     p.id
                 );
             }
-            if p.polish.is_some() {
+            if p.polish.is_some() || p.assistant.is_some() {
                 assert!(
-                    parse_polish_backend(p.id).is_some(),
-                    "{} claims LLM but parse_polish_backend rejects its id",
-                    p.id
-                );
-            }
-            if p.assistant.is_some() {
-                assert!(
-                    parse_assistant_backend(p.id).is_some(),
-                    "{} claims Assistant but parse_assistant_backend rejects its id",
+                    parse_llm_backend(p.id).is_some(),
+                    "{} claims a language-model capability but parse_llm_backend rejects its id",
                     p.id
                 );
             }
@@ -1149,11 +1136,8 @@ mod tests {
             if let Some(b) = parse_stt_backend(p.id) {
                 assert_eq!(stt_backend_str(&b), p.id);
             }
-            if let Some(b) = parse_polish_backend(p.id) {
-                assert_eq!(polish_backend_str(&b), p.id);
-            }
-            if let Some(b) = parse_assistant_backend(p.id) {
-                assert_eq!(assistant_backend_str(&b), p.id);
+            if let Some(b) = parse_llm_backend(p.id) {
+                assert_eq!(llm_backend_str(&b), p.id);
             }
             if let Some(b) = parse_tts_backend(p.id) {
                 assert_eq!(tts_backend_str(&b), p.id);
@@ -1162,10 +1146,10 @@ mod tests {
     }
 
     /// Test 4 — no orphan cloud backend variants. Every variant of
-    /// `SttBackend` / `PolishBackend` / `AssistantBackend` / `TtsBackend`
-    /// that represents a *cloud* provider must appear in at least one
-    /// catalogue entry. "Cloud" excludes local, none, ollama, wyoming,
-    /// piper, and the model-host-agnostic Whisper local backend.
+    /// `SttBackend` / `LlmBackend` / `TtsBackend` that represents a
+    /// *cloud* provider must appear in at least one catalogue entry.
+    /// "Cloud" excludes local, none, network, wyoming, piper, and the
+    /// model-host-agnostic Whisper local backend.
     #[test]
     fn no_orphan_cloud_variants() {
         for b in crate::providers::all_stt_backends() {
@@ -1178,24 +1162,21 @@ mod tests {
                 "SttBackend::{b:?} ({id}) is not present in CLOUD_PROVIDERS",
             );
         }
-        for b in crate::providers::all_polish_backends() {
-            if matches!(b, PolishBackend::Local | PolishBackend::None | PolishBackend::Ollama) {
+        // One loop for both language-model roles: they share `LlmBackend`,
+        // and `is_cloud()` already excludes the three non-cloud shapes
+        // (off, embedded local, self-hosted network server).
+        for b in crate::providers::all_llm_backends() {
+            if !b.is_cloud() {
                 continue;
             }
-            let id = polish_backend_str(&b);
+            let id = llm_backend_str(&b);
             assert!(
                 CLOUD_PROVIDERS.iter().any(|p| p.id == id && p.polish.is_some()),
-                "PolishBackend::{b:?} ({id}) is not present in CLOUD_PROVIDERS",
+                "LlmBackend::{b:?} ({id}) is not present in CLOUD_PROVIDERS for cleanup",
             );
-        }
-        for b in crate::providers::all_assistant_backends() {
-            if matches!(b, AssistantBackend::None | AssistantBackend::Ollama) {
-                continue;
-            }
-            let id = assistant_backend_str(&b);
             assert!(
                 CLOUD_PROVIDERS.iter().any(|p| p.id == id && p.assistant.is_some()),
-                "AssistantBackend::{b:?} ({id}) is not present in CLOUD_PROVIDERS",
+                "LlmBackend::{b:?} ({id}) is not present in CLOUD_PROVIDERS for the assistant",
             );
         }
         for b in crate::providers::all_tts_backends() {

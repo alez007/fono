@@ -205,6 +205,18 @@ pub type DiscoverToolsFn = Arc<
         + Sync,
 >;
 
+/// Probe a self-hosted OpenAI-compatible LLM server (`POST
+/// /api/llm/probe`). The body carries `{url, api_key_ref?}`; the daemon
+/// asks that server for its model list and returns `{ok, count, models:
+/// [id, …]}`. Nothing is stored, so an address can be tested before it is
+/// saved. This runs daemon-side on purpose: the server is typically on the
+/// LAN, where the browser cannot reach it (or is blocked by CORS).
+pub type ProbeLlmFn = Arc<
+    dyn Fn(serde_json::Value) -> BoxFuture<'static, std::result::Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
+
 /// Hook closures supplied by the daemon layer. The server itself is a thin
 /// wire adapter with no config semantics.
 #[derive(Clone)]
@@ -243,6 +255,9 @@ pub struct WebSettingsHooks {
     pub list_tools: ListToolsFn,
     pub set_tool_enabled: SetToolEnabledFn,
     pub discover_tools: DiscoverToolsFn,
+    /// Test a self-hosted OpenAI-compatible LLM endpoint and list its
+    /// models (`POST /api/llm/probe`).
+    pub probe_llm: ProbeLlmFn,
 }
 
 /// Configuration for [`WebSettingsServer::start`]. Built from
@@ -489,6 +504,7 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
         (m, p) if p == "/api/tools" || p == "/api/tools/discover" => {
             route_tools(m, p, req, &ctx).await
         }
+        (&Method::POST, "/api/llm/probe") => route_llm_probe(req, &ctx).await,
         (&Method::POST, "/v1/audio/speech") => {
             let Some(body) = read_json_body(req).await else {
                 return openai_error(StatusCode::BAD_REQUEST, "invalid or oversized JSON body");
@@ -583,6 +599,20 @@ async fn route_api_keys(
             }
         }
         _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+/// `POST /api/llm/probe` — "Test connection" for a self-hosted LLM
+/// server. The daemon does the fetching because the endpoint is usually
+/// a LAN address the browser cannot reach. A failure here means the
+/// user's server did not answer, hence `502` rather than a 4xx.
+async fn route_llm_probe(req: Request<Incoming>, ctx: &ServerCtx) -> Response<ResBody> {
+    let Some(body) = read_json_body(req).await else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid or oversized JSON body");
+    };
+    match (ctx.hooks.probe_llm)(body).await {
+        Ok(v) => json_ok(&v),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, &e),
     }
 }
 
@@ -855,6 +885,33 @@ mod tests {
         assert!(FAVICON_SVG.contains("<svg"));
     }
 
+    /// The settings page auto-picks a backend when a language-model role
+    /// is switched on with none chosen, and must reach the same verdict
+    /// the daemon would. That means duplicating `LLM_AUTOSELECT_ORDER`
+    /// in JavaScript — so assert the two copies still agree, in order.
+    /// If they drift, the page proposes one provider and the daemon
+    /// silently runs another.
+    #[test]
+    fn js_autoselect_order_matches_the_rust_one() {
+        let line = APP_JS
+            .lines()
+            .find(|l| l.starts_with("const LLM_AUTOSELECT_ORDER"))
+            .expect("app.js must declare LLM_AUTOSELECT_ORDER on one line");
+        let js: Vec<&str> = line
+            .split_once('[')
+            .and_then(|(_, r)| r.split_once(']'))
+            .expect("malformed array literal")
+            .0
+            .split(',')
+            .map(|s| s.trim().trim_matches('\''))
+            .collect();
+        let rust: Vec<&str> = fono_core::providers::llm_autoselect_order()
+            .iter()
+            .map(fono_core::providers::llm_backend_str)
+            .collect();
+        assert_eq!(js, rust, "app.js auto-select order has drifted from fono-core");
+    }
+
     /// Every rendered `<button>` must carry at least one `data-` attribute
     /// that the delegated click listener actually selects on.
     ///
@@ -928,10 +985,13 @@ mod tests {
             // privacy-breaking Wyoming wake CLIENT mode stays a deliberate
             // hand edit (see WakeWyoming::CLIENT_PRIVACY_WARNING)
             "wakeword.wyoming",
-            // local model plumbing (model ids / quant / ctx picked by the
-            // wizard + hardware probe, not casually editable)
-            "polish.local",
-            "assistant.local",
+            // local model plumbing. The model *id* is now a dropdown in
+            // the Cleanup / Assistant "Local" panel, so it is bound; these
+            // two are picked by the wizard + hardware probe instead.
+            "polish.local.quantization",
+            "polish.local.context",
+            "assistant.local.quantization",
+            "assistant.local.context",
             // voice mirror override for forks / self-hosting
             "tts.local.base_url",
             // discovered-palette switch; palette tooling is CLI-driven
@@ -977,17 +1037,21 @@ mod tests {
         cfg.tts.local.base_url = "u".into();
         cfg.tts.voice = "v".into();
         cfg.tts.output_device = "d".into();
-        cfg.polish.cloud = Some(fono_core::config::PolishCloud {
-            provider: "openai".into(),
-            api_key_ref: "OPENAI_API_KEY".into(),
+        cfg.polish.cloud =
+            fono_core::config::LlmCloud { api_key_ref: "OPENAI_API_KEY".into(), model: "m".into() };
+        cfg.polish.network = fono_core::config::LlmNetwork {
+            url: "http://localhost:11434/v1/chat/completions".into(),
             model: "m".into(),
-        });
+            api_key_ref: "T".into(),
+        };
         cfg.polish.prompt.dictionary.push("Fono".into());
-        cfg.assistant.cloud = Some(fono_core::config::AssistantCloud {
-            provider: "openai".into(),
-            api_key_ref: "OPENAI_API_KEY".into(),
+        cfg.assistant.cloud =
+            fono_core::config::LlmCloud { api_key_ref: "OPENAI_API_KEY".into(), model: "m".into() };
+        cfg.assistant.network = fono_core::config::LlmNetwork {
+            url: "http://localhost:11434/v1/chat/completions".into(),
             model: "m".into(),
-        });
+            api_key_ref: "T".into(),
+        };
         cfg.context_rules.push(fono_core::config::ContextRule {
             match_: fono_core::config::ContextMatch::default(),
             prompt_suffix: "s".into(),

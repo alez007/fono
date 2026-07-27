@@ -33,8 +33,8 @@ use anyhow::{Context, Result};
 use dialoguer::console::{Key, Term};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 use fono_core::config::{
-    AssistantBackend, AssistantCloud, Config, PolishBackend, PolishCloud, PolishLocal, Stt,
-    SttBackend, SttCloud, SttLocal, TtsBackend, TtsCloud, TtsWyoming, DEFAULT_POLISH_LOCAL_MODEL,
+    Config, LlmBackend, LlmCloud, PolishLocal, Stt, SttBackend, SttCloud, SttLocal, TtsBackend,
+    TtsCloud, TtsWyoming, DEFAULT_POLISH_LOCAL_MODEL,
 };
 use fono_core::hwcheck::{HardwareSnapshot, HostGpu, LocalTier};
 use fono_core::locale::detect_user_languages_ranked;
@@ -42,8 +42,7 @@ use fono_core::provider_catalog::{
     CloudProvider, KeyValidation, WebSearchSupport, CLOUD_PROVIDERS,
 };
 use fono_core::providers::{
-    configured_tts_backends, parse_assistant_backend, parse_polish_backend, parse_stt_backend,
-    parse_tts_backend,
+    configured_tts_backends, parse_llm_backend, parse_stt_backend, parse_tts_backend,
 };
 use fono_core::{Paths, Secrets};
 use fono_stt::registry::{ModelInfo, WHISPER_MODELS};
@@ -195,7 +194,7 @@ fn is_stt_wired(entry: &CloudProvider) -> bool {
 /// `fono-polish::factory`. The Gemini polish client is wired via the
 /// OpenAI-compatible endpoint (ADR 0034), so Gemini qualifies.
 fn is_polish_wired(entry: &CloudProvider) -> bool {
-    entry.polish.is_some() && parse_polish_backend(entry.id).is_some()
+    entry.polish.is_some() && parse_llm_backend(entry.id).is_some()
 }
 
 /// Whether the catalogue entry's TTS capability is actually wired in
@@ -226,7 +225,7 @@ fn is_primary_candidate(entry: &CloudProvider) -> bool {
 /// The catalogue advertises an assistant for several providers; only
 /// those with a wired factory should appear in the assistant picker.
 fn is_assistant_wired(entry: &CloudProvider) -> bool {
-    entry.assistant.is_some() && parse_assistant_backend(entry.id).is_some()
+    entry.assistant.is_some() && parse_llm_backend(entry.id).is_some()
 }
 
 /// Header labels for the primary-cloud-provider picker's capability
@@ -310,7 +309,7 @@ fn default_primary_for_seed(
     secrets: &Secrets,
 ) -> usize {
     // 1. Match existing polish backend.
-    let polish_id = fono_core::providers::polish_backend_str(&cfg.polish.backend);
+    let polish_id = fono_core::providers::llm_backend_str(&cfg.polish.backend);
     if let Some(i) = candidates.iter().position(|p| p.id == polish_id) {
         return i;
     }
@@ -414,22 +413,19 @@ pub fn apply_primary_provider(config: &mut Config, entry: &CloudProvider) {
     }
     if is_polish_wired(entry) {
         let polish_def = entry.polish.expect("is_polish_wired implies polish.is_some()");
-        let backend = parse_polish_backend(entry.id).expect("is_polish_wired implies parseable id");
+        let backend = parse_llm_backend(entry.id).expect("is_polish_wired implies parseable id");
         config.polish.enabled = true;
         config.polish.backend = backend;
-        config.polish.cloud = Some(PolishCloud {
-            provider: entry.id.into(),
-            api_key_ref: entry.key_env.into(),
-            model: polish_def.model.into(),
-        });
+        config.polish.cloud =
+            LlmCloud { api_key_ref: entry.key_env.into(), model: polish_def.model.into() };
     } else {
         // Lean on local: embedded GGUF cleanup (mirrors
         // `configure_local_llm`); leave the cloud block empty so
         // `build_polish` loads the local model.
         config.polish.enabled = true;
-        config.polish.backend = PolishBackend::Local;
+        config.polish.backend = LlmBackend::Local;
         config.polish.local = PolishLocal::default();
-        config.polish.cloud = None;
+        config.polish.cloud = LlmCloud::default();
     }
     if is_tts_wired(entry) {
         let tts_def = entry.tts.expect("is_tts_wired implies tts.is_some()");
@@ -450,14 +446,11 @@ pub fn apply_primary_provider(config: &mut Config, entry: &CloudProvider) {
     }
     if let Some(adef) = entry.assistant {
         if is_assistant_wired(entry) {
-            if let Some(backend) = parse_assistant_backend(entry.id) {
+            if let Some(backend) = parse_llm_backend(entry.id) {
                 config.assistant.enabled = true;
                 config.assistant.backend = backend;
-                config.assistant.cloud = Some(AssistantCloud {
-                    provider: entry.id.into(),
-                    api_key_ref: entry.key_env.into(),
-                    model: adef.text_model.into(),
-                });
+                config.assistant.cloud =
+                    LlmCloud { api_key_ref: entry.key_env.into(), model: adef.text_model.into() };
             }
         }
     }
@@ -532,8 +525,8 @@ fn catalogue_by_key_env(key_env: &str) -> Option<&'static CloudProvider> {
 
 /// Catalogue entry matching the configured polish backend (used by the
 /// assistant fast-path to determine whether the primary covers chat).
-fn catalogue_for_llm_backend(b: &PolishBackend) -> Option<&'static CloudProvider> {
-    let id = fono_core::providers::polish_backend_str(b);
+fn catalogue_for_llm_backend(b: LlmBackend) -> Option<&'static CloudProvider> {
+    let id = fono_core::providers::llm_backend_str(&b);
     fono_core::provider_catalog::find(id)
 }
 
@@ -756,11 +749,7 @@ fn assistant_extras_summary(
 /// realtime profile model (the opt-in id the factory keys on). Returns
 /// `true` when realtime was selected, so the caller skips the staged TTS
 /// picker — the Live session produces its own continuous-voice audio.
-fn offer_realtime(
-    theme: &ColorfulTheme,
-    entry: &CloudProvider,
-    cloud: &mut AssistantCloud,
-) -> bool {
+fn offer_realtime(theme: &ColorfulTheme, entry: &CloudProvider, cloud: &mut LlmCloud) -> bool {
     let Some(profile) = entry.assistant.and_then(|a| a.realtime) else {
         return false;
     };
@@ -794,7 +783,7 @@ async fn configure_assistant(
         "  Independent of dictation cleanup — Gemma E2B runs locally when you choose local chat."
     );
 
-    if config.assistant.enabled && config.assistant.backend == AssistantBackend::Ollama {
+    if config.assistant.enabled && config.assistant.backend == LlmBackend::Local {
         println!("  Voice assistant enabled — local Gemma E2B chat + local voice.");
         return Ok(());
     }
@@ -809,29 +798,22 @@ async fn configure_assistant(
     //                            to `pick_tts_for_assistant` so the user
     //                            still gets `Skip — text-only assistant`
     //                            as an explicit escape hatch.
-    let primary = catalogue_for_llm_backend(&config.polish.backend);
+    let primary = catalogue_for_llm_backend(config.polish.backend);
     let tts_already_set = !matches!(config.tts.backend, TtsBackend::None);
     if let Some(entry) = primary {
         if let Some(adef) = entry.assistant {
             if is_assistant_wired(entry) {
-                let backend = parse_assistant_backend(entry.id)
-                    .context("catalogue assistant id should parse")?;
+                let backend =
+                    parse_llm_backend(entry.id).context("catalogue assistant id should parse")?;
                 config.assistant.enabled = true;
                 config.assistant.backend = backend;
-                config.assistant.cloud = Some(AssistantCloud {
-                    provider: entry.id.into(),
-                    api_key_ref: entry.key_env.into(),
-                    model: adef.text_model.into(),
-                });
+                config.assistant.cloud =
+                    LlmCloud { api_key_ref: entry.key_env.into(), model: adef.text_model.into() };
                 // Offer realtime speech-to-speech when the provider
                 // advertises a Gemini Live profile. On accept it repoints
                 // the cloud model at the realtime id and produces its own
                 // continuous-voice audio, so the staged TTS picker is moot.
-                let realtime = config
-                    .assistant
-                    .cloud
-                    .as_mut()
-                    .is_some_and(|c| offer_realtime(theme, entry, c));
+                let realtime = offer_realtime(theme, entry, &mut config.assistant.cloud);
                 if realtime {
                     println!(
                         "  Voice assistant enabled — {} realtime speech-to-speech.",
@@ -887,7 +869,7 @@ async fn configure_assistant(
         .unwrap_or(true);
     if !want {
         config.assistant.enabled = false;
-        config.assistant.backend = AssistantBackend::None;
+        config.assistant.backend = LlmBackend::None;
         // Do NOT clobber `tts.backend` — a returning user may have an
         // existing TTS backend they still want for future opt-in.
         return Ok(());
@@ -1085,7 +1067,7 @@ async fn configure_local(
     match llm_choice {
         // Order matches `build_polish_options`: 0=Skip, 1=Cloud, 2=Local.
         0 => {
-            config.polish.backend = PolishBackend::None;
+            config.polish.backend = LlmBackend::None;
             config.polish.enabled = false;
             config.polish.local = PolishLocal::default();
         }
@@ -1122,9 +1104,9 @@ async fn prompt_optional_cloud_key(theme: &ColorfulTheme, secrets: &mut Secrets)
 /// when no TTS backend has been chosen yet.
 pub fn enable_local_assistant_with_voice(config: &mut Config) {
     config.assistant.enabled = true;
-    config.assistant.backend = AssistantBackend::Ollama;
+    config.assistant.backend = LlmBackend::Local;
     config.assistant.local.model = DEFAULT_POLISH_LOCAL_MODEL.into();
-    config.assistant.cloud = None;
+    config.assistant.cloud = LlmCloud::default();
     if config.tts.backend == TtsBackend::None {
         config.tts.backend = TtsBackend::Local;
         config.tts.cloud = None;
@@ -1134,7 +1116,7 @@ pub fn enable_local_assistant_with_voice(config: &mut Config) {
 
 fn spawn_model_downloads(paths: &Paths, config: &Config) -> Option<JoinHandle<()>> {
     let needs_download = config.stt.backend == SttBackend::Local
-        || config.polish.backend == PolishBackend::Local
+        || config.polish.backend == LlmBackend::Local
         || local_assistant_selected(config)
         || matches!(config.tts.backend, TtsBackend::Local);
     if !needs_download {
@@ -1271,14 +1253,11 @@ async fn configure_cloud(
 
     if is_polish_wired(entry) {
         let polish_def = entry.polish.expect("is_polish_wired implies polish.is_some()");
-        let backend = parse_polish_backend(entry.id).context("catalogue LLM id should parse")?;
+        let backend = parse_llm_backend(entry.id).context("catalogue LLM id should parse")?;
         config.polish.enabled = true;
         config.polish.backend = backend;
-        config.polish.cloud = Some(PolishCloud {
-            provider: entry.id.into(),
-            api_key_ref: entry.key_env.into(),
-            model: polish_def.model.into(),
-        });
+        config.polish.cloud =
+            LlmCloud { api_key_ref: entry.key_env.into(), model: polish_def.model.into() };
     } else {
         // Lean on local: embedded GGUF cleanup.
         configure_local_llm(config, snap);
@@ -1364,7 +1343,7 @@ async fn configure_customize(
         .interact()?;
     match llm_idx {
         0 => {
-            config.polish.backend = PolishBackend::None;
+            config.polish.backend = LlmBackend::None;
             config.polish.enabled = false;
         }
         1 => configure_cloud_llm(theme, config, secrets).await?,
@@ -1776,23 +1755,23 @@ pub fn recommend_local_stt_model_headless(snap: &HardwareSnapshot) -> &'static s
 // ─── LLM configuration helpers ─────────────────────────────────────────────
 
 /// Hardware-aware local LLM selector. Sets `config.polish` to
-/// `PolishBackend::Local` and picks one of the two supported local cleanup
+/// `LlmBackend::Local` and picks one of the two supported local cleanup
 /// models without opening a second model menu. The model file is downloaded
 /// later by `ensure_models` once the wizard finishes.
 fn configure_local_llm(config: &mut Config, snap: &HardwareSnapshot) {
-    config.polish.backend = PolishBackend::Local;
+    config.polish.backend = LlmBackend::Local;
     config.polish.enabled = true;
     config.polish.local =
         PolishLocal { model: default_local_polish_model(snap).into(), ..PolishLocal::default() };
-    // `local` means the embedded llama.cpp engine, not an Ollama server.
-    // Leave the cloud block empty so `build_polish` loads the local GGUF
-    // (mirrors `enable_local_assistant_with_voice`). An Ollama / OpenAI-
-    // compatible server is opt-in via `backend = "ollama"`.
-    config.polish.cloud = None;
+    // `local` means the embedded llama.cpp engine. Leave the cloud
+    // block empty so `build_polish` loads the local GGUF (mirrors
+    // `enable_local_assistant_with_voice`). A self-hosted
+    // OpenAI-compatible server is opt-in via `backend = "network"`.
+    config.polish.cloud = LlmCloud::default();
 }
 
 fn local_assistant_selected(config: &Config) -> bool {
-    config.assistant.enabled && config.assistant.backend == AssistantBackend::Ollama
+    config.assistant.enabled && config.assistant.backend == LlmBackend::Local
 }
 
 async fn configure_cloud_stt(
@@ -1875,21 +1854,19 @@ async fn configure_cloud_llm(
         .interact()?;
 
     if llm_idx == skip_idx {
-        config.polish.backend = PolishBackend::None;
+        config.polish.backend = LlmBackend::None;
         config.polish.enabled = false;
         return Ok(());
     }
     let entry = providers[llm_idx];
     prompt_or_reuse_key(theme, secrets, entry.key_env, entry.display_name, entry.console_url)
         .await?;
-    config.polish.backend =
-        parse_polish_backend(entry.id).context("catalogue LLM id should parse")?;
+    config.polish.backend = parse_llm_backend(entry.id).context("catalogue LLM id should parse")?;
     config.polish.enabled = true;
-    config.polish.cloud = Some(PolishCloud {
-        provider: entry.id.into(),
+    config.polish.cloud = LlmCloud {
         api_key_ref: entry.key_env.into(),
         model: entry.polish.expect("is_polish_wired implies polish.is_some()").model.into(),
-    });
+    };
     Ok(())
 }
 
@@ -2347,16 +2324,17 @@ mod tests {
     // ── build_local_stt_shortlist ────────────────────────────────────────
 
     // The local-polish wizard choice must produce an embedded-local
-    // config (no Ollama cloud block), so `build_polish` loads the local
-    // GGUF instead of POSTing to a server. Regression guard for the
-    // "local cleanup silently routed to Ollama" bug.
+    // config (no cloud block), so `build_polish` loads the local GGUF
+    // instead of POSTing to a server. Regression guard for the "local
+    // cleanup silently routed to a server" bug.
     #[test]
     fn configure_local_llm_leaves_polish_cloud_empty() {
         let mut config = Config::default();
         configure_local_llm(&mut config, &snap(12, 32, 200, true));
-        assert_eq!(config.polish.backend, PolishBackend::Local);
+        assert_eq!(config.polish.backend, LlmBackend::Local);
         assert!(config.polish.enabled);
-        assert!(config.polish.cloud.is_none(), "local polish must not write an Ollama cloud block");
+        assert!(config.polish.cloud.is_empty(), "local polish must not write a cloud block");
+        assert!(config.polish.network.is_empty(), "local polish must not write a network block");
     }
 
     #[test]
@@ -2518,7 +2496,7 @@ mod tests {
         // A config with `[polish].backend = "cerebras"` must default the
         // primary picker to Cerebras, not OpenAI.
         let mut cfg = Config::default();
-        cfg.polish.backend = PolishBackend::Cerebras;
+        cfg.polish.backend = LlmBackend::Cerebras;
         let secrets = Secrets::default();
         let candidates = primary_candidates_vec();
         let idx = default_primary_for_seed(&candidates, &cfg, &secrets);
@@ -2531,7 +2509,7 @@ mod tests {
         // should fall through to STT backend "groq".
         let mut cfg = Config::default();
         cfg.stt.backend = SttBackend::Groq;
-        cfg.polish.backend = PolishBackend::Local;
+        cfg.polish.backend = LlmBackend::Local;
         let secrets = Secrets::default();
         let candidates = primary_candidates_vec();
         let idx = default_primary_for_seed(&candidates, &cfg, &secrets);
@@ -2560,7 +2538,7 @@ mod tests {
         // (seed + tts_short_label) without flipping the TTS backend.
         let mut cfg = Config::default();
         cfg.stt.backend = SttBackend::Groq;
-        cfg.polish.backend = PolishBackend::Cerebras;
+        cfg.polish.backend = LlmBackend::Cerebras;
         cfg.tts.backend = TtsBackend::Wyoming;
         cfg.tts.wyoming =
             Some(TtsWyoming { uri: "tcp://piper.lan:10200".into(), ..TtsWyoming::default() });

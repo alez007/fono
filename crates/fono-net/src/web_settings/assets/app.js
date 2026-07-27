@@ -87,13 +87,12 @@ const POLISH_PROVIDERS = [
   ['local', 'Local model', 'on-device'], ['openai', 'OpenAI', 'gpt-5.4-nano'],
   ['anthropic', 'Anthropic', 'claude-haiku-4-5'], ['gemini', 'Gemini', 'gemini-flash-lite-latest'],
   ['groq', 'Groq', 'gpt-oss-120b'], ['cerebras', 'Cerebras', 'gpt-oss-120b'],
-  ['openrouter', 'OpenRouter', 'gpt-5.4-nano'], ['ollama', 'Ollama', 'localhost'],
+  ['openrouter', 'OpenRouter', 'gpt-5.4-nano'],
 ];
 const ASSISTANT_PROVIDERS = [
   ['openai', 'OpenAI', 'gpt-5.4-mini'], ['anthropic', 'Anthropic', 'claude-haiku-4-5'],
   ['gemini', 'Gemini', 'gemini-flash-lite-latest'], ['groq', 'Groq', 'gpt-oss-120b'],
   ['cerebras', 'Cerebras', 'zai-glm-4.7'], ['openrouter', 'OpenRouter', 'claude-haiku-4.5'],
-  ['ollama', 'Ollama', 'localhost'],
 ];
 const TTS_PROVIDERS = [
   ['openai', 'OpenAI', 'tts-1'], ['elevenlabs', 'ElevenLabs', 'eleven_v3'],
@@ -101,15 +100,20 @@ const TTS_PROVIDERS = [
   ['groq', 'Groq', 'orpheus-v1-english'], ['gemini', 'Gemini', 'flash-tts-preview'],
   ['speechmatics', 'Speechmatics', 'preview'], ['openrouter', 'OpenRouter', 'grok-voice-tts-1.0'],
 ];
-// Cloud-only provider grids for Cleanup and the Assistant. The
-// embedded local model and the Ollama / OpenAI-compatible network
-// server are their own segments (Local / Network), so they are
-// filtered out of the "Cloud" provider cards here.
-const POLISH_CLOUD_PROVIDERS = POLISH_PROVIDERS.filter((p) => p[0] !== 'local' && p[0] !== 'ollama');
-const ASSISTANT_CLOUD_PROVIDERS = ASSISTANT_PROVIDERS.filter((p) => p[0] !== 'ollama');
+// Cloud-only provider grids for Cleanup and the Assistant. `local`
+// (embedded model) and `network` (self-hosted OpenAI-compatible server)
+// are their own segments, so they never appear as "Cloud" cards.
+const POLISH_CLOUD_PROVIDERS = POLISH_PROVIDERS.filter((p) => p[0] !== 'local');
+const ASSISTANT_CLOUD_PROVIDERS = ASSISTANT_PROVIDERS.slice();
 // Default endpoint offered when switching Cleanup / Assistant to the
-// Network (self-hosted server) segment.
+// Network segment. Ollama's port, because it is the most common local
+// server — but any OpenAI-compatible endpoint works.
 const LOCAL_SERVER_URL = 'http://localhost:11434/v1/chat/completions';
+// Shared copy for the Network segment. Deliberately engine-neutral:
+// the backend speaks plain OpenAI chat-completions, so anything that
+// serves that shape is supported.
+const NETWORK_HINT = 'Connects to any OpenAI-compatible server on your network \u2014 Ollama, llama.cpp, LM Studio, vLLM, LocalAI, LiteLLM.';
+const NETWORK_URL_HINT = 'Paste what your server prints at startup \u2014 e.g. http://localhost:11434. The /v1/chat/completions path is added for you.';
 const OVERLAY_STYLES = [
   ['bars', 'Bars', 'p-bars', ''], ['oscilloscope', 'Oscilloscope', 'p-osc', ''],
   ['fft', 'FFT', 'p-fft', ''], ['heatmap', 'Heatmap', 'p-heat', ''],
@@ -262,6 +266,27 @@ function ensureCloud(base, provider) {
   set(cfg, base + '.api_key_ref', ENV[provider] || '');
   if (get(cfg, base + '.model') === undefined) set(cfg, base + '.model', '');
 }
+// `[<role>.cloud]` for the two LLM roles. Unlike STT/TTS there is no
+// `provider` field: `<role>.backend` names the provider, so the sub-table
+// only carries the model id and the secret name.
+function ensureLlmCloud(base, provider) {
+  if (!get(cfg, base) || typeof get(cfg, base) !== 'object') set(cfg, base, { api_key_ref: '', model: '' });
+  // A model name is provider-specific: drop it when the provider changes.
+  if (gv(base + '.api_key_ref', '') !== (ENV[provider] || '')) set(cfg, base + '.model', '');
+  set(cfg, base + '.api_key_ref', ENV[provider] || '');
+  if (get(cfg, base + '.model') === undefined) set(cfg, base + '.model', '');
+}
+// `[<role>.network]` — a self-hosted OpenAI-compatible server. Seeds a
+// sensible default URL the first time the segment is entered, and never
+// clobbers a URL the user already typed.
+function ensureNetwork(base) {
+  if (!get(cfg, base) || typeof get(cfg, base) !== 'object') {
+    set(cfg, base, { url: '', model: '', api_key_ref: '' });
+  }
+  if (!gv(base + '.url', '')) set(cfg, base + '.url', LOCAL_SERVER_URL);
+  if (get(cfg, base + '.model') === undefined) set(cfg, base + '.model', '');
+  if (get(cfg, base + '.api_key_ref') === undefined) set(cfg, base + '.api_key_ref', '');
+}
 
 // ---------- derived segment state ----------
 function sttSeg() {
@@ -276,33 +301,116 @@ function astopSeg() {
   const ms = gv('audio.auto_stop_silence_ms', 3000);
   return ms === 0 ? 'off' : ms === 3000 ? '3000' : ms === 5000 ? '5000' : 'custom';
 }
-// Cleanup backend → segment. `local` = embedded model, `ollama` =
-// self-hosted server (Network), anything else = a cloud provider.
-function polishSeg() {
-  const b = gv('polish.backend', 'local');
-  return b === 'local' ? 'local' : b === 'ollama' ? 'network' : 'cloud';
+// Cleanup / Assistant backend → segment. `backend` is now the single
+// source of truth: `local` = embedded GGUF, `network` = self-hosted
+// OpenAI-compatible server, anything else = a cloud provider.
+function llmSeg(base, dflt) {
+  const b = gv(base + '.backend', dflt);
+  return b === 'local' || b === 'network' ? b : 'cloud';
 }
-// Assistant backend → segment. The embedded model and a self-hosted
-// server share the `ollama` backend; they are told apart by the
-// `[assistant.cloud].provider` marker (`ollama-server` /
-// `openai-compatible-local` = Network, otherwise embedded Local).
-function assistantIsNetwork() {
-  const p = gv('assistant.cloud.provider', '');
-  return p === 'ollama-server' || p === 'openai-compatible-local';
+function polishSeg() { return llmSeg('polish', 'local'); }
+function assistantSeg() { return llmSeg('assistant', 'none'); }
+// Where a role should run when it is switched on without a backend
+// chosen. Mirrors `resolve_llm_backend` in fono-core/src/providers.rs
+// — a configured server first, then a saved cloud key in the same
+// preference order, then the on-device model, which always works.
+// Keep the order below in step with `LLM_AUTOSELECT_ORDER` there.
+const LLM_AUTOSELECT_ORDER = ['groq', 'cerebras', 'openai', 'anthropic', 'gemini', 'openrouter'];
+function autoBackend(base) {
+  if (gv(base + '.network.url', '').trim()) return 'network';
+  const saved = LLM_AUTOSELECT_ORDER.find((p) => meta && meta.secrets && meta.secrets[ENV[p]]);
+  return saved || 'local';
 }
-function assistantSeg() {
-  const b = gv('assistant.backend', 'none');
-  if (b === 'ollama') return assistantIsNetwork() ? 'network' : 'local';
-  return 'cloud';
+// One-line description of a role's network target for section summaries.
+function netSummary(base) {
+  const url = gv(base + '.network.url', '');
+  if (!url) return 'Network \u00b7 no server';
+  // Show host[:port] only — the full URL is too long for a summary line.
+  let host = url.replace(/^[a-z]+:\/\//i, '').split('/')[0];
+  const model = gv(base + '.network.model', '');
+  return 'Network \u00b7 ' + host + (model ? ' \u00b7 ' + model : '');
 }
+// Config paths for the two LLM roles. Written out in full rather than
+// assembled from `base + '.network.url'` so the dotted paths are greppable:
+// the coverage test in web_settings/mod.rs proves every config key is
+// reachable from this page by searching for its literal path.
+const LLM_PATHS = {
+  polish: {
+    backend: 'polish.backend',
+    localModel: 'polish.local.model',
+    cloudModel: 'polish.cloud.model',
+    cloudKey: 'polish.cloud.api_key_ref',
+    netUrl: 'polish.network.url',
+    netModel: 'polish.network.model',
+    netKey: 'polish.network.api_key_ref',
+  },
+  assistant: {
+    backend: 'assistant.backend',
+    localModel: 'assistant.local.model',
+    cloudModel: 'assistant.cloud.model',
+    cloudKey: 'assistant.cloud.api_key_ref',
+    netUrl: 'assistant.network.url',
+    netModel: 'assistant.network.model',
+    netKey: 'assistant.network.api_key_ref',
+  },
+};
+
 // Embedded local-LLM panel for the Cleanup / Assistant "Local" segment.
 // Shows the current on-device GGUF model id and lets the user change it.
 // `base` is 'polish' or 'assistant'.
 function localLlmPanel(base) {
-  return row('Model', 'Embedded on-device model. Install others with <span class="mono">fono models install &lt;id&gt;</span>.',
-    txt(base + '.local.model', { mono: true, w: 220, ph: 'gemma-4-e2b' }))
-    + '<p class="hint" style="margin-top:6px">Runs on this machine \u2014 no API key, nothing leaves your computer.</p>';
+  const P = LLM_PATHS[base];
+  const ids = (meta && meta.llm_local && meta.llm_local.models) || [];
+  const cur = gv(P.localModel, '');
+  let ctl;
+  if (ids.length) {
+    // A dropdown of what is actually installed, plus the current value if
+    // it is something else — a typo used to surface only at first use.
+    const opts = [['', 'Default (' + ids[0].id + ')']].concat(ids.map((m) => {
+      const gb = (m.approx_mb / 1024).toFixed(1) + ' GB';
+      return [m.id, m.id + ' \u00b7 ' + (m.installed ? 'installed' : 'downloads ' + gb)];
+    }));
+    if (cur && !ids.some((m) => m.id === cur)) opts.push([cur, cur + ' \u00b7 custom']);
+    ctl = sel(P.localModel, opts, '');
+  } else {
+    ctl = txt(P.localModel, { mono: true, w: 220, ph: 'gemma-4-e2b' });
+  }
+  return row('Model', 'Runs on this machine. Anything not yet downloaded is fetched on first use.', ctl)
+    + '<p class="hint" style="margin-top:6px">No API key needed \u2014 nothing leaves your computer.</p>';
 }
+
+// Self-hosted-server panel for the Cleanup / Assistant "Network" segment.
+// Engine-agnostic: anything that answers OpenAI-shaped chat completions
+// works, so nothing here names a specific product. "Test connection" asks
+// the daemon (not the browser \u2014 the box is usually LAN-side) to fetch the
+// server's model list, which then replaces the free-text model field.
+function networkLlmPanel(base) {
+  const P = LLM_PATHS[base];
+  const models = netModels[base] || null;
+  const cur = gv(P.netModel, '');
+  let modelCtl;
+  if (models && models.length) {
+    const opts = [['', 'Server default']].concat(models.map((m) => [m, m]));
+    if (cur && !models.includes(cur)) opts.push([cur, cur + ' \u00b7 not on server']);
+    modelCtl = sel(P.netModel, opts, '');
+  } else {
+    modelCtl = txt(P.netModel, { mono: true, w: 220, ph: 'gemma4:12b' });
+  }
+  return row('Server address', NETWORK_URL_HINT, txt(P.netUrl, { mono: true, w: 320 }))
+    + row('Test connection', 'Checks the address and lists the models it serves.',
+      '<button class="btn" type="button" data-llm-probe="' + base + '">Test connection</button>'
+      + ' <span class="hint llm-probe-status">' + esc(netStatus[base] || '') + '</span>')
+    + row('Model', 'Which model on that server to use.', modelCtl)
+    + row('API key name', 'Only for gateways that require a bearer token. Most local servers need none \u2014 leave empty.',
+      txt(P.netKey, { mono: true, w: 220, ph: 'none' }))
+    + '<p class="hint" style="margin-top:6px">' + NETWORK_HINT + '</p>';
+}
+
+// Per-role results of the last "Test connection" click. Ephemeral: never
+// written into cfg, and kept at module scope so a section re-render does
+// not throw away a model list the user just fetched.
+const netModels = {};
+const netStatus = {};
 
 // ---------- local TTS engine + voice picker ----------
 // Renders the engine card row (supertonic/piper/kokoro from /api/meta)
@@ -421,76 +529,43 @@ const SEG = {
     else if (v === 'custom') { if (gv('audio.auto_stop_silence_ms', 0) === 0) set(cfg, 'audio.auto_stop_silence_ms', 4000); }
     else set(cfg, 'audio.auto_stop_silence_ms', parseInt(v, 10));
   },
-  polish(v) {
-    if (v === 'local') set(cfg, 'polish.backend', 'local');
-    else if (v === 'network') {
-      if (!get(cfg, 'polish.cloud') || typeof get(cfg, 'polish.cloud') !== 'object') {
-        set(cfg, 'polish.cloud', { provider: '', api_key_ref: '', model: '' });
-      }
-      // Switching in from a cloud provider: seed the endpoint + drop the
-      // provider-specific model. Preserve both when already on the server.
-      if (gv('polish.cloud.provider', '') !== 'ollama') {
-        set(cfg, 'polish.cloud.model', '');
-        set(cfg, 'polish.cloud.api_key_ref', LOCAL_SERVER_URL);
-      }
-      set(cfg, 'polish.cloud.provider', 'ollama');
-      set(cfg, 'polish.backend', 'ollama');
-    } else {
-      const prev = gv('polish.cloud.provider', '');
-      const p = POLISH_CLOUD_PROVIDERS.some((x) => x[0] === prev) ? prev : 'openai';
-      ensureCloud('polish.cloud', p);
-      set(cfg, 'polish.cloud.provider', p);
-      set(cfg, 'polish.cloud.api_key_ref', ENV[p] || '');
-      set(cfg, 'polish.backend', p);
-    }
-  },
-  assistant(v) {
-    if (v === 'local') {
-      // Embedded on-device model = Ollama backend with no manual server.
-      // Clear the server markers so the factory takes the embedded path.
-      if (get(cfg, 'assistant.cloud')) {
-        set(cfg, 'assistant.cloud.provider', '');
-        set(cfg, 'assistant.cloud.api_key_ref', '');
-        set(cfg, 'assistant.cloud.model', '');
-      }
-      set(cfg, 'assistant.backend', 'ollama');
-    } else if (v === 'network') {
-      if (!get(cfg, 'assistant.cloud') || typeof get(cfg, 'assistant.cloud') !== 'object') {
-        set(cfg, 'assistant.cloud', { provider: '', api_key_ref: '', model: '' });
-      }
-      if (!assistantIsNetwork()) {
-        set(cfg, 'assistant.cloud.model', '');
-        set(cfg, 'assistant.cloud.api_key_ref', LOCAL_SERVER_URL);
-      }
-      set(cfg, 'assistant.cloud.provider', 'ollama-server');
-      set(cfg, 'assistant.backend', 'ollama');
-    } else {
-      const prev = gv('assistant.cloud.provider', '');
-      const p = ASSISTANT_CLOUD_PROVIDERS.some((x) => x[0] === prev) ? prev : 'openai';
-      ensureCloud('assistant.cloud', p);
-      set(cfg, 'assistant.cloud.provider', p);
-      set(cfg, 'assistant.cloud.api_key_ref', ENV[p] || '');
-      set(cfg, 'assistant.backend', p);
-    }
-  },
+  polish(v) { llmSegPick('polish', POLISH_CLOUD_PROVIDERS, v); },
+  assistant(v) { llmSegPick('assistant', ASSISTANT_CLOUD_PROVIDERS, v); },
 };
 
-// Provider-card click handlers. The explicit `.provider` / `.api_key_ref`
-// sets duplicate ensureCloud's work on purpose: the coverage test in
+// Cleanup and the Assistant share one backend enum, so they share one
+// segment handler. `backend` is the only thing that decides the mode;
+// the `[<role>.cloud]` and `[<role>.network]` sub-tables just hold the
+// details for whichever mode is active and are left alone otherwise, so
+// flipping between segments never loses a typed URL or API model id.
+function llmSegPick(base, grid, v) {
+  if (v === 'local') {
+    set(cfg, base + '.backend', 'local');
+  } else if (v === 'network') {
+    ensureNetwork(base + '.network');
+    set(cfg, base + '.backend', 'network');
+  } else {
+    const prev = gv(base + '.backend', '');
+    const p = grid.some((x) => x[0] === prev) ? prev : 'openai';
+    ensureLlmCloud(base + '.cloud', p);
+    set(cfg, base + '.backend', p);
+  }
+}
+
+// Provider-card click handlers. The explicit `.api_key_ref` sets
+// duplicate the ensure* work on purpose: the coverage test in
 // web_settings/mod.rs greps this file for full dotted paths.
 const PICK = {
   'stt-provider'(v) { ensureSttCloud(v); set(cfg, 'stt.backend', v); },
   'polish-provider'(v) {
-    ensureCloud('polish.cloud', v);
-    set(cfg, 'polish.cloud.provider', v);
+    ensureLlmCloud('polish.cloud', v);
     set(cfg, 'polish.cloud.api_key_ref', ENV[v] || '');
     set(cfg, 'polish.backend', v);
   },
   'assistant-provider'(v) {
-    set(cfg, 'assistant.backend', v);
-    ensureCloud('assistant.cloud', v);
-    set(cfg, 'assistant.cloud.provider', v);
+    ensureLlmCloud('assistant.cloud', v);
     set(cfg, 'assistant.cloud.api_key_ref', ENV[v] || '');
+    set(cfg, 'assistant.backend', v);
   },
   'tts-provider'(v) {
     ensureCloud('tts.cloud', v);
@@ -591,8 +666,8 @@ const FONO_SECTIONS = [
     summary() {
       if (!gv('polish.enabled', false)) return 'Off';
       const s = polishSeg();
-      if (s === 'local') return 'Local model';
-      if (s === 'network') return 'Network \u00b7 ' + (gv('polish.cloud.api_key_ref', '') || 'no server');
+      if (s === 'local') return 'Local model \u00b7 ' + (gv('polish.local.model', '') || 'default');
+      if (s === 'network') return netSummary('polish');
       return 'Cloud \u00b7 ' + pname(POLISH_CLOUD_PROVIDERS, gv('polish.backend', ''));
     },
     html() {
@@ -602,9 +677,7 @@ const FONO_SECTIONS = [
       if (s === 'local') {
         panel = localLlmPanel('polish');
       } else if (s === 'network') {
-        panel = row('Server URL', 'Ollama / OpenAI-compatible endpoint \u2014 e.g. http://localhost:11434/v1/chat/completions.',
-          txt('polish.cloud.api_key_ref', { mono: true, w: 300 }))
-          + row('Model', 'Model id served by that endpoint.', txt('polish.cloud.model', { mono: true, w: 220, ph: 'gemma4:12b' }));
+        panel = networkLlmPanel('polish');
       } else {
         const b = gv('polish.backend', 'openai');
         panel = '<div class="subhead">Provider</div>'
@@ -616,7 +689,7 @@ const FONO_SECTIONS = [
       return row('Enable cleanup', 'Runs each transcript through a small language model \u2014 punctuation, casing, filler removal.',
         toggle('polish.enabled', false, 'cleanup'), 'master')
         + '<div' + (on ? '' : ' class="section-off"') + '>'
-        + row('Backend', 'Local runs on this machine. Network connects to an Ollama / OpenAI-compatible server.',
+        + row('Where it runs', 'On this machine, through a cloud provider, or on your own server.',
           seg('polish', [['local', 'Local'], ['cloud', 'Cloud'], ['network', 'Network']], s))
         + panel
         + '<div style="margin-top:12px">'
@@ -658,8 +731,8 @@ const FONO_SECTIONS = [
       if (!gv('assistant.enabled', false)) return 'Off';
       const s = assistantSeg();
       let str;
-      if (s === 'local') str = 'Local model';
-      else if (s === 'network') str = 'Network \u00b7 ' + (gv('assistant.cloud.api_key_ref', '') || 'no server');
+      if (s === 'local') str = 'Local model \u00b7 ' + (gv('assistant.local.model', '') || 'default');
+      else if (s === 'network') str = netSummary('assistant');
       else {
         const b = gv('assistant.backend', 'none');
         str = b === 'none' ? 'no backend' : pname(ASSISTANT_CLOUD_PROVIDERS, b);
@@ -674,9 +747,7 @@ const FONO_SECTIONS = [
       if (s === 'local') {
         panel = localLlmPanel('assistant');
       } else if (s === 'network') {
-        panel = row('Server URL', 'Ollama / OpenAI-compatible endpoint \u2014 e.g. http://localhost:11434/v1/chat/completions.',
-          txt('assistant.cloud.api_key_ref', { mono: true, w: 300 }))
-          + row('Model', 'Model id served by that endpoint.', txt('assistant.cloud.model', { mono: true, w: 220, ph: 'gemma4:12b' }));
+        panel = networkLlmPanel('assistant');
       } else {
         const b = gv('assistant.backend', 'openai');
         const gridB = ASSISTANT_CLOUD_PROVIDERS.some((x) => x[0] === b) ? b : '';
@@ -689,7 +760,7 @@ const FONO_SECTIONS = [
       return row('Enable assistant', 'Voice Q&A \u2014 ask a question, hear or read the answer.',
         toggle('assistant.enabled', false, 'assistant'), 'master')
         + '<div' + (on ? '' : ' class="section-off"') + '>'
-        + row('Backend', 'Local runs on this machine. Network connects to an Ollama / OpenAI-compatible server.',
+        + row('Where it runs', 'On this machine, through a cloud provider, or on your own server.',
           seg('assistant', [['local', 'Local'], ['cloud', 'Cloud'], ['network', 'Network']], s))
         + panel
         + promptRow('System prompt', 'Personality and constraints', 'assistant.prompt_main', 'assistant_prompt', 5)
@@ -1838,6 +1909,35 @@ async function tryServer(i) {
   await loadTools();
 }
 
+// "Test connection" for a self-hosted LLM server. Asks the daemon to fetch
+// the model list (the browser usually cannot reach a LAN box), then swaps
+// the free-text model field for a dropdown of what the server actually
+// serves. Purely local to the page: nothing is saved by testing.
+async function probeLlmServer(base, sec) {
+  const url = gv(base + '.network.url', '').trim();
+  if (!url) { toast('Enter a server address first.', true); return; }
+  netStatus[base] = 'Connecting\u2026';
+  if (sec) renderSection(sec);
+  try {
+    const r = await api('/api/llm/probe', {
+      method: 'POST',
+      body: JSON.stringify({ url: url, api_key_ref: gv(base + '.network.api_key_ref', '') }),
+    });
+    netModels[base] = r.models || [];
+    netStatus[base] = r.count + (r.count === 1 ? ' model available' : ' models available');
+    // Nothing chosen yet and the server offers exactly one model: pick it.
+    // Saves a click in the overwhelmingly common single-model setup.
+    if (!gv(base + '.network.model', '') && netModels[base].length === 1) {
+      set(cfg, base + '.network.model', netModels[base][0]);
+    }
+  } catch (err) {
+    netModels[base] = null;
+    netStatus[base] = err.message;
+  }
+  if (sec) renderSection(sec);
+  updateBar();
+}
+
 async function discoverTools() {
   toolsBusy = true;
   refreshToolsSection();
@@ -1945,6 +2045,14 @@ document.addEventListener('change', (e) => {
     default: v = el.value;
   }
   set(cfg, boundPath(el), v);
+  // Turning Cleanup or the Assistant on with no backend chosen used to
+  // render an empty provider grid, which reads as broken. Pick the best
+  // thing actually available, mirroring `resolve_llm_backend` in
+  // fono-core so the page agrees with what the daemon would have done.
+  if (v === true && (boundPath(el) === 'polish.enabled' || boundPath(el) === 'assistant.enabled')) {
+    const base = boundPath(el).split('.')[0];
+    if (gv(base + '.backend', 'none') === 'none') set(cfg, base + '.backend', autoBackend(base));
+  }
   afterChange(el, el.dataset.rr);
 });
 
@@ -1965,12 +2073,13 @@ document.addEventListener('input', (e) => {
 });
 
 document.addEventListener('click', (e) => {
-  const t = e.target.closest('[data-seg],[data-pick],[data-tts-test],[data-tag-rm],[data-wake-rm],[data-wake-add],[data-vocab-rm],[data-vocab-add],[data-keycap],[data-reset],[data-key-edit],[data-key-clear],[data-key-save],[data-key-cancel],[data-key-new],[data-key-rename],[data-key-revoke],[data-key-restore],[data-key-delete],[data-spk-rename],[data-spk-delete],[data-spk-record],[data-spk-submit],[data-spk-discard],[data-spk-cal-record],[data-spk-cal-run],[data-spk-cal-clear],[data-spk-cal-apply],[data-spk-manage],[data-spk-manage-close],[data-spk-utt-del],[data-spk-prune],[data-tool-discover],[data-tool-try],[data-tool-srv-add],[data-tool-srv-rm]');
+  const t = e.target.closest('[data-seg],[data-pick],[data-tts-test],[data-tag-rm],[data-wake-rm],[data-wake-add],[data-vocab-rm],[data-vocab-add],[data-keycap],[data-reset],[data-key-edit],[data-key-clear],[data-key-save],[data-key-cancel],[data-key-new],[data-key-rename],[data-key-revoke],[data-key-restore],[data-key-delete],[data-spk-rename],[data-spk-delete],[data-spk-record],[data-spk-submit],[data-spk-discard],[data-spk-cal-record],[data-spk-cal-run],[data-spk-cal-clear],[data-spk-cal-apply],[data-spk-manage],[data-spk-manage-close],[data-spk-utt-del],[data-spk-prune],[data-tool-discover],[data-tool-try],[data-tool-srv-add],[data-tool-srv-rm],[data-llm-probe]');
   if (!t) return;
   const secEl = t.closest('details.sec');
   const sec = secEl ? FONO_SECTIONS.find((s) => 'd-' + s.id === secEl.id) : null;
 
   if (t.dataset.toolDiscover !== undefined) { discoverTools(); return; }
+  if (t.dataset.llmProbe) { probeLlmServer(t.dataset.llmProbe, sec); return; }
   if (t.dataset.toolTry !== undefined) { tryServer(Number(t.dataset.toolTry)); return; }
   if (t.dataset.toolSrvAdd !== undefined) {
     const arr = gv('assistant.tools.mcp', []).slice();

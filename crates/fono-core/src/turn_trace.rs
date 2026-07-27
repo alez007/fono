@@ -42,6 +42,27 @@ static CURRENT_TRACE: OnceLock<Mutex<Option<Weak<Inner>>>> = OnceLock::new();
 /// [`TurnTrace::make_current`] and back off when the guard drops.
 static TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether to record the **verbatim** prompt sent to the model and the
+/// **verbatim** text it sent back — true exactly when a trace is being
+/// captured at all.
+///
+/// There is deliberately no second switch. A trace exists to answer "what
+/// happened in this turn", and the single most common question — what did the
+/// model actually see, and what did it actually say — is unanswerable without
+/// the text. Splitting it out only produced the re-run loop: enable tracing,
+/// find the one field you needed is missing, do it again.
+///
+/// The consequence is that **a trace file is a transcript**: everything the
+/// user said, the whole system prompt, every tool schema, and the name of
+/// every device in their home. Treat one as sensitive and never attach an
+/// unread trace to a bug report.
+///
+/// Callers guard on this before assembling the text, so an untraced turn pays
+/// nothing.
+pub fn transcript_enabled() -> bool {
+    TRACE_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Stable trace lane (Chrome Trace `tid`) names. Both the F7 (plain dictation /
 /// polish) and F8 (assistant) paths render into the same fixed set of lanes so
 /// a loaded trace always shows the pipeline in the same top-to-bottom order:

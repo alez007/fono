@@ -148,12 +148,33 @@ Pointing the variable at a path ending in `.json` writes a single trace to
 that exact file instead. Setting it empty, to `0`, or to `false` disables
 tracing.
 
-> **Privacy note:** traces include the full prompt text — your dictated
-> words, the transcript being cleaned, and the assistant conversation — so
-> treat trace files like the history database. Set
-> `FONO_ASSISTANT_TRACE_PROMPT=0` to omit prompt text from traces, and
-> prefer a private directory over a world-readable `/tmp` path on shared
-> machines. Tracing is off unless `FONO_ASSISTANT_TRACE` is set.
+### What the model was actually told, and what it said back
+
+Timings tell you a turn was slow; they don't tell you why the assistant
+picked the wrong device. For that you need the conversation itself, and a
+trace carries it — no second variable to remember:
+
+| trace event | contents |
+| --- | --- |
+| `llm.request` | the entire request sent to a cloud or self-hosted assistant — system prompt, every history message, and the JSON schema of every tool offered |
+| `llm.reply` | the reply as produced: text, `finish_reason`, and the tool call verbatim (name plus arguments) |
+| `llm.generate` → `prompt` | the fully rendered prompt for the on-device assistant, including its tool block |
+| `llm.local_*_finished` → `reply` | the on-device reply before any cleanup, so you can see machinery the user never hears |
+
+Tool results are recorded too, so a turn reads as a complete transcript:
+prompt → tool call → result → prompt → reply. That is usually enough to
+tell "the model chose badly" from "Fono asked the wrong question" from
+"the device lied" without reproducing anything by hand.
+
+None of this costs anything when you are not tracing: the text is only
+assembled while a trace is being captured.
+
+> **Privacy note:** a trace file is a transcript. It contains everything
+> you said, everything the assistant replied, the whole system prompt, and
+> the name of every device in your home. Treat those files like the
+> history database: write them to a private directory rather than a
+> world-readable `/tmp` path, and never attach one to a bug report without
+> reading it first.
 
 ## Hotkey doesn't fire
 

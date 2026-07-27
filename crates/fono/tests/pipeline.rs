@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use fono_core::config::{Config, PolishBackend};
+use fono_core::config::{Config, LlmBackend};
 use fono_core::history::HistoryDb;
 use fono_core::paths::Paths;
 use fono_polish::{FormatContext, TextFormatter};
@@ -85,9 +85,9 @@ async fn pipeline_produces_history_row_and_injects_cleaned_text() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI; // anything non-None
-                                                // Force the LLM to run regardless of the default short-utterance
-                                                // skip threshold; this test covers the cleaned-output path.
+    cfg.polish.backend = LlmBackend::OpenAI; // anything non-None
+                                             // Force the LLM to run regardless of the default short-utterance
+                                             // skip threshold; this test covers the cleaned-output path.
     cfg.polish.skip_if_words_lt = 0;
     let cfg = Arc::new(cfg);
 
@@ -173,7 +173,7 @@ async fn pipeline_falls_back_to_raw_when_llm_rejects_clarification() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     let cfg = Arc::new(cfg);
 
     let (orch, _rx) = orchestrator_for_test(
@@ -227,7 +227,7 @@ async fn pipeline_skips_llm_for_short_capture_under_default_threshold() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     // Sanity-check the new default rather than hard-coding it.
     assert!(cfg.polish.skip_if_words_lt >= 3);
     let cfg = Arc::new(cfg);
@@ -341,7 +341,7 @@ async fn pipeline_feeds_candidate_set_and_directive_when_stt_reports_no_language
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     cfg.general.languages = vec!["ro".into(), "en".into()];
     let cfg = Arc::new(cfg);
 
@@ -389,7 +389,7 @@ async fn pipeline_adds_source_language_contract_when_stt_reports_language() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     cfg.general.languages = vec!["ro".into(), "en".into()];
     let cfg = Arc::new(cfg);
 
@@ -511,7 +511,7 @@ async fn pipeline_vocabulary_survives_polish_reintroducing_mishearing() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     cfg.polish.skip_if_words_lt = 0;
     let cfg = Arc::new(cfg);
 
@@ -581,7 +581,7 @@ async fn pipeline_vocabulary_reaches_streaming_cleanup_inject_path() {
 
     let mut cfg = Config::default();
     cfg.polish.enabled = true;
-    cfg.polish.backend = PolishBackend::OpenAI;
+    cfg.polish.backend = LlmBackend::OpenAI;
     cfg.polish.skip_if_words_lt = 0;
     cfg.polish.stream_injection = true;
     let cfg = Arc::new(cfg);

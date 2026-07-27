@@ -50,8 +50,12 @@ use crate::history::{ChatRole, ChatTurn, ToolCall};
 use crate::sse::SseBuffer;
 use crate::traits::{Assistant, AssistantContext, TokenDelta, ToolEvent};
 
+/// True for self-hosted OpenAI-compatible servers (the `network`
+/// backend). They bill nothing per token, so they get a larger reply
+/// budget, and they accept the thinking-suppression switches that
+/// hosted APIs reject.
 fn is_local_backend(backend_name: &str) -> bool {
-    backend_name == "ollama"
+    backend_name == "network"
 }
 
 /// Inter-chunk watchdog for streaming chat. SSE replies tick at most
@@ -79,7 +83,8 @@ pub struct OpenAiCompatChat {
     /// Phase E5 — when `Some`, the request body grows a `tools`
     /// array carrying this provider's native web-search tool. Only
     /// OpenAI populates this in practice (the catalogue gates Groq /
-    /// Cerebras / OpenRouter / Ollama as `WebSearchSupport::None`).
+    /// Cerebras / OpenRouter / self-hosted servers as
+    /// `WebSearchSupport::None`).
     web_search_tool: Option<&'static str>,
     client: reqwest::Client,
 }
@@ -139,8 +144,15 @@ impl OpenAiCompatChat {
         Self::new(GEMINI_CHAT_ENDPOINT, api_key, model, "gemini")
     }
 
-    pub fn ollama(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new(endpoint, "", model, "ollama")
+    /// Any self-hosted OpenAI-compatible chat-completions server —
+    /// Ollama, `llama.cpp` server, LM Studio, vLLM, LiteLLM. `token` is
+    /// sent as a bearer only when the server requires one.
+    pub fn network(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        token: Option<String>,
+    ) -> Self {
+        Self::new(endpoint, token.unwrap_or_default(), model, "network")
     }
 }
 
@@ -752,6 +764,21 @@ impl ChatRunner {
             tools,
         };
 
+        // The whole request, verbatim, when a developer asked for it. This is
+        // the only way to answer "what did the model actually see" — the system
+        // prompt, the history, and the tool schemas all live in here.
+        if fono_core::turn_trace::transcript_enabled() {
+            fono_core::turn_trace::current_instant(
+                "llm.request",
+                "llm",
+                "llm",
+                serde_json::json!({
+                    "endpoint": self.endpoint,
+                    "request": serde_json::to_string_pretty(&req).unwrap_or_default(),
+                }),
+            );
+        }
+
         let mut builder =
             self.client.post(&self.endpoint).header("accept", "text/event-stream").json(&req);
         if !self.api_key.is_empty() {
@@ -939,6 +966,22 @@ impl ChatRunner {
         } else {
             None
         };
+        // The reply as the model actually produced it. `reply_chars` in the log
+        // tells you the model said *something*; this tells you what.
+        if fono_core::turn_trace::transcript_enabled() {
+            fono_core::turn_trace::current_instant(
+                "llm.reply",
+                "llm",
+                "llm",
+                serde_json::json!({
+                    "content": buffered,
+                    "finish_reason": if finish_is_tool_calls { "tool_calls" } else { "stop" },
+                    "tool_call": tool_call.as_ref().map(|t| {
+                        serde_json::json!({ "name": t.name, "arguments": t.arguments })
+                    }),
+                }),
+            );
+        }
         Ok(PumpResult { buffered_content: buffered, tool_call })
     }
 }
@@ -1126,7 +1169,7 @@ mod tests {
 
     #[test]
     fn local_backends_disable_thinking() {
-        assert!(is_local_backend("ollama"));
+        assert!(is_local_backend("network"));
         assert!(!is_local_backend("groq"));
         assert!(!is_local_backend("openai"));
     }
@@ -1135,7 +1178,7 @@ mod tests {
     fn gemini_sends_low_reasoning_effort_others_omit_it() {
         assert_eq!(reasoning_effort_for("gemini"), Some("low"));
         assert_eq!(reasoning_effort_for("groq"), None);
-        assert_eq!(reasoning_effort_for("ollama"), None);
+        assert_eq!(reasoning_effort_for("network"), None);
 
         let req = ChatReq {
             model: "gemini-flash-lite-latest".into(),
@@ -1175,7 +1218,7 @@ mod tests {
             messages: Vec::new(),
             temperature: Some(0.5),
             top_p: Some(0.9),
-            max_tokens: assistant_token_budget("ollama"),
+            max_tokens: assistant_token_budget("network"),
             stream: true,
             reasoning_effort: None,
             think: Some(false),

@@ -62,7 +62,7 @@ mod realtime_live {
         RealtimeSession,
     };
     use fono_audio::{AudioCapture, AudioPlayback, CaptureConfig};
-    use fono_core::config::{Assistant as AssistantCfg, AssistantBackend, AssistantCloud};
+    use fono_core::config::{Assistant as AssistantCfg, LlmBackend, LlmCloud};
     use fono_core::{provider_catalog, Paths, Secrets};
     use futures::StreamExt;
 
@@ -102,12 +102,11 @@ mod realtime_live {
 
         let cfg = AssistantCfg {
             enabled: true,
-            backend: AssistantBackend::Gemini,
-            cloud: Some(AssistantCloud {
-                provider: "gemini".to_string(),
+            backend: LlmBackend::Gemini,
+            cloud: LlmCloud {
                 api_key_ref: "GEMINI_API_KEY".to_string(),
                 model: profile.model.to_string(),
-            }),
+            },
             ..AssistantCfg::default()
         };
         match fono_assistant::build_assistant_handle(&cfg, secrets, std::path::Path::new("."))? {

@@ -191,18 +191,15 @@ fn normalised_rms(samples: &[f32]) -> f32 {
 /// Return `true` when the configured assistant backend is vision-capable
 /// (has a `multimodal_model` in the provider catalogue). Used to gate
 /// the `fono_screen` tool injection in the F8 voice loop.
-fn backend_is_vision_capable(backend: &fono_core::config::AssistantBackend) -> bool {
-    use fono_core::config::AssistantBackend;
-    let id = match backend {
-        AssistantBackend::OpenAI => "openai",
-        AssistantBackend::Anthropic => "anthropic",
-        AssistantBackend::Groq => "groq",
-        AssistantBackend::Cerebras => "cerebras",
-        AssistantBackend::OpenRouter => "openrouter",
-        AssistantBackend::Gemini => "gemini",
-        AssistantBackend::Ollama | AssistantBackend::None => return false,
-    };
-    fono_core::provider_catalog::find(id)
+///
+/// Only hosted cloud providers have catalogue entries; `local` and
+/// `network` are user-supplied models Fono cannot introspect, so they
+/// are treated as text-only.
+fn backend_is_vision_capable(backend: fono_core::config::LlmBackend) -> bool {
+    if !backend.is_cloud() {
+        return false;
+    }
+    fono_core::provider_catalog::find(fono_core::providers::llm_backend_str(&backend))
         .and_then(|p| p.assistant)
         .and_then(|a| a.multimodal_model)
         .is_some()
@@ -831,7 +828,7 @@ impl SessionOrchestrator {
                     // auth/network/key failures get tailored copy; a
                     // missing local GGUF falls through to the generic
                     // "polish failed … run `fono models install`" body.
-                    let provider = fono_core::providers::polish_backend_str(&config.polish.backend);
+                    let provider = fono_core::providers::llm_backend_str(&config.polish.backend);
                     let class = fono_core::critical_notify::classify(&err_text);
                     fono_core::critical_notify::notify(
                         fono_core::critical_notify::Stage::Polish,
@@ -1101,7 +1098,7 @@ impl SessionOrchestrator {
             Ok(opt) => opt,
             Err(e) => {
                 let err_text = format!("{e:#}");
-                let provider = fono_core::providers::polish_backend_str(&cfg.polish.backend);
+                let provider = fono_core::providers::llm_backend_str(&cfg.polish.backend);
                 fono_core::critical_notify::notify_actionable(
                     fono_core::critical_notify::Stage::Polish,
                     provider,
@@ -1138,7 +1135,7 @@ impl SessionOrchestrator {
             Ok(opt) => opt,
             Err(e) => {
                 let err_text = format!("{e:#}");
-                let provider = fono_core::providers::assistant_backend_str(&cfg.assistant.backend);
+                let provider = fono_core::providers::llm_backend_str(&cfg.assistant.backend);
                 fono_core::critical_notify::notify_actionable(
                     fono_core::critical_notify::Stage::Assistant,
                     provider,
@@ -1297,7 +1294,7 @@ impl SessionOrchestrator {
     /// Read-only snapshot of the active backend names. Returns the
     /// **canonical** lowercase identifier from
     /// [`fono_core::providers::stt_backend_str`] /
-    /// [`fono_core::providers::polish_backend_str`] (e.g. `"local"`,
+    /// [`fono_core::providers::llm_backend_str`] (e.g. `"local"`,
     /// `"groq"`, `"none"`) so the tray's active-marker comparison and
     /// the doctor / status output stay in sync. The trait `name()`s
     /// (e.g. `"whisper-local"`, `"llama-local"`) are intentionally
@@ -1306,7 +1303,7 @@ impl SessionOrchestrator {
     pub fn active_backends(&self) -> (String, String) {
         let cfg = self.current_config();
         let stt = fono_core::providers::stt_backend_str(&cfg.stt.backend).to_string();
-        let polish = fono_core::providers::polish_backend_str(&cfg.polish.backend).to_string();
+        let polish = fono_core::providers::llm_backend_str(&cfg.polish.backend).to_string();
         (stt, polish)
     }
 
@@ -1317,9 +1314,8 @@ impl SessionOrchestrator {
     pub fn active_backends_full(&self) -> (String, String, String, String) {
         let cfg = self.current_config();
         let stt = fono_core::providers::stt_backend_str(&cfg.stt.backend).to_string();
-        let polish = fono_core::providers::polish_backend_str(&cfg.polish.backend).to_string();
-        let assistant =
-            fono_core::providers::assistant_backend_str(&cfg.assistant.backend).to_string();
+        let polish = fono_core::providers::llm_backend_str(&cfg.polish.backend).to_string();
+        let assistant = fono_core::providers::llm_backend_str(&cfg.assistant.backend).to_string();
         let tts = fono_core::providers::tts_backend_str(&cfg.tts.backend).to_string();
         (stt, polish, assistant, tts)
     }
@@ -3192,7 +3188,7 @@ impl SessionOrchestrator {
             // screenshot frame (realtimeInput.video) before mic audio.
             let rt_prefer_vision = cfg.assistant.prefer_vision;
             let rt_screen_capture_fn: Option<fono_assistant::ScreenCaptureFn> =
-                if rt_prefer_vision && backend_is_vision_capable(&cfg.assistant.backend) {
+                if rt_prefer_vision && backend_is_vision_capable(cfg.assistant.backend) {
                     use fono_core::screen_capture::GrabberProbe;
                     use fono_inject::focus::detect_focus;
                     let probe = GrabberProbe::detect();
@@ -3281,7 +3277,7 @@ impl SessionOrchestrator {
         // and the configured assistant backend is vision-capable.
         let prefer_vision = cfg.assistant.prefer_vision;
         let screen_capture_fn: Option<fono_assistant::ScreenCaptureFn> =
-            if prefer_vision && backend_is_vision_capable(&cfg.assistant.backend) {
+            if prefer_vision && backend_is_vision_capable(cfg.assistant.backend) {
                 use fono_core::screen_capture::GrabberProbe;
                 use fono_inject::focus::detect_focus;
                 let probe = GrabberProbe::detect();

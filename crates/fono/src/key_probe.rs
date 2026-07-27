@@ -32,13 +32,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every canonical API-key env-var name across the key-requiring
-/// backends. STT + polish is the full union — TTS and assistant reuse
-/// the same env vars — so enumerating those two covers every probeable
-/// key. Callers filter by which are actually configured before probing.
+/// backends. STT + the LLM roles is the full union — TTS reuses the
+/// same env vars, and cleanup and assistant share one backend enum —
+/// so enumerating those two covers every probeable key. Callers filter
+/// by which are actually configured before probing.
 #[must_use]
 pub fn all_key_envs() -> Vec<String> {
     use fono_core::providers::{
-        all_polish_backends, all_stt_backends, polish_key_env, polish_requires_key, stt_key_env,
+        all_llm_backends, all_stt_backends, llm_key_env, llm_requires_key, stt_key_env,
         stt_requires_key,
     };
     let mut set = std::collections::BTreeSet::new();
@@ -47,9 +48,9 @@ pub fn all_key_envs() -> Vec<String> {
             set.insert(stt_key_env(&b).to_string());
         }
     }
-    for b in all_polish_backends() {
-        if polish_requires_key(&b) {
-            set.insert(polish_key_env(&b).to_string());
+    for b in all_llm_backends() {
+        if llm_requires_key(&b) {
+            set.insert(llm_key_env(&b).to_string());
         }
     }
     set.into_iter().collect()

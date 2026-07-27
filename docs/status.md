@@ -33,6 +33,79 @@ with the player's own `playback.play` span and only *partly* overlapped it
 track — Perfetto was dropping the slice with
 `slice_spill_overlapping_complete_event`. Drain moved to its own `playback-wait`
 lane.
+## 2026-07-27 — One LLM backend vocabulary: none / local / network / provider
+
+`[polish]` and `[assistant]` now share a single `LlmBackend` enum with four
+kinds of choice, and the word `ollama` is gone from the outbound schema
+entirely. Prompted by a user report that "the config says ollama, the tray
+says local, and the web UI shows three sections" — all three were right, which
+was the problem.
+
+**What was actually broken.** `AssistantBackend::Ollama` was the only route to
+the *embedded* llama.cpp engine **and** the route to a network server,
+disambiguated at runtime by a marker string (`"ollama-server"`,
+`"openai-compatible-local"`) plus a URL smuggled into `api_key_ref` — a field
+whose name promises the name of a secret. On top of that,
+`assistant_backend_str(&Ollama)` returned `"local"` while serde wrote
+`"ollama"`, and the polish twin returned `"ollama"` for the same variant. The
+asymmetry was pinned by a passing test. `PolishBackend` had modelled this
+correctly all along with separate `Local` and `Ollama` variants; the assistant
+got the cheap fix years later.
+
+The web settings page looked correct because it reimplemented the Rust marker
+convention by hand in JavaScript — compensating in the UI for a schema that
+could not express what it was rendering.
+
+**The shape now.** `backend` is the single source of truth:
+`none | local | network | <provider>`, with `[<role>.local]`,
+`[<role>.network]`, `[<role>.cloud]` as typed siblings. `cloud.provider` is
+deleted (two fields could disagree; one cannot). `local` never opens a socket,
+`network` never loads a GGUF — enforced by tests rather than convention.
+`network` names no vendor: the contract is an OpenAI-compatible
+`/v1/chat/completions` endpoint, so Ollama, `llama-server`, LM Studio, vLLM and
+LiteLLM all work identically. Follows the `[stt.wyoming]` precedent.
+
+**Compatibility deliberately dropped** (maintainer sign-off: no real users of
+the token). Serde runs *before* `migrate()`, so a stale `ollama` fails at load
+with serde's own `unknown variant` message listing the valid tokens — which
+beats carrying a disposable migration path through the schema. Config
+`version` bumped to 2.
+
+**The trap this hid.** Roughly twenty sites used `matches!` rather than an
+exhaustive `match` — `factory.rs`, `summarize.rs`, `models.rs`, `session.rs`,
+five wizard sites. Those compile clean and silently change behaviour under an
+enum change. Converted where practical so the compiler now guards them.
+
+**UX earned once the schema was honest:** a **Test connection** button that
+probes the server and turns its model list into a dropdown (run daemon-side —
+the endpoint is usually LAN-side and the browser cannot reach it), a model
+dropdown for the local GGUF, and the network host in the tray label.
+
+**`none` is a choice, not a fallback.** One enum covering both "off" and "not
+yet decided" forced the empty state to be disambiguated, and `enabled` already
+does it. `none` on a *disabled* role is obeyed; `none` on an *enabled* role
+means nobody has chosen yet, and `resolve_llm_backend` picks the best available
+option — a configured `network` server, else a cloud provider whose key is in
+`secrets.toml` (fixed preference order), else `local`, which needs no key and no
+network and therefore always works. The daemon resolves once at startup and
+**persists** the result, so the file, the tray and the settings page cannot
+disagree. Only `secrets.toml` counts, never the process environment, matching
+`configured_llm_backends` — a key exported in one shell must not silently
+relocate a role. The order is duplicated in the settings page's JavaScript
+(the browser has to predict the daemon's answer); a `fono-net` test parses the
+JS constant and asserts it matches the Rust one, so they cannot drift.
+
+Fixed alongside: auto-download keyed on `backend == Local` alone, so a
+*switched-off* `[polish]` still pulled a 3.4 GB GGUF. Both roles are now gated
+on `enabled` as well.
+
+Recorded as [ADR 0039](decisions/0039-unified-llm-backend-selection.md); ADR
+0036 is marked partially superseded (only its outbound marker convention — the
+inbound `[server.llm]` API is untouched and still serves the Ollama-native
+format on 11434).
+
+All four gates green; `release-slim` ships at 22.04 MiB against a 25 MiB
+budget, unchanged — no new crates.
 
 ## 2026-07-26 — Voice actions: Fono itself now switches a real light
 
