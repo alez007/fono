@@ -385,10 +385,11 @@ fn turn_to_wire(turn: &ChatTurn) -> WireMessage {
 /// rolling history + the current user turn.
 fn build_initial_messages(ctx: &AssistantContext, user_text: &str) -> Vec<WireMessage> {
     let mut messages: Vec<WireMessage> = Vec::with_capacity(ctx.history.len() + 2);
-    if !ctx.system_prompt.is_empty() {
+    let system = ctx.system_block();
+    if !system.is_empty() {
         messages.push(WireMessage {
             role: ChatRole::System.as_str(),
-            content: Some(WireContent::Text(ctx.system_prompt.clone())),
+            content: Some(WireContent::Text(system)),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -1043,6 +1044,8 @@ mod tests {
     fn initial_messages_serialise_history_in_order() {
         let ctx = AssistantContext {
             system_prompt: "be brief".into(),
+            speaker_note: None,
+            instructions: None,
             language: None,
             history: vec![turn(ChatRole::User, "hi"), turn(ChatRole::Assistant, "hello")],
             active_window_context: None,
@@ -1077,6 +1080,8 @@ mod tests {
 
         let ctx = AssistantContext {
             system_prompt: String::new(),
+            speaker_note: None,
+            instructions: None,
             language: None,
             history: vec![
                 turn(ChatRole::User, "what's on screen?"),

@@ -205,54 +205,78 @@ fn backend_is_vision_capable(backend: fono_core::config::LlmBackend) -> bool {
         .is_some()
 }
 
-fn assistant_cache_warmup(config: &Config) -> AssistantPromptCacheWarmup {
+fn assistant_cache_warmup(
+    config: &Config,
+    paths: Option<&Paths>,
+    backend: (&str, bool),
+) -> AssistantPromptCacheWarmup {
+    let (context, instructions, descriptors) =
+        assistant_head_and_descriptors(config, paths, backend);
     AssistantPromptCacheWarmup {
         f7_system_prompt: Some(f7_polish_prompt_for_cache(config)),
-        f8_system_prompt: Some(config.assistant.prompt_main.clone()),
+        f8_system_prompt: Some(context),
         assistant_tool_prompt: config
             .assistant
             .prefer_vision
             .then(|| ASSISTANT_SCREEN_TOOL_PROMPT.to_string()),
+        f8_action_descriptors: descriptors,
+        f8_instructions: Some(instructions),
     }
 }
 
-/// Compose the live F8 system prompt: the configured `prompt_main`, plus
-/// the room names when the user has tools, plus a one-line speaker identity
-/// note when voice verification matched.
+/// The steady *context* part of the F8 system prompt: the room and device
+/// names, when the user has tools.
 ///
-/// **`prompt_main` must stay leading.** The prompt-state cache pins the
-/// `F8System` layer as `assistant_base_prefix(prompt_main)`, built from bare
-/// `prompt_main` at startup by [`assistant_cache_warmup`]. That checkpoint is
-/// restorable only while it remains a genuine token prefix of the live prompt,
-/// so any per-turn decoration has to be appended, never prepended. Prepending
-/// the identity note diverged at roughly token one and cold-prefilled the whole
-/// system block on every speaker-matched turn. The F7 polish path composes its
-/// per-app context the same way, onto the end of the polish base.
+/// Everything here changes only when the house does, so a backend that
+/// checkpoints its prompt can keep it across conversations and across
+/// restarts. Two things are deliberately **not** here:
 ///
-/// Order among the appended parts matters for the same reason: the room
-/// names change only when the house does, the speaker changes every turn,
-/// so the steadier one goes first and stays cacheable for longer.
-pub(crate) fn assistant_system_prompt(
-    prompt_main: &str,
-    rooms: Option<&str>,
-    speaker: Option<&str>,
-) -> String {
-    // Nothing to add: leave the prompt byte-identical to what the cache
-    // pinned, trailing whitespace and all.
-    if rooms.is_none() && speaker.is_none() {
-        return prompt_main.to_string();
-    }
-    let mut out = prompt_main.trim_end().to_string();
-    if let Some(rooms) = rooms {
-        out.push_str("\n\n");
-        out.push_str(rooms);
-    }
-    if let Some(name) = speaker {
-        out.push_str("\n\nThe current speaker is ");
-        out.push_str(name);
-        out.push('.');
-    }
-    out
+/// - The behavioural rules (`prompt_main`) — those are carried apart on
+///   [`AssistantContext::instructions`] and rendered *after* the tool block, so
+///   a weak model reads them last. See [`fono_assistant::compose_head`].
+/// - The speaker note — carried on [`AssistantContext::speaker_note`] and
+///   appended after everything, so a change of speaker costs a handful of
+///   tokens rather than the whole device list.
+///
+/// What remains has to stay **leading and stable**: the prompt-state cache pins
+/// the `F8System` layer as `assistant_base_prefix(head)`, built from this same
+/// function at startup by [`assistant_cache_warmup`], and that checkpoint is
+/// restorable only while it remains a genuine token prefix of the live prompt.
+pub(crate) fn assistant_prompt_context(rooms: Option<&str>) -> String {
+    rooms.map(str::trim).unwrap_or_default().to_string()
+}
+
+/// The one-line identity note, when voice verification matched.
+///
+/// Kept out of [`assistant_prompt_context`] deliberately. This is the most
+/// volatile thing in the prompt — it appears, disappears and changes identity
+/// from one turn to the next — so the backend appends it *after* the head,
+/// where a change of speaker costs a handful of tokens instead of throwing
+/// away nine hundred tokens of device list that was perfectly good.
+#[allow(clippy::single_option_map)]
+pub(crate) fn assistant_speaker_note(speaker: Option<&str>) -> Option<String> {
+    speaker.map(|name| format!("The current speaker is {name}."))
+}
+
+/// The steady context, the behavioural rules, and the tool descriptors,
+/// exactly as the reply path will build them for this backend — named by
+/// `(name, can_run_actions)`.
+///
+/// Goes through [`crate::actions::for_backend`] rather than reading the
+/// catalogue directly, because a backend that cannot invoke tools is given
+/// none of them and told so instead — a different head. Warming the other one
+/// would pin a checkpoint that is not a prefix of anything ever sent, which is
+/// the failure mode this whole track exists to remove.
+fn assistant_head_and_descriptors(
+    config: &Config,
+    paths: Option<&Paths>,
+    (backend, can_act): (&str, bool),
+) -> (String, String, Vec<serde_json::Value>) {
+    let built = paths.and_then(|p| crate::actions::build(config, p));
+    let (actions, tools_note) = crate::actions::for_backend(built, can_act, backend);
+    let context = assistant_prompt_context(tools_note.as_deref());
+    let instructions = config.assistant.prompt_main.trim().to_string();
+    (context, instructions, actions.map(|a| a.descriptors.clone()).unwrap_or_default())
 }
 
 fn f7_polish_prompt_for_cache(config: &Config) -> String {
@@ -2394,7 +2418,11 @@ impl SessionOrchestrator {
         gate: &Arc<tokio::sync::Semaphore>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let assistant = self.current_assistant()?;
-        let warmup = assistant_cache_warmup(&self.current_config());
+        let warmup = assistant_cache_warmup(
+            &self.current_config(),
+            self.paths.as_ref().map(std::convert::AsRef::as_ref),
+            (assistant.name(), assistant.can_run_actions()),
+        );
         let assistant_trace = trace.cloned();
         let gate = Arc::clone(gate);
         Some(tokio::spawn(async move {
@@ -2432,6 +2460,61 @@ impl SessionOrchestrator {
                 );
             }
         }))
+    }
+
+    /// Re-warm the assistant's steady prompt head after something that can
+    /// change it: a tool switched on or off, a discovery pass that found new
+    /// tools, a config reload, a model swap.
+    ///
+    /// Without this the next thing said after any catalogue edit pays the full
+    /// cold head — on a small local model, thirteen seconds — at exactly the
+    /// moment the user is most likely to be testing the change they just made.
+    ///
+    /// Cheap when nothing moved: the head is content-addressed, so an unchanged
+    /// one costs a hash and a map probe inside the backend and returns without
+    /// prefilling. Cheap when something did: a changed head replaces the pin of
+    /// the same layer, so nothing leaks.
+    ///
+    /// Fire-and-forget, and coalesced — a browser toggling six tools in a row
+    /// must not queue six prefills nor block the HTTP response behind one.
+    pub fn rewarm_assistant_head(&self) {
+        /// One daemon per process, so a process-wide flag is the whole of the
+        /// debounce. Set while a re-warm is queued or running; a second request
+        /// arriving in that window is dropped, because the one in flight will
+        /// read the config and catalogue *after* it sleeps and so already sees
+        /// whatever the second request would have asked for.
+        static PENDING: AtomicBool = AtomicBool::new(false);
+
+        let Some(assistant) = self.current_assistant() else { return };
+        if PENDING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let config = Arc::clone(&self.config);
+        let paths = self.paths.clone();
+        tokio::spawn(async move {
+            // Let a burst of toggles settle, then read the world once.
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let warmup = {
+                let cfg = Arc::clone(&config.read().expect("config lock poisoned"));
+                assistant_cache_warmup(
+                    &cfg,
+                    paths.as_deref(),
+                    (assistant.name(), assistant.can_run_actions()),
+                )
+            };
+            PENDING.store(false, Ordering::SeqCst);
+            let started = Instant::now();
+            match assistant.prewarm_prompt_caches(warmup).await {
+                Ok(()) => debug!(
+                    "re-warmed assistant {} prompt head in {}ms",
+                    assistant.name(),
+                    started.elapsed().as_millis()
+                ),
+                Err(e) => {
+                    debug!("assistant {} prompt-head re-warm skipped: {e:#}", assistant.name());
+                }
+            }
+        });
     }
 
     /// Wire pre-built components together. Used by both [`Self::new`]
@@ -2604,6 +2687,10 @@ impl SessionOrchestrator {
                 history,
                 AssistantCacheTrigger::F7,
                 f7_polish_prompt_for_cache(&cfg),
+                // F7 is dictation, not conversation: there is no tool block and
+                // no behavioural block to place behind one.
+                String::new(),
+                Vec::new(),
                 focus_info.clone(),
                 cfg.assistant.prefer_vision,
                 trace.clone(),
@@ -2900,11 +2987,18 @@ impl SessionOrchestrator {
                             let mut s = self.assistant_session.lock().await;
                             s.history.snapshot()
                         };
+                        let (context, instructions, descriptors) = assistant_head_and_descriptors(
+                            &cfg,
+                            self.paths.as_ref().map(std::convert::AsRef::as_ref),
+                            (assistant.name(), assistant.can_run_actions()),
+                        );
                         Self::prepare_assistant_prompt_cache(
                             assistant,
                             history,
                             AssistantCacheTrigger::F8,
-                            cfg.assistant.prompt_main.clone(),
+                            context,
+                            instructions,
+                            descriptors,
                             focus_info.clone(),
                             cfg.assistant.prefer_vision,
                             None,
@@ -2976,11 +3070,18 @@ impl SessionOrchestrator {
                 let mut s = self.assistant_session.lock().await;
                 s.history.snapshot()
             };
+            let (context, instructions, descriptors) = assistant_head_and_descriptors(
+                &cfg,
+                self.paths.as_ref().map(std::convert::AsRef::as_ref),
+                (assistant.name(), assistant.can_run_actions()),
+            );
             Self::prepare_assistant_prompt_cache(
                 assistant,
                 history,
                 AssistantCacheTrigger::F8,
-                cfg.assistant.prompt_main.clone(),
+                context,
+                instructions,
+                descriptors,
                 focus_info.clone(),
                 cfg.assistant.prefer_vision,
                 None,
@@ -3310,14 +3411,12 @@ impl SessionOrchestrator {
         // speaker, tell the assistant who it is talking to with a one-line
         // identity note. No-op when unmatched.
         //
-        // The note is APPENDED, never prepended. The prompt-state cache pins
-        // `F8System` as `assistant_base_prefix(prompt_main)` (built at startup
-        // from bare `prompt_main`, see `assistant_cache_warmup`), and
-        // `find_longest_prefix` restores it only when it is a genuine token
-        // prefix of the live prompt. Prepending pushed the divergence to
-        // roughly token one, so every speaker-matched turn cold-prefilled the
-        // whole system block. Appending keeps `prompt_main` leading, which is
-        // also how F7 composes its per-app context onto the polish base.
+        // The note travels APART from the system prompt, on
+        // `AssistantContext::speaker_note`, and the backend appends it after
+        // everything steady. The prompt-state cache pins `F8System` as
+        // `assistant_base_prefix(head)` and restores it only when it is a
+        // genuine token prefix of the live prompt, so anything volatile has to
+        // come last — a speaker change must not cost the device list.
         // The user's own tools, when they have any switched on. Built from
         // data already on disk, so this costs no network — including the
         // room names, which have to be in hand *before* the prompt is
@@ -3328,11 +3427,8 @@ impl SessionOrchestrator {
         // switch the light on. So the tools are withheld and the model told.
         let (actions, tools_note) =
             crate::actions::for_backend(actions, assistant.can_run_actions(), assistant.name());
-        let system_prompt = assistant_system_prompt(
-            &cfg.assistant.prompt_main,
-            tools_note.as_deref(),
-            assistant_speaker.as_deref(),
-        );
+        let system_prompt = assistant_prompt_context(tools_note.as_deref());
+        let speaker_note = assistant_speaker_note(assistant_speaker.as_deref());
         let inputs = AssistantTurnInputs {
             pcm,
             sample_rate: self.capture_cfg.target_sample_rate,
@@ -3340,6 +3436,10 @@ impl SessionOrchestrator {
             assistant,
             tts,
             system_prompt,
+            // The behavioural rules go last, behind the tool block — see
+            // `fono_assistant::compose_head`.
+            instructions: Some(cfg.assistant.prompt_main.trim().to_string()),
+            speaker_note,
             speaker: assistant_speaker,
             language: cfg.general.language_override().map(str::to_string),
             action_tx: self.action_tx.clone(),
@@ -3740,11 +3840,14 @@ impl SessionOrchestrator {
     /// window-context checkpoint; cloud backends treat this as a no-op via the
     /// default trait method. Fire-and-forget so the hotkey press path never
     /// blocks on cache work (plan tasks 5–7/9).
+    #[allow(clippy::too_many_arguments)]
     fn prepare_assistant_prompt_cache(
         assistant: Arc<dyn Assistant>,
         history: Vec<fono_assistant::ChatTurn>,
         trigger: AssistantCacheTrigger,
         system_prompt: String,
+        instructions: String,
+        action_descriptors: Vec<serde_json::Value>,
         focus_info: FocusInfo,
         prefer_vision: bool,
         trace: Option<TurnTrace>,
@@ -3752,6 +3855,8 @@ impl SessionOrchestrator {
         let snapshot = AssistantPromptCacheSnapshot {
             trigger,
             system_prompt,
+            action_descriptors,
+            instructions: Some(instructions),
             history,
             active_window_context: assistant_window_context_for_cache(&focus_info),
             prefer_vision,
@@ -6069,39 +6174,95 @@ mod tests {
     }
 
     #[test]
-    fn speaker_note_is_appended_so_prompt_main_stays_a_prefix() {
+    fn speaker_note_is_appended_so_the_warm_head_stays_a_prefix() {
+        use fono_assistant::{compose_head, compose_system_prompt};
         let main = "You are Fono, a helpful voice assistant.";
+        let head =
+            |rooms: Option<&str>| compose_head(&assistant_prompt_context(rooms), None, Some(main));
+        let compose = |rooms: Option<&str>, speaker: Option<&str>| {
+            compose_system_prompt(&head(rooms), assistant_speaker_note(speaker).as_deref())
+        };
 
         // No decoration at all: the live prompt is exactly what the cache pins.
-        assert_eq!(assistant_system_prompt(main, None, None), main);
+        assert_eq!(compose(None, None), main);
 
-        // With a speaker, `prompt_main` must still lead, or the pinned
-        // `F8System` checkpoint stops being a token prefix and every
-        // speaker-matched turn cold-prefills the whole system block.
-        let decorated = assistant_system_prompt(main, None, Some("Bogdan"));
+        // The behavioural rules go last, behind everything about the house.
+        // An instruction a thousand tokens from the generation point is an
+        // instruction a small model forgets — two Romanian commands in a row
+        // were answered in English with `prompt_main` leading.
+        let both = compose(Some("Rooms: Kitchen."), None);
+        assert!(
+            both.find("Rooms: Kitchen.") < both.find(main),
+            "the rules must come after the house: {both:?}"
+        );
+
+        // The speaker note is last of all: it is the most volatile line in the
+        // prompt, so anything steady in front of it survives a change of
+        // speaker.
+        let decorated = compose(None, Some("Bogdan"));
         assert!(
             decorated.starts_with(main),
             "speaker note must be appended, never prepended: {decorated:?}"
         );
         assert!(decorated.contains("The current speaker is Bogdan."));
 
-        // Trailing whitespace in `prompt_main` must not produce a double
-        // blank line, but the prefix relationship still has to hold on the
-        // trimmed base that the warmup path pins.
-        let padded = assistant_system_prompt("Be brief.\n\n", None, Some("Ana"));
+        // Trailing whitespace must not produce a double blank line.
+        let padded = compose_system_prompt(
+            &compose_head("", None, Some("Be brief.\n\n")),
+            assistant_speaker_note(Some("Ana")).as_deref(),
+        );
         assert_eq!(padded, "Be brief.\n\nThe current speaker is Ana.");
 
-        // Room names are appended too, and ahead of the speaker note: they
-        // change only when the house does, so putting them first keeps the
-        // longest possible run of the prompt identical between turns.
-        let both = assistant_system_prompt(main, Some("Rooms: Kitchen."), Some("Ana"));
-        assert!(both.starts_with(main), "{both:?}");
-        assert!(
-            both.find("Rooms: Kitchen.") < both.find("The current speaker"),
-            "the steadier part must come first: {both:?}"
+        // The head the warm path pins must be a byte prefix of every live
+        // prompt built on top of it — with or without a speaker. This is the
+        // invariant that broke twice (F28, F31); a one-byte drift silently
+        // reverts to a cold prefill on every turn.
+        let warm = head(Some("Rooms: Kitchen."));
+        for speaker in [None, Some("Ana"), Some("Bogdan")] {
+            let live = compose_system_prompt(&warm, assistant_speaker_note(speaker).as_deref());
+            assert!(live.starts_with(&warm), "warm head must lead the live prompt: {live:?}");
+        }
+    }
+
+    /// The steady head the warm path pins must carry the user's tools, and the
+    /// tool descriptors must travel with it.
+    ///
+    /// A trace of a small local model showed what happens when they do not: the
+    /// warm pinned 72 tokens of bare greeting in front of a live prompt that
+    /// opened with 1510 tokens of greeting, rooms, devices and tool
+    /// descriptions, and every first command of a conversation paid thirteen
+    /// seconds to re-read a device list that had not changed since boot. The
+    /// cache reported a hit throughout, because 72 tokens of it did match.
+    #[test]
+    fn warmup_carries_the_head_and_the_tools() {
+        let mut c = Config::default();
+        c.assistant.prompt_main = "You are Fono.".into();
+
+        // No `Paths`, so no tools: there is nothing to say about the house and
+        // nothing to describe. The behavioural rules travel apart, so they are
+        // still warmed — just not as part of the context block.
+        let bare = assistant_cache_warmup(&c, None, ("stub", true));
+        assert_eq!(bare.f8_system_prompt.as_deref(), Some(""));
+        assert_eq!(bare.f8_instructions.as_deref(), Some("You are Fono."));
+        assert!(bare.f8_action_descriptors.is_empty());
+
+        // A backend that cannot invoke tools is told so instead, and the warm
+        // must pin *that* head — warming the other one pins a checkpoint that
+        // is not a prefix of anything the reply path ever sends.
+        let mute = assistant_cache_warmup(&c, None, ("stub", false));
+        assert_eq!(mute.f8_instructions.as_deref(), Some("You are Fono."));
+        assert!(mute.f8_action_descriptors.is_empty());
+
+        // With rooms, the head grows and the house comes before the rules —
+        // the pinned checkpoint is only restorable while it is a genuine
+        // prefix, and the rules are what the model must read last.
+        let head = fono_assistant::compose_head(
+            &assistant_prompt_context(Some("Rooms: Kitchen.")),
+            None,
+            Some(&c.assistant.prompt_main),
         );
-        // And with rooms alone, the base still leads.
-        assert!(assistant_system_prompt(main, Some("Rooms: Kitchen."), None).starts_with(main));
+        assert!(head.starts_with("Rooms: Kitchen."));
+        assert!(head.ends_with("You are Fono."));
     }
 
     #[test]

@@ -37,6 +37,25 @@ const CLOSE: &str = "</tool_call>";
 /// is delayed by this.
 const OPENERS: [&str; 3] = ["<", "{", "```"];
 
+/// The steady head of the system prompt: the caller's context, the tool block,
+/// then how to behave.
+///
+/// The one place the tool block is rendered. The reply path and the cache
+/// warm-up must produce the same bytes or the pinned checkpoint can never be
+/// restored, and two renderings that had to agree by convention have drifted
+/// twice before — each time costing a local model tens of seconds re-reading a
+/// device list that had not changed. Ordering rationale lives on
+/// [`crate::compose_head`].
+#[must_use]
+pub fn head_with_tools(
+    context: &str,
+    descriptors: &[Value],
+    instructions_suffix: Option<&str>,
+) -> String {
+    let tools = (!descriptors.is_empty()).then(|| instructions(descriptors));
+    crate::traits::compose_head(context, tools.as_deref(), instructions_suffix)
+}
+
 /// Renders the tool block appended to the system prompt.
 ///
 /// Kept terse on purpose. Every line here is prefilled on the request path of

@@ -28,6 +28,26 @@ pub struct AssistantPromptCacheWarmup {
     pub f7_system_prompt: Option<String>,
     pub f8_system_prompt: Option<String>,
     pub assistant_tool_prompt: Option<String>,
+    /// The user's own tools, exactly as the reply path will be given them.
+    ///
+    /// A backend that describes tools in the system prompt — the embedded one
+    /// does, because it renders its own chat markers and so never sees the
+    /// model's tool template — must warm the prompt it will actually use. A
+    /// trace of a small local model showed the cost of not doing so: the warm
+    /// pinned 72 tokens of bare greeting while the live prompt opened with 1510
+    /// tokens of greeting, rooms, devices and tool descriptions, so every first
+    /// command of a conversation paid thirteen seconds to read a device list
+    /// that had not changed since boot.
+    ///
+    /// Descriptors travel rather than rendered text so that only one piece of
+    /// code ever renders them. Two renderings that must agree byte for byte
+    /// have drifted twice before, and each time the symptom was a checkpoint
+    /// that could never match.
+    pub f8_action_descriptors: Vec<serde_json::Value>,
+    /// How the assistant should behave, rendered *after* everything else.
+    ///
+    /// See [`compose_head`] for why last.
+    pub f8_instructions: Option<String>,
 }
 
 /// Per-turn cache preparation request captured at hotkey press time, before STT
@@ -37,9 +57,68 @@ pub struct AssistantPromptCacheWarmup {
 pub struct AssistantPromptCacheSnapshot {
     pub trigger: AssistantCacheTrigger,
     pub system_prompt: String,
+    /// The user's tools, as [`AssistantPromptCacheWarmup::f8_action_descriptors`].
+    /// Carried for the same reason: a backend that describes tools in the
+    /// system prompt must warm the prompt it will actually use.
+    pub action_descriptors: Vec<serde_json::Value>,
+    /// How the assistant should behave, as
+    /// [`AssistantPromptCacheWarmup::f8_instructions`].
+    pub instructions: Option<String>,
     pub history: Vec<ChatTurn>,
     pub active_window_context: Option<String>,
     pub prefer_vision: bool,
+}
+
+/// Assemble the steady head, in the order that survives a weak model.
+///
+/// `context` — who the assistant is, the rooms, the device names — then the
+/// tool block, then `instructions`: how to behave. Everything here changes
+/// only when the house does, so the whole string stays checkpointable.
+///
+/// **Why the instructions come last.** A trace of a small local model showed
+/// *"Match the user's language"* sitting roughly fourteen hundred tokens back,
+/// behind seventy-seven device names and twenty-three tool signatures, and
+/// being ignored twice in a row: two Romanian commands, two English replies.
+/// Attention thins with distance, and the machine-readable bulk in the middle
+/// is exactly the kind of text that dilutes it. Moving the behavioural rules to
+/// the end costs a capable model nothing and gives a weak one its best chance
+/// of honouring them.
+///
+/// The order also has to be *stable*, not merely good: this is what the prompt
+/// cache pins, so anything volatile — the speaker note — is composed afterwards
+/// by [`compose_system_prompt`], never woven in here.
+#[must_use]
+pub fn compose_head(context: &str, tool_block: Option<&str>, instructions: Option<&str>) -> String {
+    let mut parts = std::iter::once(context)
+        .chain(tool_block)
+        .chain(instructions)
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let Some(first) = parts.next() else { return String::new() };
+    let mut out = first.to_string();
+    for p in parts {
+        out.push_str("\n\n");
+        out.push_str(p);
+    }
+    out
+}
+
+/// Compose the system block a backend will actually send: the steady head
+/// first, the volatile speaker note last.
+///
+/// The head — greeting, rooms, devices, tool descriptions — changes only when
+/// the house does, so a backend that checkpoints its prompt can keep it for
+/// days. The speaker note changes from one turn to the next. Putting the note
+/// last is what lets a change of speaker cost a handful of tokens instead of
+/// throwing away nine hundred tokens of perfectly good device list.
+#[must_use]
+pub fn compose_system_prompt(head: &str, speaker_note: Option<&str>) -> String {
+    speaker_note.map(str::trim).filter(|n| !n.is_empty()).map_or_else(
+        // Leave the head byte-identical to what the cache pinned — trailing
+        // whitespace and all — when there is nothing to add.
+        || head.to_string(),
+        |note| format!("{}\n\n{note}", head.trim_end()),
+    )
 }
 
 /// One token delta yielded by [`Assistant::reply_stream`]. Most
@@ -159,6 +238,24 @@ impl std::fmt::Debug for ActionTools {
 #[derive(Clone, Default)]
 pub struct AssistantContext {
     pub system_prompt: String,
+    /// Who Fono believes it is talking to, when voice verification matched.
+    ///
+    /// Carried apart from [`system_prompt`] because it is the most volatile
+    /// thing in the prompt — it appears, disappears and changes identity from
+    /// one turn to the next — while everything around it (the greeting, the
+    /// rooms, the devices, the tool descriptions) changes only when the house
+    /// does. A backend that caches its prompt must put the steady part first
+    /// and this last, or a change of speaker throws away nine hundred tokens
+    /// of device list that was perfectly good.
+    pub speaker_note: Option<String>,
+    /// How the assistant should behave — reply length, plain prose, match the
+    /// user's language.
+    ///
+    /// Carried apart from [`system_prompt`](Self::system_prompt) so it can be
+    /// rendered *after* the tool block. See [`compose_head`] for why last; a
+    /// backend that does not describe tools in the prompt gets the same order
+    /// for free through [`system_block`](Self::system_block).
+    pub instructions: Option<String>,
     pub language: Option<String>,
     pub history: Vec<ChatTurn>,
     /// Short, runtime-only description of the window active when the assistant
@@ -192,10 +289,28 @@ pub struct AssistantContext {
     pub allow_brain_capture: bool,
 }
 
+impl AssistantContext {
+    /// The system block to send: the steady head, then the speaker note.
+    ///
+    /// Backends that pass the system prompt straight through should use this
+    /// rather than [`system_prompt`](Self::system_prompt), so the behavioural
+    /// rules land after the context and the volatile speaker note lands last.
+    /// A backend that appends more steady material of its own — the embedded
+    /// one describes the user's tools in the system prompt — must build the
+    /// head with [`compose_head`] and call [`compose_system_prompt`] itself.
+    #[must_use]
+    pub fn system_block(&self) -> String {
+        let head = compose_head(&self.system_prompt, None, self.instructions.as_deref());
+        compose_system_prompt(&head, self.speaker_note.as_deref())
+    }
+}
+
 impl std::fmt::Debug for AssistantContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AssistantContext")
             .field("system_prompt", &self.system_prompt)
+            .field("speaker_note", &self.speaker_note)
+            .field("instructions", &self.instructions)
             .field("language", &self.language)
             .field("history", &self.history)
             .field("active_window_context", &self.active_window_context)

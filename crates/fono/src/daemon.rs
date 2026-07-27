@@ -4122,7 +4122,7 @@ fn web_settings_hooks(
     let speak = speech_hook(config_path.clone(), secrets_path.clone(), paths.voices_dir());
     let meta = meta_hook(config_path, secrets_path, paths.polish_models_dir());
     let doctor = doctor_hook(paths);
-    let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths);
+    let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths, orchestrator);
     let probe_llm = probe_llm_hook(paths);
     let (list_dictation, list_threads, get_thread, delete_history) = history_hooks(paths);
 
@@ -4427,6 +4427,7 @@ fn set_secret_hook(
 /// rather than pretending they were never there. Only `discover` reaches out.
 fn tool_catalog_hooks(
     paths: &Paths,
+    orchestrator: Option<&Arc<SessionOrchestrator>>,
 ) -> (
     fono_net::web_settings::ListToolsFn,
     fono_net::web_settings::SetToolEnabledFn,
@@ -4472,6 +4473,7 @@ fn tool_catalog_hooks(
     });
 
     let db = paths.tool_catalog_db();
+    let toggle_orch = orchestrator.map(Arc::clone);
     let set_tool_enabled: fono_net::web_settings::SetToolEnabledFn =
         Arc::new(move |source, name, enabled| {
             let store =
@@ -4481,10 +4483,18 @@ fn tool_catalog_hooks(
                 "web settings: tool {source}/{name} {} via browser UI",
                 if enabled { "enabled" } else { "disabled" }
             );
+            // The enabled set is part of the prompt the assistant reads before
+            // it can answer anything, so a toggle invalidates the warm copy.
+            // Re-warm now rather than leaving the cost to whoever speaks next —
+            // which, having just flipped a switch in the browser, is very
+            // likely the same person about to test it.
+            if let Some(orch) = &toggle_orch {
+                orch.rewarm_assistant_head();
+            }
             Ok(())
         });
 
-    let discover_tools = discover_tools_hook(paths);
+    let discover_tools = discover_tools_hook(paths, orchestrator);
     (list_tools, set_tool_enabled, discover_tools)
 }
 
@@ -4496,16 +4506,21 @@ fn tool_catalog_hooks(
 /// others still reconcile. Reconcile never deletes and never resets the
 /// user's choices, so a server that is down simply has its tools marked
 /// unavailable until it returns.
-fn discover_tools_hook(paths: &Paths) -> fono_net::web_settings::DiscoverToolsFn {
+fn discover_tools_hook(
+    paths: &Paths,
+    orchestrator: Option<&Arc<SessionOrchestrator>>,
+) -> fono_net::web_settings::DiscoverToolsFn {
     use fono_core::tool_catalog::ToolCatalogStore;
 
     let db = paths.tool_catalog_db();
     let config_path = paths.config_file();
     let secrets_path = paths.secrets_file();
+    let orch = orchestrator.map(Arc::clone);
     Arc::new(move |probe| {
         let db = db.clone();
         let config_path = config_path.clone();
         let secrets_path = secrets_path.clone();
+        let orch = orch.clone();
         Box::pin(async move {
             let secrets = Secrets::load(&secrets_path).unwrap_or_default();
 
@@ -4591,6 +4606,13 @@ fn discover_tools_hook(paths: &Paths) -> fono_net::web_settings::DiscoverToolsFn
                 if let Err(e) = cfg.save(&config_path) {
                     warn!("tool discovery: could not switch tool use on: {e}");
                 }
+            }
+            // Discovery is the biggest thing that can move the prompt: new
+            // tools, new rooms, new device names, all of which the assistant
+            // reads before it can answer. Re-warm so the first command after
+            // connecting a house does not pay for the whole catalogue.
+            if let Some(orch) = &orch {
+                orch.rewarm_assistant_head();
             }
             Ok(serde_json::json!({ "servers": summaries }))
         })
@@ -6055,7 +6077,7 @@ mod tests {
             s.save(&paths.secrets_file()).unwrap();
         }
 
-        let (list, set_enabled, discover) = tool_catalog_hooks(&paths);
+        let (list, set_enabled, discover) = tool_catalog_hooks(&paths, None);
 
         // Probe mode first: a server can be tried before it is saved, and a
         // probe must never leave anything behind. This is the "Test" button.

@@ -1,7 +1,13 @@
 # Voice-Triggered Actions — v4 (architecture-first)
 
 **Date:** 2026-07-26
-**Status:** draft, awaiting sign-off.
+**Revised:** 2026-07-27 — F25–F27 added from a cloud-backend trace; §8, §9,
+§13 and §15 changed as a result. F28–F30 added from a local-backend
+(`gemma-4-e2b`) trace: the wording pass was cold-prefilling every tool turn.
+**Status:** signed off. Phases 0, 0.5, 1 and 4b are **complete**; Phase 3 is
+substantially complete (the §7 ladder ships, including partial-outcome
+reporting) but still owes no-op detection (§7.2) and a permanent home for the
+live house test (§12.1); Phases 2, 4, 5 and 6 are open.
 **Supersedes:** `plans/2026-07-25-voice-actions-v3.md` decisions **D3** and
 **D5**. Everything else in v3 (D1, D2, D4, D6–D8, and the crate/phase
 skeleton) is **inherited unchanged** and not restated here — read v3 first.
@@ -154,6 +160,190 @@ partially working — only 531 of ~2 900 catalogue tokens were evaluated —
 so the remaining win is in making the *uncached tail* (system prompt +
 decoration + user text) small and stable, which is exactly the prefix
 discipline the D2 fix established.
+
+**F25 — the cloud path has a different bottleneck, and "end to end" was the
+wrong metric.** One real assistant trace (`gpt-5.4-mini` over
+`api.openai.com`, one Romanian light command), instrumented with the new
+`actions` trace lane (`tool.execute` / `tool.verify`,
+`crates/fono-core/src/turn_trace.rs`, `crates/fono/src/actions/mod.rs`) which
+exists because the entire tool round trip was previously **invisible** — an
+unexplained gap between two `llm` slices:
+
+| stage | cost |
+|---|---|
+| STT | 1.07 s |
+| **model decides the call** | **10.78 s** |
+| tool executes (MCP round trip) | 0.59 s |
+| model phrases the reply | 0.67 s |
+| TTS | 0.58 s |
+| playback | 2.87 s |
+
+Two corrections follow. (a) **Prefill is not the cloud bottleneck.** The
+second request carried the same prefix *plus* the whole tool result — a longer
+prompt — and completed in 0.67 s. F24's prefill finding is real but
+**local-only**; §6 and the payload trim are local levers and must be scoped as
+such. (b) **The metric was wrong.** What the user waits for is not the turn:
+for a command it is *stop speaking → the device moves* = **12.44 s**, of which
+the model is **87 %**; playback and verification both fall *after* it and cost
+the user nothing. For a query it is *stop speaking → the answer is audible* =
+13.70 s. §13 now states both.
+
+**F26 — a stored reply cannot be honest, which removes a whole planned
+distinction.** A replayed shortcut was going to speak the sentence the model
+produced when the phrase was learned, and this fails on the exact bug that
+prompted the revision: the office command *partly* succeeded (air conditioning
+in `success`, the wanted lamp in `failed`). A stored "I turned on the office
+light" would be replayed over every future partial failure. Dropping stored
+replies costs **nothing on the F25 command metric** — the phrasing call happens
+after the device has already moved — and it deletes the need to classify tools
+as commands vs queries at all (§8). One path: a shortcut caches *which tool
+with which arguments*, never data, never wording.
+
+**F27 — the GBNF grammars §6 specifies were never built, and the runtime
+supports them.** `LlamaSampler::grammar_lazy` is present in the pinned
+`llama-cpp-2` 0.1.150 (`sampling.rs:329`) — no new dependency, no binary
+growth. Nothing in the workspace passes a grammar; the local path instead asks
+for `<tool_call>{…}</tool_call>` in the prompt and parses forgivingly
+(`crates/fono-assistant/src/local_tools.rs:101`, `:114`), whose own test
+comments record the cost: *"the shapes models actually produce when they drift.
+Each of these was a light that would otherwise have been read out loud instead
+of switched."* Lazy triggering is what makes this shippable — prose generates
+unconstrained and the grammar engages only once the model commits to a call, so
+ordinary conversation is untouched. **Scope limit: constrain shape, not
+values** — see the §14 risk.
+
+**F28 — the wording pass on the local backend cold-prefilled every tool turn,
+and the fix was two lines.** Measured on `gemma-4-e2b`, trace
+`assistant-1785177665-0005.json`: STT 6.82 s, first model pass 2.0 s (prefill 0.3
+s — a 1041-token checkpoint matched), tool 0.11 s, then the second pass spent
+**21.65 s** re-reading 974 tokens plus 3.67 s of suffix, for 37.6 s total on one
+light. Two independent causes, both in `crates/fono-assistant/src/llama_local.rs`:
+
+1. The continuation re-serialised the parsed call as tidy JSON
+   (`{"name": …, "arguments": …}`) while the completed-turn checkpoint was saved
+   under the model's *raw* reply (`<tool_call>…</tool_call>`), so the checkpoint
+   was not a token prefix of the very next prompt and could never match.
+2. The second pass offered the **system** prefix to the cache, and
+   `PromptStateCache::find_longest_prefix` only considers entries *shorter* than
+   the prefix it is given (`crates/fono-core/src/prompt_cache.rs:354`). The
+   1096-token checkpoint was therefore invisible — and worse, inserting it had
+   pruned the 1041-token entry that used to match (subsumption,
+   `prompt_cache.rs:264`), leaving the 72-token pinned system prompt as the only
+   restorable state.
+
+Fixed by continuing from the reply as written and offering *this turn's completed
+exchange* as the cached prefix, which makes the checkpoint an exact-key hit.
+Pinned by `the_wording_pass_starts_where_the_finished_turn_was_saved`. The
+generalisable lesson for Phase 2: **a checkpoint is only reusable if the next
+prompt is rendered by the same code path that saved it**, and offering a shallow
+prefix can *hide* a deeper one. Also exposes a latent trap worth fixing if it
+recurs — pruning a shallower entry is only safe while the deeper entry actually
+matches.
+
+**F29 — a failed command left no evidence.** The same trace shows
+`tool.execute` with `server_error: true` and nothing else: no arguments, no
+server message. The model's spoken excuse (*"it is not a supported device
+type"*) was the only clue, and it is the least trustworthy witness available.
+`tool.execute` now records the arguments and the server's own words (capped at
+300 characters), and refusals are logged at `warn`. Diagnosis before
+optimisation: Phase 5 cannot promote what it cannot explain.
+
+**F30 — the static head was read from scratch once per conversation, and the
+first turn of a conversation was never checkpointed at all.** Two traces on
+`gemma-4-e2b` taken a minute apart, after the F28 fix landed:
+
+- `assistant-1785178455-0002.json` (cold, command refused) — pass 1 prefilled
+  **894 tokens in 13.22 s**, pass 2 prefilled **958 tokens in 23.79 s**; 60.8 s
+  total. `cold_prefills: 0` and `cache_hits: 2` in the summary, because both
+  passes "matched" the **72-token** `f8_system` pin the daemon warms at startup
+  and called it a hit.
+- `assistant-1785178534-0003.json` (warm, command succeeded) — pass 2 matched a
+  1065-token `f8_chat_prefix` checkpoint and prefilled **0.042 s** (F28 confirmed
+  fixed in the field), but pass 1 still prefilled **944 tokens in 16.51 s**;
+  28.4 s total.
+
+Two distinct defects, both in `crates/fono-assistant/src/llama_local.rs`:
+
+1. **The head was never checkpointed after being read.** The static head —
+   system prompt + rooms + devices + tool catalogue, 966 tokens — costs ~13 s to
+   read and was then discarded. The only pinned entry was the bare 72-token
+   system prompt, pinned at daemon startup *before* the device list and the tool
+   catalogue exist. Fix: when a turn pays to prefill its prefix and that prefix
+   is the static head (empty history), checkpoint it and **pin** it under
+   `F8System`, replacing the useless 72-token pin. The price is then paid once
+   per system prompt instead of once per conversation. Carried by
+   `GenParams::pin_prefix`, false for the wording pass (whose prefix contains
+   that turn's own words and must never displace the head pin).
+2. **The first turn of a conversation stored no completed-turn checkpoint.** The
+   store was gated on non-empty history, to stop a `fono.summarize` checkpoint
+   from pruning the shared prefix. That gate also removed the checkpoint the
+   wording pass needs seconds later — which is exactly the 23.79 s in the cold
+   trace, and why the warm trace (turn 2, history non-empty) paid 0.042 s for the
+   same step. The gate's original justification is void now that the head is
+   pinned: `prune_dominated_by` skips pinned entries
+   (`crates/fono-core/src/prompt_cache.rs:275`). Fix: store on every turn.
+
+Lesson for Phase 2, and the reason `cold_prefills: 0` must never again be read
+as "the cache is working": **the metric that matters is decoded prefix tokens,
+not hit count.** A hit on a 72-token pin ahead of a 966-token prefix is a cold
+prefill wearing a hit's clothing. Phase 2's warm-path assertion should count
+`decoded_prefix_tokens`, not `cold_prefills`.
+
+**F31 — a turn that calls a tool poisons its own checkpoint for the next turn,
+and the head fix did not reach turn two.** Two more `gemma-4-e2b` traces, taken
+a minute apart, with F30 already landed:
+
+- `assistant-1785180569-0002.json` — pass 1 prefilled **1562 tokens in 28.6 s**;
+  47.3 s total. The command was refused by Home Assistant.
+- `assistant-1785180630-0003.json` — the *next* turn in the same conversation,
+  whose prompt is an **exact character prefix** of nothing less than the
+  previous prompt plus one reply. It still prefilled **1599 tokens in 37.6 s**;
+  47.5 s total. Both summaries again said `cold_prefills: 0`, both matching only
+  the 72-token pin.
+
+The second one is the interesting one: everything the turn needed had been read
+and checkpointed one minute earlier, and none of it could be used. Two causes,
+compounding, both now fixed in `crates/fono-assistant/src/llama_local.rs` and
+`crates/fono-core/src/prompt_cache.rs`:
+
+1. **A completed-turn checkpoint is unusable by the next turn whenever a tool
+   was called.** It covers prompt + tool call + tool result + reply, but the
+   next turn's history keeps only the *spoken reply* — the call and the result
+   are never rendered again. So the checkpoint diverges mid-sequence and can
+   never win a prefix match, however deep it is. In trace 0002 the survivors
+   were a 1742-token completed-turn entry (divergent) and the 72-token pin.
+2. **The prefix a turn reads was pruned inside that same turn.** F30 stored it,
+   but under `F8ChatPrefix` — the same layer as the completed-turn checkpoint,
+   which is a strict superset of it, so `prune_dominated_by` dropped it seconds
+   later. Visible as the `llm.prompt_cache_pruned` at 37.383 in trace 0002. The
+   fix that would have saved 1599 tokens deleted itself.
+
+Fix: store the read prefix under a **new `HistoryPrefix` layer** so it is out of
+the chat layer's pruning fight, and add that layer to the lookup set. It is the
+one checkpoint guaranteed to be a genuine prefix of the next turn, because it
+contains nothing of this turn's own output. The layer still self-prunes across
+turns, so it holds one entry, not one per turn.
+
+Generalised lesson, and a rule for Phase 2: **a checkpoint is only worth storing
+if what follows it in the next prompt is an append.** Anything a turn emits that
+history will later drop — tool calls, tool results, preambles — makes every
+checkpoint taken after it dead weight. Checkpoint *before* the divergence, not
+after.
+
+**F32 — a `null` argument made Home Assistant refuse the command, twice.** Same
+trace 0002, now legible thanks to F29's instrumentation:
+`HassTurnOff {"area": "Kitchen", "domain": ["light"], "floor": null, "name":
+"Kitchen lights"}` → `Input validation error: None is not of type 'string'`.
+The model filled in every field the tool advertises, two of them with
+placeholders. Nothing was broken and the command was one `null` away from
+working; the user repeated themselves and the model apologised each time.
+
+Fix: drop `null`, empty-string and empty-list arguments before the call leaves
+Fono (`crates/fono/src/actions/mod.rs`). A key the caller did not mean to set and
+a key it left blank are the same request. This never changes what was asked for
+— it stops us asking for it badly. Note this is a *shape* error of exactly the
+kind F27's grammar work would prevent at the source, and is more evidence for
+scoping that to shape rather than values.
 
 ---
 
@@ -409,7 +599,14 @@ Three rules follow, and they are the honest part:
 - **No-op must be distinguished from success.** "Turn on" a light that
   is already on yields no state change: it is *not* a failure, but it is
   *not evidence* that targeting was correct, so it must not count toward
-  promotion (§8).
+  promotion (§8). **Still owed — and it gates Phase 5.** `confirms`
+  deliberately returns `Confirmed` for an already-correct state
+  (`crates/fono/src/actions/vendor.rs:189-210`), which is right for *wording*
+  (the user asked for a state and it holds) and wrong as *promotion
+  evidence*. The two uses must be separated before anything can be promoted.
+  Cheapest shape: read the pre-state only when a phrase is already a
+  promotion candidate, so the extra round trip is paid once per phrase
+  learned rather than on every command.
 - Failures must surface the *reason* to the user, not a generic error.
   The model diagnosed F17 better than our code would have; a
   target-not-found error should say so and offer the real names.
@@ -445,6 +642,21 @@ is measured as a real annoyance, the minimal fix is **one** flag to skip
 the reply for verified state-changing actions — one boolean, not three
 modes and a rule. Not before.
 
+**Reaffirmed 2026-07-27, and extended to Tier 0 replay.** A stored reply —
+replaying the sentence the model produced when a shortcut was learned — was
+considered and **rejected on correctness, not cost** (F26). It would speak a
+success sentence over a later partial failure, which is the failure this plan
+exists to prevent. Two consequences:
+
+- **A replay is phrased by the model, from the real result**, exactly as a
+  novel command is. Costs nothing the user waits for (F25: the device has
+  already moved), and a partial failure narrates itself with no special case.
+- **There is therefore no command/query distinction anywhere in the design.**
+  An earlier revision split tools into "commands, replay the stored sentence"
+  and "queries, must be fresh"; that split existed *only* to decide when a
+  stored sentence was safe, and dies with it. Shortcuts cache **routing**
+  (which tool, which arguments). Never data, never wording.
+
 ---
 
 ## 9. A5 — Promotion gated on verification (refines v3 D4)
@@ -461,6 +673,29 @@ for `Dangerous`) is kept **and tightened**:
   tool becomes `available = 0` / `enabled = 0` (§5).
 - Tier 0 replay still executes the *real* tool call and still verifies.
   Replay skips the *decision*, never the *verification*.
+- **A replay that fails verification hands the turn to the model rather than
+  the user.** The failed result is already a sentence the model can act on
+  (`crates/fono/src/actions/mod.rs:282-285`), so the fallback is the ordinary
+  path with one tool result already in history — no new mechanism. Three
+  constraints:
+  - **Tools are offered again exactly once**, and only after a *replay*. The
+    second turn is deliberately tool-less so a model cannot chain actions
+    (`crates/fono-assistant/src/openai_compat_chat.rs:603-608`); this is a
+    narrow exception to that rule, not its removal.
+  - **Only when the intent is an absolute end state.** Re-running "turn the
+    light on" is harmless; re-running "raise the temperature by two degrees"
+    is four degrees. Today this holds by accident — verification only exists
+    where `desired_state` is `Some` (`crates/fono/src/actions/vendor.rs:218-224`),
+    which is absolute by construction — so it is written down here as a rule
+    before a vendor with relative commands arrives. Relative intents get the
+    honest failure sentence instead.
+  - **Execution failure falls through unconditionally.** If the server was
+    unreachable or nothing was touched, no effect happened, so there is
+    nothing to double.
+
+  Cost when it fires: ~13.0 s to the device moving, against 12.44 s with no
+  shortcut at all (F25) — ~0.6 s worse, once, because the same failure demotes
+  the shortcut (§9.1). The user never has to repeat themselves.
 
 ### 9.1 Demotion — a shortcut is a standing hypothesis, not a fact
 
@@ -558,7 +793,13 @@ ordering below reflects that latency architecture now precedes breadth.
   model involvement.
 - **Phase 2 — prepay + cache contract** (§6). Layered prefix, background
   warm on the four triggers, `fono doctor` pin visibility, assert zero
-  cold prefill on warm turns.
+  cold prefill on warm turns. **Scoped local-only by F25** — a cloud
+  backend's prefix is already effectively cached, so this buys nothing
+  there. Add one adjacent local lever while here: **trim the tool-result
+  payload** to what a reply needs, since the whole house dump is re-prefilled
+  on the second turn (`brief()` currently passes 2000 chars through
+  verbatim, `crates/fono/src/actions/mod.rs:332-342`). Correctness benefit
+  too — less irrelevant JSON is less to misread.
 - **Phase 3 — execution verification** (§7). Strategy ladder, no-op
   detection, real error surfacing. Re-run the F16 live test: the RO rows
   must fail *loudly* with the real reason.
@@ -570,6 +811,11 @@ ordering below reflects that latency architecture now precedes breadth.
   the decision turn: prune the catalogue (§5) and keep the uncached tail
   small and prefix-stable (§6). Output-count capping via JSON-schema /
   GBNF (F20) comes last — it addresses the smaller half. Target 1–2 s.
+  **Grammar scope, per F27:** use `grammar_lazy` triggered on `<tool_call>`
+  so prose is unconstrained, and constrain **shape only** — JSON validity,
+  the enabled tool names as literals, required arguments present. This
+  removes the drift class the `local_tools` tests enumerate. Do **not**
+  constrain argument *values* without measuring first (§14).
 - **Phase 4b — prepaid target-name resolution** (F23, §6). Inject the
   real area/target names into the warmed prefix. Measured: RO 0/2 → 2/2
   live, ~30 tokens, no per-request cost. Highest accuracy-per-token in
@@ -577,7 +823,15 @@ ordering below reflects that latency architecture now precedes breadth.
 - **Phase 5 — Tier 0 replay, with demotion** (§9, §9.1). Verified
   promotion, continuous re-verification on replay, immediate demotion on
   verified failure, structural invalidation. Target ~200 ms on the third
-  utterance.
+  utterance. **Depends on Phase 3's no-op detection** (§7.2) — a light that
+  was already on must not count as promotion evidence — so that lands first.
+  Sliced so each step is testable with no model involvement: (0) no-op
+  detection; (1) shortcut store, additive tables in the existing
+  `tools.sqlite`, no new database and no new dependency; (2) learning —
+  phrase → (tool, arguments, verified outcome); (3) replay — normalise,
+  look up, execute, verify, let the model phrase it; (4) demotion and the
+  §9 fallthrough; (5) the §11 config keys, which were never added; (6) the
+  UI (§15 Q3).
 - **Phase 6 — Tier 1 specialist bake-off** (§10). FunctionGemma-class
   candidates behind the A6 boundary, adapter included. The §1 matrix is
   already reasoning-off (F21) and stands as the shortlist baseline.
@@ -601,7 +855,8 @@ Three things, run at every phase boundary. Two of them already exist.
    it did not work**. It is the only check that covers the whole chain,
    and it already forces a known pre-state so a command that changes
    nothing cannot score a false pass. **Phase 3 owes it a permanent home
-   under `tests/`** so it stops being a personal artefact.
+   under `tests/`** so it stops being a personal artefact — still outstanding,
+   and `tmp/` being pruned would lose it outright.
 3. **Say one command out loud.** Everything else bypasses STT. Thirty
    seconds, and it is the only check that the *user's* path works.
 
@@ -626,8 +881,22 @@ Beyond that: write the tests the code needs. That is not a policy.
 
 ## 13. Verification criteria
 
-- **Tier 0**: repeated verified command ≤ **300 ms** end to end, zero
-  model calls, still verified.
+**How latency is measured (F25).** Two numbers, both from the moment the user
+stops speaking — not from turn start, and not to turn end:
+
+- **Command latency** — stop speaking → **the device moves**. Verification,
+  reply generation, TTS and playback all happen *after* this and are excluded.
+  Baseline 12.44 s.
+- **Query latency** — stop speaking → **the answer is audible** (playback
+  starts). Baseline 13.70 s.
+
+Every target below is one of these two. "End to end" is not used again: it
+flattered playback into the budget and hid that the model is 87 % of what the
+user actually waits for.
+
+- **Tier 0**: repeated verified command ≤ **2 s** command latency, zero
+  model calls before the device moves, still verified. (The old ≤ 300 ms
+  "end to end" figure was never achievable — STT alone is 1.07 s.)
 - **Tier 1**: novel command p50 ≤ **2.5 s** on CPU, laptop-class RAM.
 - **Cache**: zero `prompt_cache_cold_prefill` on any warm turn; first
   post-start turn pays no catalogue prefill (§6).
@@ -641,6 +910,10 @@ Beyond that: write the tests the code needs. That is not a policy.
   verified runs, with both transitions visible in the trace (§9.1).
 - **Verification**: a call that changes nothing is reported as a failure
   with its real reason, and is never promoted (F18).
+- **Fallthrough**: a replay that fails verification finishes the job in the
+  same turn without the user speaking again, and demotes the shortcut (§9).
+- **Honesty**: a partially-successful command names the devices that did not
+  respond, on the replay path as well as the novel path (F26).
 - **Memory**: peak RSS within laptop budget for the shipped default
   tier.
 - **Size**: `./tests/check.sh --size-budget` green — no new dependency
@@ -657,6 +930,15 @@ Beyond that: write the tests the code needs. That is not a policy.
 - **Constrained decoding fights the chat template.** GBNF plus `--jinja`
   tool syntax may conflict per model family. Mitigation: Tier 1 is
   optional per A6; Tier 2 always works.
+- **A value-constrained grammar turns a clean failure into a confident wrong
+  action.** Enumerating the real area names in the grammar would make F17's
+  `area: "bucătărie"` unemittable — but the model must then pick *some*
+  allowed literal, and picking the wrong room switches a real light in it.
+  Today an unknown room matches nothing and Fono says so, which is the better
+  failure. Mitigation: constrain **shape** only (F27); treat value enumeration
+  as a separate, measured decision, and keep the §6 prepaid name list — which
+  *informs* the model without removing its ability to decline — as the
+  preferred fix for the same problem (F23, already 2/2 on the real house).
 - **PostCondition unavailable** for many third-party tools. Mitigation:
   the ladder degrades explicitly, and promotion simply never happens for
   unverifiable tools — correct, if slower.
@@ -681,15 +963,37 @@ Beyond that: write the tests the code needs. That is not a policy.
    reasoning-off plus a smaller token count, not cheaper tokens.
 2. `PostCondition` for HA: read back via `GetLiveContext` (simple, ~100 ms,
    coarse) or a narrower state read? Prefer narrower if MCP exposes one.
-3. Do we expose Tier 0 shortcuts in the UI as editable rows, or keep them
-   invisible learned state with a "forget" button?
+3. ~~Do we expose Tier 0 shortcuts in the UI as editable rows, or keep them
+   invisible learned state with a "forget" button?~~ **Answered
+   2026-07-27: visible, on a new `#/actions` route.** Learned behaviour that
+   fires real-world devices is not hidden. The route carries the retrieved
+   tool list *and* the shortcut rows, including **actions that have worked
+   only once and are not yet on the fast path** — each showing last run, who
+   said it (speaker identification is already in the pipeline), the
+   `tool.execute` / `tool.verify` timings (F25), and verification strength.
+   Many phrases may point at one action (different word order, different
+   languages) and **user-authored phrases are allowed**, marked as such and
+   still executed and verified like any other — a hand-written phrase is not
+   trusted more than a learned one. "Tools & actions" in settings keeps the
+   servers, the enabled/disabled counts, and a link here.
+   Editing is limited to adding phrases and forgetting rows; the
+   phrase→action mapping itself is earned by verification, not authored,
+   or the verification gate means nothing.
 4. Does disabling reasoning cost accuracy on genuinely ambiguous
    multi-step requests? F19 shows no loss on simple commands. If a loss
    appears, reasoning becomes a **Tier 2-only escalation** — off by
    default, enabled only after a Tier 1 failure. Never on by default.
-5. How is a readback tool matched to an action tool at discovery time
-   (§7.1)? Naming heuristics (`get_*`/`list_*`/`*Context`) are cheap but
-   fuzzy; an explicit per-server mapping is exact but does not scale to
-   unknown servers. Likely answer: heuristic default, with the
-   classification stored as data so a wrong guess is one row to correct
-   rather than a code change.
+5. ~~How is a readback tool matched to an action tool at discovery time
+   (§7.1)?~~ **Answered: naming heuristic, with the result stored as data** —
+   shipped as `pick_readback_tool` / `classify`
+   (`crates/fono-core/src/tool_catalog.rs:577`, `:601`). An explicit
+   per-server mapping would be exact but does not scale to unknown servers;
+   storing the guess means a wrong one is a row to correct rather than a code
+   change, which is what makes the fuzzy default acceptable.
+6. **Promotion on servers we cannot verify.** `for_result` knows one vendor
+   (`crates/fono/src/actions/vendor.rs:108-117`); everything else is
+   `Unknown`, which by design claims nothing — so on a non-Home-Assistant
+   server *nothing would ever be promoted*. Either promote on weaker evidence
+   ("no error, N runs") or promote routing only and label those rows
+   unverified in the UI. Leaning to the second: it keeps the honesty ladder
+   intact, and a fast wrong answer is what this plan buys insurance against.

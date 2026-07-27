@@ -151,6 +151,8 @@ mod realtime_live {
         let ctx = AssistantContext {
             system_prompt: "You are Fono, a concise spoken assistant. Keep replies short."
                 .to_string(),
+            instructions: None,
+            speaker_note: None,
             language: None,
             history: ConversationHistory::default().snapshot(),
             active_window_context: None,

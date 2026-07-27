@@ -53,10 +53,17 @@ const MIN_CTX: u32 = 512;
 struct GenParams {
     /// Cap on generated tokens (already clamped to [`MAX_NEW_TOKENS`]).
     max_new_tokens: i32,
-    /// Empty-history request (e.g. `fono.summarize`): cache only the shared
-    /// system-prompt prefix, never a payload-specific completed-turn
-    /// checkpoint. See [`LlamaLocalAssistant::generate_with_prefix_cache`].
-    one_shot: bool,
+    /// This request's cached prefix is the *static head* — system prompt, room
+    /// and device names, tool catalogue — with no conversation in front of it,
+    /// so it is byte-identical on every later turn and in every later
+    /// conversation. True for a turn with empty history and for the
+    /// `fono.summarize` path; false once a conversation has history, and for
+    /// the wording pass after a tool call.
+    ///
+    /// The prefix is checkpointed either way — see the store site in
+    /// [`Self::generate_with_prefix_cache`] — but only the static head is
+    /// **pinned**, because only it is worth protecting from eviction forever.
+    pin_prefix: bool,
     /// Whether this turn may drive the Glas Cortex tap. Carried from
     /// [`AssistantContext::allow_brain_capture`]; `false` for network turns
     /// so a remote client sharing this backend never lights the local
@@ -400,12 +407,24 @@ impl LlamaLocalAssistant {
             return Ok(None);
         }
         let key = self.prompt_state_cache_key(layer.clone(), prefix, &prefix_tokens)?;
+        // Where the pinned static head lives (see `GenParams::pin_prefix`). It is
+        // asked for by key as well as by prefix search because a repeat of the
+        // *same* head — the first turn of a second conversation — is an
+        // equal-length match, and `find_longest_prefix` deliberately ignores
+        // those: for a whole prompt an equal-length entry leaves nothing to
+        // decode. Here the head is only part of the prompt and the suffix is
+        // known to be non-empty, so the match is both legal and exactly the one
+        // that saves the most time.
+        let head_key = self
+            .prompt_state_cache_key(PromptStateCacheLayer::F8System, prefix, &prefix_tokens)
+            .ok();
         let cached = {
             let mut cache = self
                 .prompt_state_cache
                 .lock()
                 .map_err(|_| anyhow!("llama-local prompt-state cache mutex poisoned"))?;
-            let entry = cache.get(&key);
+            let entry =
+                cache.get(&key).or_else(|| head_key.as_ref().and_then(|head| cache.get(head)));
             current_instant(
                 "llm.prompt_cache_lookup",
                 "cache",
@@ -474,7 +493,11 @@ impl LlamaLocalAssistant {
                     .map_err(|_| anyhow!("llama-local prompt-state cache mutex poisoned"))?;
                 let hit_key = cache.find_longest_prefix(
                     &runtime,
-                    &[PromptStateCacheLayer::F8ChatPrefix, PromptStateCacheLayer::F8System],
+                    &[
+                        PromptStateCacheLayer::F8ChatPrefix,
+                        PromptStateCacheLayer::HistoryPrefix,
+                        PromptStateCacheLayer::F8System,
+                    ],
                     &token_ids(&prefix_tokens),
                 );
                 hit_key.and_then(|hk| cache.get(&hk).map(|entry| (hk, entry)))
@@ -532,36 +555,61 @@ impl LlamaLocalAssistant {
                     "llm.prompt_cache_build_prefill",
                 )?;
             }
-            // Checkpoint the pre-suffix prefix ONLY for one-shot requests on a
-            // fully cold prefill. For a one-shot prompt (empty history: the
-            // `fono.summarize` path — constant system prompt, varying payload)
-            // this shared-prefix entry is the ONLY thing the next request can
-            // reuse: the completed-turn checkpoint below embeds this request's
-            // payload + reply and never prefixes a different payload, and —
-            // worse — because it is a deeper token-superset of this prefix it
-            // would prune this very entry on insert (subsumption). So for
-            // one-shot we store the prefix here and SKIP the completed-turn
-            // checkpoint, leaving the warm system-prompt prefix as the entry
-            // the next summary restores. Without this, every summary
-            // re-prefills the full system prompt.
+            // Checkpoint the prefix whenever we just paid to read it. Measured
+            // on gemma-4-e2b: 966 tokens of system prompt, room and device
+            // names and tool catalogue cost 13.2 s to read, and were then
+            // thrown away — the next conversation paid 16.5 s to read the same
+            // thing again, because the only pinned entry was the 72-token bare
+            // system prompt the daemon warms at startup, before the device list
+            // and the tools exist.
             //
-            // For the F8 chat loop (history grows) we do the opposite: the
-            // completed-turn checkpoint IS a token-prefix of the next turn and
-            // is the superior entry, so storing this shallower prefix would be
-            // pure waste (it gets pruned by the completed-turn insert anyway).
-            // Hence the `one_shot` gate. `F8ChatPrefix` is not pinnable, so a
-            // normal LRU entry — non-users of summarize lose nothing.
-            if params.one_shot && !matched {
-                if let Ok(prefix_state) = copy_context_state(&ctx) {
+            // Stored on EVERY cold read, not only when the prefix is the static
+            // head, and stored under `HistoryPrefix` rather than the chat
+            // layer. Both halves matter, and a later pair of traces showed why:
+            //
+            //  * A turn that calls a tool ends up storing a checkpoint that
+            //    contains the tool call and the tool result. The NEXT turn
+            //    never sees either — history keeps only the spoken reply — so
+            //    that checkpoint diverges and cannot match, however deep it is.
+            //    The prefix read at the start of the turn is the thing the next
+            //    turn actually shares.
+            //  * Pruning is per layer, and drops any shorter same-layer entry
+            //    the new one covers. Filed under the chat layer, this
+            //    checkpoint was pruned by the completed-turn insert seconds
+            //    later, in the same turn, leaving only the 72-token pin again.
+            //    Its own layer keeps it out of that fight.
+            //
+            // Measured cost of not having it: a conversation whose prompt was
+            // an exact prefix of the next turn's still re-read 1599 tokens,
+            // 37.6 s, because the only survivor was a 1742-token checkpoint too
+            // long and too divergent to match.
+            //
+            // Only the static head is PINNED (`params.pin_prefix`): it is the
+            // one entry worth protecting from eviction forever, being identical
+            // in every later conversation.
+            if start < prefix_tokens.len() {
+                let store_key = if params.pin_prefix {
+                    head_key
+                } else {
+                    self.prompt_state_cache_key(
+                        PromptStateCacheLayer::HistoryPrefix,
+                        prefix,
+                        &prefix_tokens,
+                    )
+                    .ok()
+                };
+                if let (Ok(prefix_state), Some(store_key)) = (copy_context_state(&ctx), store_key) {
                     let state_bytes = prefix_state.len();
                     if let Ok(mut cache) = self.prompt_state_cache.lock() {
-                        let report = cache.insert(
-                            key.clone(),
-                            PromptStateCacheEntry::with_tokens(
-                                prefix_state,
-                                token_ids(&prefix_tokens),
-                            ),
+                        let entry = PromptStateCacheEntry::with_tokens(
+                            prefix_state,
+                            token_ids(&prefix_tokens),
                         );
+                        let report = if params.pin_prefix {
+                            cache.insert_pinned(store_key.clone(), entry)
+                        } else {
+                            cache.insert(store_key.clone(), entry)
+                        };
                         record_cache_mutation(&report);
                     }
                     current_instant(
@@ -569,8 +617,9 @@ impl LlamaLocalAssistant {
                         "cache",
                         CACHE_LANE,
                         json!({
-                            "layer": layer.as_str(),
-                            "cache_key": key.stable_id(),
+                            "layer": store_key.layer().as_str(),
+                            "cache_key": store_key.stable_id(),
+                            "pinned": params.pin_prefix,
                             "token_count": prefix_tokens.len(),
                             "state_bytes": state_bytes,
                         }),
@@ -618,12 +667,16 @@ impl LlamaLocalAssistant {
         // (restore sets n_past to the token count, then prefills the new turn
         // into free cells). Cells past the boundary would be stale anyway.
         //
-        // Skipped for one-shot requests (empty history): the completed-turn
-        // checkpoint embeds this request's payload + reply, so it can never
-        // prefix the next (different-payload) summary, and storing it would
-        // prune the shared system-prompt prefix we just checkpointed above
-        // (it is a deeper token-superset). See the `one_shot` rationale there.
-        if !params.one_shot && !generation.tokens.is_empty() {
+        // Stored for every turn, including the first one of a conversation. It
+        // used to be skipped when the history was empty, on the grounds that a
+        // one-shot summary's checkpoint can never prefix the next, different
+        // summary — true, but it also skipped the case that matters most: the
+        // first turn of a conversation, whose checkpoint is needed twice within
+        // a second or two (by the wording pass after a tool call, and by turn
+        // two). A trace paid 23.8 s for that omission. The old objection that
+        // this insert would prune the shared system-prompt prefix no longer
+        // holds either — that prefix is now pinned, and pruning skips pins.
+        if !generation.tokens.is_empty() {
             let mut combined: Vec<llama_cpp_2::token::LlamaToken> =
                 Vec::with_capacity(full_tokens.len() + generation.tokens.len());
             combined.extend_from_slice(&full_tokens);
@@ -1594,7 +1647,17 @@ impl LlamaLocalAssistant {
         // The F8 system base is framed into the chat template so it is a true
         // token prefix of the live F8ChatPrefix prompt (mirrors the F7 base).
         if let Some(system) = warmup.f8_system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
-            let base = assistant_base_prefix(system, model_name);
+            // Warm the head the reply path will actually send — greeting, rooms,
+            // devices and tool descriptions — rendered by the same code, so the
+            // checkpoint is a genuine token prefix of the live prompt. Warming
+            // the bare greeting instead pinned 72 tokens in front of 1510 and
+            // cost thirteen seconds on the first command of every conversation.
+            let head = local_tools::head_with_tools(
+                system,
+                &warmup.f8_action_descriptors,
+                warmup.f8_instructions.as_deref(),
+            );
+            let base = assistant_base_prefix(&head, model_name);
             self.build_prompt_prefix_cache(model, PromptStateCacheLayer::F8System, &base)?;
         }
         if let Some(tools) =
@@ -1624,7 +1687,13 @@ impl LlamaLocalAssistant {
         let guard = self.state.lock().map_err(|_| anyhow!("llama-local mutex poisoned"))?;
         let model = guard.as_ref().ok_or_else(|| anyhow!("llama-local model not loaded"))?;
         let model_name = self.model_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let base = assistant_base_prefix(&snapshot.system_prompt, model_name);
+        // Same head as the reply path — see `build_stable_prompt_caches`.
+        let head = local_tools::head_with_tools(
+            &snapshot.system_prompt,
+            &snapshot.action_descriptors,
+            snapshot.instructions.as_deref(),
+        );
+        let base = assistant_base_prefix(&head, model_name);
         self.build_prompt_prefix_cache(model, PromptStateCacheLayer::F8System, &base)?;
         Ok(())
     }
@@ -2008,20 +2077,32 @@ impl Assistant for LlamaLocalAssistant {
         // its own chat markers and so never sees the GGUF's tool template. The
         // block is *appended*, never prepended, so the pinned system checkpoint
         // stays a genuine token prefix and the turn is not cold-prefilled.
+        //
+        // Order is load-bearing: greeting, rooms, devices, tools — everything
+        // that changes only when the house does — and the speaker note last,
+        // because it changes every turn. Composed here rather than by the
+        // caller so that the head this backend sends is byte-identical to the
+        // head `prewarm_prompt_caches` pinned; two renderings that must agree
+        // have drifted twice before, and each time the symptom was a checkpoint
+        // that could never match.
         let actions = ctx
             .actions
             .clone()
             .filter(|a| !a.descriptors.is_empty())
             .filter(|_| std::env::var_os("FONO_LOCAL_TOOLS_OFF").is_none());
-        let ctx = actions.as_ref().map_or(std::borrow::Cow::Borrowed(ctx), |a| {
+        let head = local_tools::head_with_tools(
+            &ctx.system_prompt,
+            actions.as_ref().map_or(&[][..], |a| &a.descriptors),
+            ctx.instructions.as_deref(),
+        );
+        let composed = crate::compose_system_prompt(&head, ctx.speaker_note.as_deref());
+        let ctx = if composed == ctx.system_prompt {
+            std::borrow::Cow::Borrowed(ctx)
+        } else {
             let mut c = ctx.clone();
-            c.system_prompt = format!(
-                "{}\n\n{}",
-                c.system_prompt.trim_end(),
-                local_tools::instructions(&a.descriptors)
-            );
+            c.system_prompt = composed;
             std::borrow::Cow::Owned(c)
-        });
+        };
         let ctx = ctx.as_ref();
         let prompt = build_prompt(ctx, user_text, model_name);
 
@@ -2049,12 +2130,20 @@ impl Assistant for LlamaLocalAssistant {
             .max_new_tokens
             .and_then(|n| i32::try_from(n).ok())
             .map_or(MAX_NEW_TOKENS, |n| n.clamp(1, MAX_NEW_TOKENS));
-        // One-shot (empty history) requests — the `fono.summarize` path — cache
-        // only the shared system-prompt prefix, not a payload-specific
-        // completed-turn checkpoint (see `generate_with_prefix_cache`).
+        // Pin this request's prefix only when it genuinely IS the static head —
+        // system prompt, rooms, devices, tool catalogue and nothing else.
+        //
+        // The warm paths pin that head deliberately and by name, so this is now
+        // only a safety net for the window before the warm has finished (or a
+        // backend reached through the LLM server, which never warms at all).
+        // Narrow, because the pin is one entry per layer and the wrong occupant
+        // evicts the right one: a turn carrying a speaker note would pin
+        // "…tools, and you are talking to Ana", which the next turn — a
+        // different speaker, or none — cannot use, having thrown away the head
+        // that every turn could.
         let gen_params = GenParams {
             max_new_tokens,
-            one_shot: ctx.history.is_empty(),
+            pin_prefix: ctx.history.is_empty() && ctx.speaker_note.is_none(),
             allow_capture: ctx.allow_brain_capture,
         };
         let started = Instant::now();
@@ -2116,32 +2205,56 @@ impl Assistant for LlamaLocalAssistant {
                 let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone()))));
                 let outcome = handle.block_on((actions.execute)(call.clone()));
                 let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Result {
-                    tool_call_id: call.id.clone(),
+                    tool_call_id: call.id,
                     summary: outcome.summary.clone(),
                     failed: outcome.failed,
                 })));
-                // Second pass: word the result. The continuation still starts
-                // with the pinned system prefix, so the cache is reused.
-                let call_text =
-                    format!("{{\"name\": \"{}\", \"arguments\": {}}}", call.name, call.arguments);
+                // Second pass: word the result. Two things decide whether this
+                // pass costs a fifth of a second or half a minute, and a real
+                // trace paid the half minute — 21.6 s of it re-reading 974
+                // tokens it had just read:
+                //
+                //  * The call has to be spelled the way the model spelled it.
+                //    Re-serialising it as tidy JSON made this prompt diverge
+                //    from the checkpoint saved moments earlier, so that
+                //    checkpoint could never match.
+                //  * The cached prefix has to be THIS turn's completed
+                //    exchange, not the system prefix. The search only considers
+                //    entries shorter than the prefix it is given, so offering
+                //    the system prefix hid the deeper checkpoint — which, worse,
+                //    had just displaced the shallower entry that used to match,
+                //    leaving nothing but the system prompt to restore.
+                let closer = turn_markers(&model_name_owned).close;
+                let call_text = text.trim();
                 let cont = tool_result_continuation(
                     &prompt,
-                    &call_text,
+                    call_text,
                     &outcome.summary,
                     &model_name_owned,
                 );
-                let cont_suffix =
-                    cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string();
+                let turn_prefix = format!("{prompt}{call_text}{closer}\n");
+                let (cont_prefix, cont_suffix) = match cont.strip_prefix(turn_prefix.as_str()) {
+                    Some(rest) if !rest.is_empty() => (turn_prefix, rest.to_string()),
+                    // Belt and braces: an empty suffix would generate from
+                    // nothing, so fall back to the old system-prefix split.
+                    _ => (
+                        cache_prefix.clone(),
+                        cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
+                    ),
+                };
                 // Some models open the wording pass with their own channel
                 // header. Hold the opening tokens only while they still look
                 // like one, so the header never reaches the speaker.
                 let mut head = Some(String::new());
                 me.run_inference_with_prefix_cache(
                     &cont,
-                    &cache_prefix,
+                    &cont_prefix,
                     &cont_suffix,
                     PromptStateCacheLayer::F8ChatPrefix,
-                    gen_params,
+                    // Never pinned: this pass's prefix carries this turn's own
+                    // words, so pinning it would evict the static head pin —
+                    // the one entry every later conversation depends on.
+                    GenParams { pin_prefix: false, ..gen_params },
                     |delta| {
                         let delta = delta.trim_start_matches('\u{feff}').to_string();
                         if delta.is_empty() {
@@ -2493,6 +2606,58 @@ mod tests {
         }
     }
 
+    /// The head the warm paths pin must be byte-identical to the head the reply
+    /// path sends — including the tool block, and regardless of who is
+    /// speaking.
+    ///
+    /// Three places render it: `build_stable_prompt_caches` (startup),
+    /// `prepare_turn_prompt_caches` (hotkey), and `reply_stream` (live). They
+    /// all go through `local_tools::head_with_tools`, but nothing in the type
+    /// system says they must, and a checkpoint that is not a genuine token
+    /// prefix of the live prompt can never be restored — the symptom being a
+    /// full cold prefill on every turn while the cache reports a hit on the
+    /// bare greeting behind it (F28, F30, F31).
+    #[test]
+    fn warm_head_leads_every_live_prompt() {
+        let prompt_main = "You are Fono, a terse assistant.\n\nRooms: Kitchen, Office.";
+        let instructions = "Reply in 1-4 sentences. Match the user's language.";
+        let descriptors = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "HassTurnOn",
+                "parameters": { "properties": { "area": { "type": "string" } } },
+            },
+        })];
+        // What the two warm paths pin.
+        let warm_head =
+            crate::local_tools::head_with_tools(prompt_main, &descriptors, Some(instructions));
+        // The behavioural rules go last, behind the tool block — a weak model
+        // ignored them when they sat fourteen hundred tokens back.
+        assert!(
+            warm_head.trim_end().ends_with(instructions),
+            "instructions must be the tail of the head: {warm_head:?}"
+        );
+
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let base = assistant_base_prefix(&warm_head, model);
+            for speaker in [None, Some("Ana"), Some("Bogdan")] {
+                // What the reply path composes: the same head, then the
+                // volatile speaker note appended behind it.
+                let live = crate::compose_system_prompt(
+                    &warm_head,
+                    speaker.map(|s| format!("The current speaker is {s}.")).as_deref(),
+                );
+                let ctx = AssistantContext { system_prompt: live, ..AssistantContext::default() };
+                let (prefix, _) = build_prompt_split(&ctx, "turn on the lights", model);
+                assert!(
+                    prefix.starts_with(&base),
+                    "warm head must lead the live prompt for {model:?} / {speaker:?}\n \
+                     base: {base:?}\n prefix: {prefix:?}"
+                );
+            }
+        }
+    }
+
     /// Tools reach this backend through the system prompt, so the two things
     /// that could quietly go wrong are: the block landing *before* the pinned
     /// base (a cold prefill on every turn), and the second pass not continuing
@@ -2518,6 +2683,38 @@ mod tests {
             assert!(
                 cont.starts_with(&prefix),
                 "the follow-up turn must continue the cached prefix for {model:?}"
+            );
+        }
+    }
+
+    /// The second pass is only fast if its prompt starts with the exact string
+    /// the checkpoint was saved under: the finished prompt, the reply as the
+    /// model wrote it, and the model's own turn closer. One trace paid 21.6 s
+    /// for a mismatch here, so this pins the two halves together — if the
+    /// checkpoint rendering and the continuation rendering ever drift apart,
+    /// this test fails instead of the next local turn going slow in silence.
+    #[test]
+    fn the_wording_pass_starts_where_the_finished_turn_was_saved() {
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let ctx = AssistantContext {
+                system_prompt: "You are Fono.".to_string(),
+                ..AssistantContext::default()
+            };
+            let prompt = build_prompt(&ctx, "turn on the office light", model);
+            // Exactly what the model emits, wrapper and all — not a tidied
+            // re-serialisation of the parsed call.
+            let reply = "<tool_call>{\"name\": \"HassTurnOn\", \"arguments\": {\"area\": \
+                         \"Office\"}}</tool_call>";
+            // How `run_inference_with_prefix_cache` spells the saved checkpoint.
+            let saved = format!("{prompt}{reply}{}\n", turn_markers(model).close);
+            let cont = tool_result_continuation(&prompt, reply, "it worked", model);
+            assert!(
+                cont.starts_with(&saved),
+                "the wording pass must continue the saved checkpoint for {model:?}"
+            );
+            assert!(
+                cont.len() > saved.len(),
+                "the wording pass must add a suffix to generate from for {model:?}"
             );
         }
     }

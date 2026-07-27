@@ -41,7 +41,8 @@ pub use factory::{
 pub use gemini_live::GeminiLive;
 pub use history::{ChatRole, ChatTurn, ConversationHistory, ToolCall};
 pub use traits::{
-    ActionTools, Assistant, AssistantCacheTrigger, AssistantContext, AssistantPromptCacheSnapshot,
-    AssistantPromptCacheWarmup, RealtimeAssistant, RealtimeEvent, RealtimeMode, RealtimeSession,
-    ScreenCaptureFn, TokenDelta, ToolEvent, ToolExecFn, ToolOutcome,
+    compose_head, compose_system_prompt, ActionTools, Assistant, AssistantCacheTrigger,
+    AssistantContext, AssistantPromptCacheSnapshot, AssistantPromptCacheWarmup, RealtimeAssistant,
+    RealtimeEvent, RealtimeMode, RealtimeSession, ScreenCaptureFn, TokenDelta, ToolEvent,
+    ToolExecFn, ToolOutcome,
 };

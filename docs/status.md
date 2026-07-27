@@ -1,5 +1,182 @@
 # Fono — Project Status
-Last updated: 2026-07-27
+Last updated: 2026-07-28
+
+## 2026-07-28 — What Fono is told about itself now comes last, where it is read
+
+Fono's instructions — who it is, how long an answer should be, and to reply in
+the language it was spoken to — used to open the prompt, with the rooms, the
+devices and two dozen tool descriptions piled on afterwards. By the time a small
+model reached the point of answering, those instructions were a thousand words
+behind it, and it behaved accordingly: asked twice in Romanian to turn on a
+light, it apologised in English both times.
+
+The instructions now come last, after everything about the house and after the
+list of things Fono can do. Nothing about them changed; only where they sit. A
+capable model was already following them and is unaffected; a small one now
+reads them immediately before it answers.
+
+This is deliberately the *last* thing in the steady part of the prompt and the
+first thing before the line naming who is speaking, so the ordering is: the
+house, then the tools, then the rules, then the speaker. Everything but the
+speaker is unchanged between conversations, which is what lets Fono keep the
+reading it has already done. The order lives in one place used by every path, so
+the saved copy and the live one cannot fall out of step — the failure that
+defeated two earlier attempts at this.
+
+## 2026-07-28 — The assistant stops re-reading your house before every conversation
+
+Before Fono can answer anything it has to read everything it has been told: who
+it is, the rooms, the devices in them, and the list of things it can do. On a
+model running on your own machine that is around thirteen seconds of reading.
+Fono was saving only a short greeting written at startup — seventy-two words of
+fifteen hundred — and counting that as good enough, so the reading was paid over
+again at the start of every conversation. Traces reported a healthy cache hit
+throughout, because the greeting genuinely did match.
+
+**The whole thing is now saved, and saved once.** The greeting, the rooms, the
+devices and the tool descriptions are composed by a single piece of code, used
+both when Fono warms up and when it answers, so the saved copy and the live one
+cannot drift apart. That drift is what defeated the two previous attempts at
+this, and there is now a test that fails if it happens again.
+
+**Who is speaking moved to the end.** The line naming the recognised speaker is
+the most changeable thing in the prompt and it sat in front of the largest steady
+part, so every change of speaker threw away the entire device list behind it. It
+now comes last, where a change of speaker costs a handful of words instead of
+everything.
+
+**Kept fresh when the house changes.** Switching a tool on or off, or connecting
+a new server, now refreshes the saved copy in the background rather than leaving
+the cost to whoever speaks next — who, having just flipped a switch, is very
+likely the same person about to test it. A burst of changes is coalesced into one
+refresh, and refreshing when nothing actually changed costs almost nothing.
+
+**Visible without a trace.** `fono doctor` now reports roughly how much the
+assistant reads before it can answer, which is the number that matters most on a
+local model.
+
+
+## 2026-07-27 — A saved conversation that could never be reused, and one empty word
+
+Two more traces on the small local model, a minute apart, and the second is the
+damning one: it asks a follow-up in the same conversation, so everything it
+needs was read and saved sixty seconds earlier — and it still spent 37 seconds
+re-reading all of it. 47 seconds for a turn, twice over.
+
+**Why the saved copy was useless.** When Fono tells the house to do something,
+the exchange it saves includes the request it sent and the house's answer. The
+next thing you say never mentions either — the conversation keeps only what was
+said aloud — so the saved copy no longer matches from that point on, and none of
+it can be reused. Fono was saving the version that had gone stale and discarding
+the version that had not. It now keeps the state of the conversation *as it was
+before it spoke*, which is the part the next turn genuinely shares, and keeps it
+somewhere it will not be overwritten by the stale copy. Previously the useful
+one was thrown away seconds after being saved, in the same turn, which is why
+the last fix appeared to do nothing.
+
+**Why the light did not come off.** Asked to turn the kitchen lights off, the
+model filled in every field the command offers and left two of them empty. The
+house rejected the whole thing over a single blank value and nothing moved —
+twice in a row, with the request repeated and an apology each time. Nothing was
+broken; the command was one empty word away from working. Fono now removes
+blanks before sending, since a field left empty and a field never filled in mean
+the same thing. What you asked for is unchanged — it is just no longer asked for
+badly.
+
+## 2026-07-27 — Reading the same 950 words at the start of every conversation
+
+Two fresh traces on the same small local model, a minute apart. The second one
+proved the previous fix works in the field — the follow-up question that used to
+cost 22 seconds now costs four hundredths of a second. But both traces still
+spent between 13 and 17 seconds *before* the model said anything, and the first
+one wasted a further 24 seconds after telling the house.
+
+**The long silence at the start.** Before Fono can answer, the model has to read
+everything it has been told: who it is, the rooms of the house, the devices in
+them, and the list of things it can do. That is around 950 words, and reading it
+takes about 13 seconds on this machine. Fono then threw the result away, so the
+next conversation read the whole thing again from the beginning. It was keeping
+only a 72-word fragment — the greeting written at startup, before the house and
+the tools are even known — and counting that as a success, which is why the
+summary claimed the cache was working perfectly while the clock said otherwise.
+Fono now keeps the whole thing, and protects it from being displaced, so that
+reading is paid for once rather than once per conversation.
+
+**And the first command of a conversation was never saved.** The exchange is
+saved so the follow-up question can carry on from where it left off, but the save
+was skipped whenever the conversation had no history yet — that is, on the very
+first thing you say. Which is precisely when it is needed, seconds later. That
+alone accounts for the 24 wasted seconds in the first trace, and for why the
+second trace, one turn deeper into the conversation, was fine. The exchange is
+now saved every time; the reason it used to be skipped no longer applies.
+
+Finding F30 in `plans/2026-07-26-voice-actions-v4.md`, with the measurement rule
+that follows from it: judge the cache by how much it still had to read, never by
+how many times it reported a hit.
+
+## 2026-07-27 — A light on a local model: 37 seconds, 22 of them wasted
+
+A trace of one command on a small local model (`gemma-4-e2b`) took **37.6 s** and
+the light never came on. Both problems were real and both are now addressed.
+
+**The wasted 22 seconds.** After the house has been told what to do, Fono asks
+the model a second time, to put the result into words. That second question
+re-read 974 tokens of a conversation it had just read — **21.65 s** on this
+hardware — even though the finished exchange had been saved for reuse moments
+earlier. Two reasons, and either alone was enough to break it: the saved copy
+spelled the model's request the way the model wrote it, while the follow-up
+spelled it in tidied-up form, so the two no longer matched; and the follow-up
+asked to reuse only the opening part of the conversation, which hides any longer
+saved copy — and saving the longer one had already displaced the shorter one that
+used to match. The follow-up now continues from exactly the point that was
+saved, which turns a 22-second re-read into an instant restore. A test pins the
+two renderings together so they cannot drift apart again in silence.
+
+**Why the light did not come on: unknown, and that was the second bug.** The
+trace recorded that the house refused the command and nothing else — not what was
+asked for, not what the house said about it. The only account of the failure was
+the model's own excuse, spoken aloud, which is the least reliable witness there
+is. Sending a command now records what was asked and the house's own words, and
+refusals are logged as warnings.
+
+Findings F28 and F29 in `plans/2026-07-26-voice-actions-v4.md`, with the
+generalisable lesson: a saved conversation is only reusable if the next request
+is written by the same code that saved it.
+
+## 2026-07-27 — Traces now show how long a smart-home command really takes
+
+Asking Fono to turn on a light does three separate things: it works out what
+you meant, it tells the house, then it tells you. Only the first and the last
+were visible in a trace. The middle part — the request that actually moves the
+device — was an unexplained gap between two model slices, so there was no way
+to answer "was that slow because of the model or because of the house?"
+
+**A new `actions` lane, with two spans.** `tool.execute` covers sending the
+command, `tool.verify` covers reading the world back to check it landed. They
+sit next to each other rather than nested, so a slow command and a slow check
+are told apart at a glance, and each carries which tool ran and what the check
+concluded.
+
+**What the first measurement said.** One real command over a cloud model: 1.07 s
+to transcribe, **10.78 s for the model to decide**, 0.59 s for the house to act,
+0.67 s to word the reply, then speech. Measured the way it is actually
+experienced — from when you stop talking to when the light moves — the model is
+**87 %** of the wait, and the house is under 5 %.
+
+That reordered the plan for making this faster. Three things changed in
+`plans/2026-07-26-voice-actions-v4.md`: the prompt-cache work is now scoped to
+local models only, because a cloud backend's prompt is already cached and the
+work would buy nothing there; the idea of replaying a saved sentence for a
+learned shortcut is **dropped**, because a saved "I turned on the light" would
+be repeated over a later partial failure — precisely the bug that started this;
+and a shortcut that fails its check now hands the job to the model in the same
+turn instead of asking you to repeat yourself. Dropping saved sentences also
+removed a distinction between commands and questions that had been added to
+support them, and costs nothing, since the wording happens after the device has
+already moved.
+
+Also recorded: the tool-call grammars the plan has always specified for local
+models were never actually built, and the library we already link supports them.
 
 ## 2026-07-27 — Assistant conversations are saved, and there is a page to read them
 

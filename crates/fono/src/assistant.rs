@@ -153,6 +153,18 @@ pub struct AssistantTurnInputs {
     /// a reading-time dwell instead of being synthesised + played back
     pub tts: Option<Arc<dyn TextToSpeech>>,
     pub system_prompt: String,
+    /// The behavioural rules — who Fono is and how it should answer.
+    ///
+    /// Carried apart from [`system_prompt`] so the backend can place them
+    /// *behind* the tool catalogue: an instruction a thousand tokens from
+    /// the generation point is an instruction a small model forgets.
+    pub instructions: Option<String>,
+    /// The one-line identity note, when voice verification matched.
+    ///
+    /// Carried apart from [`system_prompt`] so the backend can append it
+    /// *after* everything steady. A change of speaker then costs a handful of
+    /// tokens instead of throwing away the whole cached device list.
+    pub speaker_note: Option<String>,
     /// Verified enrolled speaker for this turn, when speaker verification
     /// is enabled and the captured voice matched (name only, never the
     /// embedding). Annotates the `assistant:` summary line; `None`
@@ -273,6 +285,8 @@ pub async fn run_assistant_turn(
         assistant,
         tts,
         system_prompt,
+        instructions,
+        speaker_note,
         speaker,
         language,
         action_tx,
@@ -516,6 +530,8 @@ pub async fn run_assistant_turn(
     };
     let ctx = AssistantContext {
         system_prompt,
+        instructions,
+        speaker_note,
         language,
         history: history_snapshot,
         active_window_context,
@@ -1937,6 +1953,10 @@ pub async fn run_realtime_turn(
     };
     let ctx = AssistantContext {
         system_prompt,
+        // The realtime backend gets one flat prompt: it has no tool block to
+        // place the behavioural rules behind.
+        instructions: None,
+        speaker_note: None,
         language: language.clone(),
         history: history_snapshot,
         active_window_context,
@@ -2226,6 +2246,9 @@ pub async fn run_live_session(
     let history_snapshot = { state.lock().await.history.snapshot() };
     let ctx = AssistantContext {
         system_prompt,
+        // As above: no tool block in live mode, so nothing to sit behind.
+        instructions: None,
+        speaker_note: None,
         language,
         history: history_snapshot,
         active_window_context,

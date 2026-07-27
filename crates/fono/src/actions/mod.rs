@@ -25,6 +25,7 @@ use fono_core::config::Config;
 use fono_core::paths::Paths;
 use fono_core::secrets::Secrets;
 use fono_core::tool_catalog::{ToolCatalogStore, VerifyClass};
+use fono_core::turn_trace::{current_span, ACTIONS_LANE};
 use tracing::{debug, info, warn};
 use vendor::{Vendor, Verdict};
 
@@ -214,6 +215,44 @@ fn room_hint(store: &ToolCatalogStore) -> Option<String> {
 /// better answer.
 const MAX_LISTED_DEVICES: usize = 200;
 
+/// Drop arguments the model filled in with nothing.
+///
+/// A small local model, asked to turn off the kitchen lights, sent
+/// `{"area": "Kitchen", "domain": ["light"], "floor": null, "name":
+/// "Kitchen lights"}`. Every field the tool advertises got a value, and two of
+/// them were placeholders: `floor` was `null` and, in a sibling trace, `name`
+/// was an empty string. Home Assistant answered *"Input validation error: None
+/// is not of type 'string'"* and did nothing — twice in a row, with the user
+/// repeating themselves and the model apologising each time. Nothing was
+/// broken, and the model was one `null` away from a working command.
+///
+/// A key the caller did not mean to set and a key it left blank are the same
+/// request, so the blank ones are removed before the server sees them: `null`,
+/// the empty string, and the empty list, at the top level and inside nested
+/// objects. Anything with a value is passed through untouched — this never
+/// changes what was asked for, only stops us asking for it badly.
+fn drop_empty_arguments(args: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    fn is_blank(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::String(s) => s.trim().is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+    match args {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, drop_empty_arguments(v)))
+                .filter(|(_, v)| !is_blank(v))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Run one call the model asked for and describe what happened.
 ///
 /// Never returns an error: a tool that failed is the news, not a fault in
@@ -230,7 +269,36 @@ async fn run_one(
     };
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-    let res = match mcp_client::call_tool(&r.endpoint, &call.name, &args).await {
+    let args = drop_empty_arguments(args);
+
+    // Running the command is the part the user is waiting on, and until this
+    // span existed it was an unexplained gap between two model requests: a
+    // real trace showed 587 ms of silence there with nothing to attribute it
+    // to. Finished before the outcome is judged, so the timing measures the
+    // server and not our reading of it.
+    let span = current_span("tool.execute", "actions", ACTIONS_LANE);
+    let called = mcp_client::call_tool(&r.endpoint, &call.name, &args).await;
+    // What was asked for and what the server said about it both belong here.
+    // A trace of a command that never happened showed only the tool's name and
+    // that something went wrong, which is not enough to tell a bad room name
+    // from an unreachable server from a device that cannot do what was asked.
+    let detail = match &called {
+        Err(e) => Some(e.to_string()),
+        Ok(res) if res.is_error => Some(res.text.clone()),
+        Ok(_) => None,
+    };
+    if let Some(detail) = &detail {
+        warn!(tool = %call.name, args = %call.arguments, "actions: {} refused: {detail}", call.name);
+    }
+    span.finish(serde_json::json!({
+        "tool": call.name,
+        "args": args,
+        "answered": called.is_ok(),
+        "server_error": called.as_ref().is_ok_and(|res| res.is_error),
+        "error": detail.as_deref().map(|d| d.chars().take(300).collect::<String>()),
+    }));
+
+    let res = match called {
         Err(e) => return bad(format!("{} could not be run: {e}", call.name)),
         // The server objected. Its own words are the most useful thing we
         // have, and they are what tells the user why.
@@ -313,13 +381,28 @@ async fn confirm(
     result: &str,
 ) -> Option<Verdict> {
     let empty = serde_json::json!({});
-    match mcp_client::call_tool(&r.endpoint, readback, &empty).await {
+    // Sequential with `tool.execute` and never nested inside it, so the two
+    // costs read off the lane separately: proving a command landed is a whole
+    // extra round trip to the same server, and it is charged to the same turn.
+    let span = current_span("tool.verify", "actions", ACTIONS_LANE);
+    let back = mcp_client::call_tool(&r.endpoint, readback, &empty).await;
+    let verdict = match &back {
         Ok(back) => vendor.confirms(call, result, &back.text),
         Err(e) => {
             warn!("actions: could not check whether {} worked: {e}", call.name);
             None
         }
-    }
+    };
+    span.finish(serde_json::json!({
+        "tool": call.name,
+        "readback": readback,
+        "verdict": match verdict {
+            Some(Verdict::Confirmed) => "confirmed",
+            Some(Verdict::Contradicted) => "contradicted",
+            None => "unproven",
+        },
+    }));
+    verdict
 }
 
 /// Servers can be chatty, and every extra token here is paid for twice —
@@ -383,6 +466,44 @@ mod tests {
         assert!(out.failed, "unreachable must not be logged as a success");
         assert!(out.summary.starts_with("HassTurnOn could not be run"), "{}", out.summary);
         assert!(!out.summary.to_lowercase().contains("done"), "{}", out.summary);
+    }
+
+    /// Verbatim from a trace: asked to turn the kitchen lights off, a small
+    /// local model filled in every field the tool advertises, two of them with
+    /// nothing. Home Assistant rejected the whole command over the `null` and
+    /// the light stayed on, twice in a row. A key left blank is a key the
+    /// caller did not mean to set.
+    #[test]
+    fn a_blank_argument_is_not_sent_to_the_server() {
+        let args = serde_json::json!({
+            "area": "Kitchen",
+            "domain": ["light"],
+            "floor": null,
+            "name": "",
+            "device_class": [],
+            "extra": {"nested": null, "kept": "yes"},
+        });
+        assert_eq!(
+            drop_empty_arguments(args),
+            serde_json::json!({
+                "area": "Kitchen",
+                "domain": ["light"],
+                "extra": {"kept": "yes"},
+            })
+        );
+    }
+
+    /// Trimming must never change what was asked for: a real value of every
+    /// shape survives, including the ones that look empty but are not.
+    #[test]
+    fn a_real_argument_is_passed_through_untouched() {
+        let args = serde_json::json!({
+            "brightness": 0,
+            "on": false,
+            "name": "Kitchen lights",
+            "domain": ["light", "switch"],
+        });
+        assert_eq!(drop_empty_arguments(args.clone()), args);
     }
 
     /// A device named after somewhere it is not — a lamp called after the
@@ -609,11 +730,8 @@ mod tests {
             let ctx = fono_assistant::AssistantContext {
                 // Compose the prompt through the shipping path, so the room
                 // names reach the model exactly as they do in a real turn.
-                system_prompt: crate::session::assistant_system_prompt(
-                    &cfg.assistant.prompt_main,
-                    actions.hint.as_deref(),
-                    None,
-                ),
+                system_prompt: crate::session::assistant_prompt_context(actions.hint.as_deref()),
+                instructions: Some(cfg.assistant.prompt_main.clone()),
                 actions: Some(actions.clone()),
                 ..Default::default()
             };
@@ -646,11 +764,8 @@ mod tests {
         for want_on in [true, false] {
             set_device(&ep, &device, !want_on).await;
             let ctx = fono_assistant::AssistantContext {
-                system_prompt: crate::session::assistant_system_prompt(
-                    &cfg.assistant.prompt_main,
-                    actions.hint.as_deref(),
-                    None,
-                ),
+                system_prompt: crate::session::assistant_prompt_context(actions.hint.as_deref()),
+                instructions: Some(cfg.assistant.prompt_main.clone()),
                 actions: Some(actions.clone()),
                 ..Default::default()
             };

@@ -75,6 +75,7 @@ pub fn transcript_enabled() -> bool {
 /// | `f7-polish`     | F7 plain-dictation cleanup (`polish.*`)                |
 /// | `f7-inject`     | F7 streaming text injection (`polish.inject_*`)        |
 /// | `llm`           | F8 assistant generation (`assistant.llm`)              |
+/// | `actions`       | tool calls to MCP servers (`tool.*`)                   |
 /// | `splitter`      | sentence splitting between LLM and TTS (`splitter.*`)  |
 /// | `tts`           | text-to-speech synthesis                               |
 /// | `playback`      | audio playback at the device (`playback.*`)            |
@@ -116,6 +117,17 @@ pub const POLISH_LANE: &str = "f7-polish";
 pub const INJECT_LANE: &str = "f7-inject";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
 pub const LLM_LANE: &str = "llm";
+/// Where tool calls to MCP servers go.
+///
+/// A tool call sits *between* two generations — the model asks for it, the
+/// server answers, the answer is read back to the model — so on the `llm` lane
+/// it would be an unexplained gap between two requests, which is how the cost
+/// of running a command stayed invisible in real traces. It carries two spans,
+/// sequential and never overlapping: `tool.execute` (doing the thing) and
+/// `tool.verify` (asking the world whether it was done), which are the two
+/// halves a slow command has to be told apart by.
+/// See [`KEYS_LANE`] for the full lane taxonomy.
+pub const ACTIONS_LANE: &str = "actions";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
 pub const SPLITTER_LANE: &str = "splitter";
 /// See [`KEYS_LANE`] for the full lane taxonomy.
@@ -136,6 +148,7 @@ const LANE_ORDER: &[&str] = &[
     POLISH_LANE,
     INJECT_LANE,
     LLM_LANE,
+    ACTIONS_LANE,
     SPLITTER_LANE,
     TTS_LANE,
     PLAYBACK_LANE,

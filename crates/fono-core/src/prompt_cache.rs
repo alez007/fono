@@ -52,6 +52,18 @@ pub enum PromptStateCacheLayer {
     WindowContext,
     /// F8 chat prefix (system + tools + history), used by the live reply path.
     F8ChatPrefix,
+    /// The prefix a turn actually read before generating: system + tools +
+    /// history, with nothing of this turn's own reply in it.
+    ///
+    /// Distinct from [`Self::F8ChatPrefix`] purely so it survives that layer's
+    /// pruning. A turn stores two checkpoints — this one at the start, and a
+    /// completed-turn one at the end that also covers the reply. Under one
+    /// layer the second prunes the first within the same turn, and the second
+    /// is the one the *next* turn cannot use when a tool was called, because a
+    /// completed turn carries the tool call and its result while history keeps
+    /// only the spoken reply. Keeping them apart means the next turn still has
+    /// something to stand on.
+    HistoryPrefix,
     /// Synthetic benchmark prefix.
     BenchmarkPrefix,
     /// Exact full-prompt snapshot.
@@ -67,6 +79,7 @@ impl PromptStateCacheLayer {
             Self::F7Context => "f7_context",
             Self::WindowContext => "window_context",
             Self::F8ChatPrefix => "f8_chat_prefix",
+            Self::HistoryPrefix => "history_prefix",
             Self::BenchmarkPrefix => "benchmark_prefix",
             Self::ExactPrompt => "exact_prompt",
         }
@@ -575,5 +588,43 @@ mod tests {
             );
         }
         assert_eq!(cache.len(), 1);
+    }
+
+    /// The trap that cost a real turn 37.6 s of re-reading. A turn that calls a
+    /// tool saves a completed-turn checkpoint covering the call and its result,
+    /// but the next turn's history keeps only the spoken reply — so that
+    /// checkpoint diverges and can never match. What the next turn *does* share
+    /// is the prefix this turn read before generating; saving it under its own
+    /// layer is what keeps it alive, because filed under the chat layer the
+    /// completed-turn insert prunes it seconds later, in the same turn.
+    #[test]
+    fn the_prefix_a_turn_read_outlives_its_own_completed_turn_checkpoint() {
+        let mut cache = PromptStateCache::new(8, usize::MAX);
+        cache.insert_pinned(key(PromptStateCacheLayer::F8System, "head"), token_entry(&[1, 2]));
+        // Start of the turn: system + tools + history, before anything is said.
+        cache.insert(
+            key(PromptStateCacheLayer::HistoryPrefix, "read"),
+            token_entry(&[1, 2, 3, 4, 5]),
+        );
+        // End of the same turn: also covers the tool call and the tool result,
+        // neither of which the next turn will ever see.
+        let report = cache.insert(
+            key(PromptStateCacheLayer::F8ChatPrefix, "completed"),
+            token_entry(&[1, 2, 3, 4, 5, 90, 91, 92]),
+        );
+        assert!(report.pruned.is_empty(), "the prefix was pruned inside its own turn");
+
+        // Next turn: history gained the spoken reply (6), never the tool
+        // traffic, so the completed-turn checkpoint diverges at token 90.
+        let layers = [
+            PromptStateCacheLayer::F8ChatPrefix,
+            PromptStateCacheLayer::HistoryPrefix,
+            PromptStateCacheLayer::F8System,
+        ];
+        assert_eq!(
+            cache.find_longest_prefix("runtime", &layers, &[1, 2, 3, 4, 5, 6, 7]),
+            Some(key(PromptStateCacheLayer::HistoryPrefix, "read")),
+            "fell back to the 2-token pin and re-read everything else"
+        );
     }
 }

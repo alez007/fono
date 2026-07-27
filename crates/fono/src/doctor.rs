@@ -517,6 +517,26 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
                 col.push(S::Fail, "assistant", &format!("{e:#}"));
             }
         }
+        // How much the assistant has to read before it can answer anything.
+        // On a model running locally this is the single largest cost of the
+        // first command of a conversation, and it is paid over again whenever
+        // the warm copy goes stale — so it is worth being able to see without
+        // opening a trace.
+        {
+            let head = fono_assistant::compose_head(
+                &crate::session::assistant_prompt_context(
+                    crate::actions::build(c, paths).as_ref().and_then(|a| a.hint.as_deref()),
+                ),
+                None,
+                Some(&c.assistant.prompt_main),
+            );
+            // Four characters per token is the usual rule of thumb and close
+            // enough for a size the user is meant to eyeball, not audit.
+            let approx_tokens = head.chars().count() / 4;
+            let line = format!("~{approx_tokens} tokens read before every answer");
+            writeln!(out, "  assistant head: {}", dim(&line))?;
+            col.push(S::Info, "assistant head", &line);
+        }
         match fono_tts::build_tts(&c.tts, &secrets, &c.general.languages, &paths.voices_dir()) {
             Ok(Some(t)) => {
                 writeln!(out, "  tts: {} {}", t.name(), ok("ready"))?;

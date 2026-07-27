@@ -288,6 +288,8 @@ async fn exercise_assistant(cfg: &AssistantCfg, secrets: &Secrets) -> Result<usi
     // Reply stream — short prompt, collect deltas. 30 s timeout.
     let ctx = AssistantContext {
         system_prompt: "You are a smoke-test fixture. Reply in 5 words exactly.".into(),
+        instructions: None,
+        speaker_note: None,
         language: None,
         history: ConversationHistory::default().snapshot(),
         active_window_context: None,
@@ -415,6 +417,8 @@ async fn exercise_groq_e2e(secrets: &Secrets) -> Result<()> {
         .ok_or_else(|| anyhow!("build_assistant returned None"))?;
     let ctx = AssistantContext {
         system_prompt: "You are a brief smoke-test assistant. Reply in one short sentence.".into(),
+        instructions: None,
+        speaker_note: None,
         language: None,
         history: ConversationHistory::default().snapshot(),
         active_window_context: None,

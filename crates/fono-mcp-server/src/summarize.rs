@@ -377,6 +377,9 @@ async fn summarize_with_timeouts(
 ) -> Result<String> {
     let ctx = AssistantContext {
         system_prompt: system_prompt(cfg, &payload.instructions),
+        speaker_note: None,
+        // Summarize builds its whole prompt in one string; nothing to append.
+        instructions: None,
         language: None,
         history: Vec::new(),
         active_window_context: None,

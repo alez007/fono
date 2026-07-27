@@ -421,7 +421,7 @@ impl RealtimeAssistant for GeminiLive {
         let full_duplex = matches!(mode, RealtimeMode::FullDuplex);
         let setup = build_setup_json(
             &self.model,
-            &ctx.system_prompt,
+            &ctx.system_block(),
             &self.voice,
             seed_history,
             full_duplex,

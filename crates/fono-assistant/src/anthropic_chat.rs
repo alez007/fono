@@ -168,12 +168,13 @@ impl Assistant for AnthropicChat {
             }
         }
         messages.push(Message { role: "user", content: user_text });
+        let system_block = ctx.system_block();
         let system_full = if history_system_extra.is_empty() {
-            ctx.system_prompt.clone()
-        } else if ctx.system_prompt.is_empty() {
+            system_block
+        } else if system_block.is_empty() {
             history_system_extra.clone()
         } else {
-            format!("{}\n\n{}", ctx.system_prompt, history_system_extra)
+            format!("{system_block}\n\n{history_system_extra}")
         };
 
         let tools = self.web_search_tool.map(build_web_search_tools);
