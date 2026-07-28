@@ -304,21 +304,17 @@ strip = "symbols"
 opt-level = "s"
 
 [patch.crates-io]
-# Our fork of llama-cpp-sys-2 0.1.150. It carries one extra commit that makes
-# llama.cpp fall back gracefully instead of aborting when the fused Gated Delta
-# Net support check sees an unnamed node. Without it, loading gemma-4 (a hybrid
-# GDN model) hits a GGML_ASSERT at context creation and the process dies, because
-# on the CPU reserve path those nodes still have ggml's default node_N names.
-# The fork disables the fused path and uses the non-fused one instead, which is
-# no slower on CPU (see ggml-org/llama.cpp#24298). llama-cpp-2 stays on the
-# published crate and links this patched sys. Pinned to an exact rev; drop this
-# once the fix lands in a published llama-cpp-2 release.
+# Our fork of llama-cpp-sys-2 0.1.153, rebased on upstream main. It carries a
+# single commit that makes llama.cpp fall back gracefully instead of aborting
+# when the fused Gated Delta Net support check sees an unnamed node. Without it,
+# loading gemma-4 (a hybrid GDN model) hits a GGML_ASSERT at context creation
+# and the process dies, because on the CPU reserve path those nodes still have
+# ggml's default node_N names. The fork disables the fused path and uses the
+# non-fused one instead, which is no slower on CPU (see ggml-org/llama.cpp#24298).
+# llama-cpp-2 stays on the published crate and links this patched sys. Pinned to
+# an exact rev; drop this once the fix lands in a published llama-cpp-2 release.
 #
-# The pinned rev also carries a second commit that forwards GGML_-prefixed env
-# vars into the CMake configure step (mirroring the existing CMAKE_ passthrough),
-# so `GGML_CPU_REPACK=OFF` in .cargo/config.toml can disable the Q4_0 repack.
-# Repack rewrites Q4_0 into a runtime-only layout in anonymous memory, which
-# disables mmap and forces a full resident copy — fatal for larger-than-RAM
-# streaming, where the weights must stay file-backed and page in on demand.
-# Upstreamed as utilityai/llama-cpp-rs#1079; drop the carry commit if it merges.
-llama-cpp-sys-2 = { git = "https://github.com/bogdanr/llama-cpp-rs", rev = "a5abb913a2dbfe59b45ec7fcadf83da28f5d5514" }
+# The GGML_ env-var forwarding we used to carry here (so `GGML_CPU_REPACK=OFF`
+# in .cargo/config.toml can disable the Q4_0 repack) landed upstream as
+# utilityai/llama-cpp-rs#1079 and is now inherited, not carried.
+llama-cpp-sys-2 = { git = "https://github.com/bogdanr/llama-cpp-rs", rev = "39cbdb951f7dd156bafb1c87dcada15c4fedbd4b" }
