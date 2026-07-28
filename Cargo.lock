@@ -1423,6 +1423,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "whatlang",
  "windows-sys 0.59.0",
 ]
 

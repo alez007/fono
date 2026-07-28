@@ -36,6 +36,12 @@ secrets.toml
 # Wake-word training venv (host tooling; never committed)
 /.venv-wakeword/
 
+# Action-benchmark fixtures that name real devices and rooms. The committed
+# suite states requirements ("any light") and so runs on anybody's home; a
+# fixture reproducing one exact command on one exact lamp is about one house
+# and must never be published.
+/tests/fixtures/bench_actions/local/
+
 # Local dev-host addresses (FONO_MAC_HOST / FONO_WIN_HOST) — per the
 # macOS/Windows port plans' guiding constraint, these never live in
 # the repo. Source .env.hosts.local yourself before using

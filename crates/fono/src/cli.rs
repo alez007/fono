@@ -198,6 +198,61 @@ pub enum Cmd {
         #[arg(short = 'f', long = "follow")]
         follow: bool,
     },
+    /// Measure whether spoken commands actually work, against this home.
+    ///
+    /// Says each fixture out loud, in text, through exactly the path a real
+    /// spoken command takes, then checks the house rather than the model's
+    /// account of it. Devices are chosen from whatever this home has, so no
+    /// setup is needed and no device name is ever written down. Every case
+    /// puts back what it moved.
+    ///
+    /// Hidden: it commands real devices, so it should be found on purpose.
+    #[cfg(feature = "bench-actions")]
+    #[command(hide = true)]
+    BenchActions {
+        /// Fixture files to run. Defaults to the committed suite.
+        fixtures: Vec<std::path::PathBuf>,
+        /// Languages to say each command in.
+        #[arg(long, value_delimiter = ',', default_value = "en")]
+        languages: Vec<String>,
+        /// Run each case this many times, to tell a real failure from a
+        /// coin toss.
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+        /// Print what would be said, and to which device, and touch nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip anything that would make noise.
+        #[arg(long)]
+        quiet_hours: bool,
+        /// Only run cases whose name contains this.
+        #[arg(long)]
+        only: Option<String>,
+        /// Use a different assistant backend, without changing your config.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Use a different model, without changing your config.
+        #[arg(long)]
+        model: Option<String>,
+        /// List every device the home reports, and stop.
+        ///
+        /// Use this to write a fixture that names one particular device.
+        #[arg(long)]
+        show_house: bool,
+        /// Do not record a trace of each turn.
+        ///
+        /// Tracing is on by default: without it a failure is a verdict with
+        /// no explanation, and the run has to be repeated to learn anything.
+        /// Traces stay in the results directory, which is outside the
+        /// repository — but a trace holds everything the model was shown and
+        /// said, including every device name in your home, so treat one as
+        /// private.
+        #[arg(long)]
+        no_trace: bool,
+        /// Where to write the results.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Type literal text to verify the inject + clipboard pipeline.
     ///
     /// Bypasses audio, STT, and LLM. Use this to confirm text can
@@ -827,6 +882,36 @@ pub async fn run(cli: Cli) -> Result<()> {
                 doctor::follow_log(&paths).await?;
             }
             Ok(())
+        }
+        #[cfg(feature = "bench-actions")]
+        Some(Cmd::BenchActions {
+            fixtures,
+            languages,
+            repeats,
+            dry_run,
+            quiet_hours,
+            only,
+            backend,
+            model,
+            show_house,
+            no_trace,
+            out,
+        }) => {
+            let config = Config::load(&paths.config_file()).unwrap_or_default();
+            let args = crate::bench_actions::Args {
+                fixtures,
+                languages,
+                repeats,
+                dry_run,
+                quiet_hours,
+                only,
+                backend,
+                model,
+                show_house,
+                trace: !no_trace,
+                out,
+            };
+            crate::bench_actions::run(config, &paths, &args).await
         }
         Some(Cmd::TestInject { text, no_inject, no_clipboard }) => {
             test_inject_cmd(&text, no_inject, no_clipboard);

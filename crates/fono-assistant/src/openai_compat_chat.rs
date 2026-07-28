@@ -763,6 +763,26 @@ fn reasoning_effort_for(backend_name: &str) -> Option<&'static str> {
     (backend_name == "gemini").then_some("low")
 }
 
+/// The three thinking-suppression switches for `backend_name`, as
+/// `(reasoning_effort, think, chat_template_kwargs)`.
+///
+/// Extracted from the request body so it can be asserted without a network
+/// call. Hidden reasoning is the single largest lever on time-to-first-token
+/// on the action path — a model that thinks for ten seconds before choosing
+/// `HassTurnOn` has already lost — and it is the kind of thing a refactor
+/// drops silently, because nothing downstream fails when it goes missing:
+/// the reply is still correct, just slow.
+fn thinking_switches(
+    backend_name: &str,
+) -> (Option<&'static str>, Option<bool>, Option<serde_json::Value>) {
+    let local = is_local_backend(backend_name);
+    (
+        reasoning_effort_for(backend_name),
+        local.then_some(false),
+        local.then(|| serde_json::json!({ "enable_thinking": false })),
+    )
+}
+
 /// Outcome of one pump: the buffered content (when buffering was
 /// enabled) and the accumulated tool call (if any).
 struct PumpResult {
@@ -784,6 +804,7 @@ impl ChatRunner {
         buffer_content: bool,
         tx: &tokio::sync::mpsc::Sender<Result<TokenDelta>>,
     ) -> Result<PumpResult> {
+        let (reasoning_effort, think, chat_template_kwargs) = thinking_switches(self.backend_name);
         let req = ChatReq {
             model: self.model.clone(),
             messages,
@@ -792,13 +813,9 @@ impl ChatRunner {
             top_p: (!uses_default_sampling_only(self.backend_name, &self.model)).then_some(0.9),
             max_tokens: assistant_token_budget(self.backend_name),
             stream: true,
-            reasoning_effort: reasoning_effort_for(self.backend_name),
-            think: is_local_backend(self.backend_name).then_some(false),
-            chat_template_kwargs: is_local_backend(self.backend_name).then_some(
-                serde_json::json!({
-                    "enable_thinking": false,
-                }),
-            ),
+            reasoning_effort,
+            think,
+            chat_template_kwargs,
             tools,
         };
 
@@ -1214,6 +1231,58 @@ mod tests {
         assert!(is_local_backend("network"));
         assert!(!is_local_backend("groq"));
         assert!(!is_local_backend("openai"));
+    }
+
+    /// Every backend Fono can talk to must be told not to think out loud
+    /// before it acts, and the switch must be the one that backend understands.
+    ///
+    /// Hidden reasoning is the largest single cost on the action path: a
+    /// measured trace spent 10.8 s of a 12.4 s command inside the model, and
+    /// almost none of that was reading the prompt. Nothing downstream notices
+    /// if a switch goes missing — the reply is still correct, only slow — so
+    /// the only thing that keeps this from being quietly dropped in a refactor
+    /// is a test that names every backend and asserts what each one is sent.
+    #[test]
+    fn every_backend_is_told_not_to_think_before_it_acts() {
+        // Named individually rather than iterated over a list built from the
+        // same source, so adding a backend without deciding this fails here.
+        for backend in ["cerebras", "groq", "openai", "openrouter", "gemini", "network"] {
+            let (effort, think, kwargs) = thinking_switches(backend);
+            let req = ChatReq {
+                model: "m".into(),
+                messages: Vec::new(),
+                temperature: None,
+                top_p: None,
+                max_tokens: assistant_token_budget(backend),
+                stream: true,
+                reasoning_effort: effort,
+                think,
+                chat_template_kwargs: kwargs,
+                tools: None,
+            };
+            let body = serde_json::to_string(&req).unwrap();
+            match backend {
+                // Gemini 3.x cannot disable thinking; "low" is the floor.
+                "gemini" => {
+                    assert!(body.contains("\"reasoning_effort\":\"low\""), "{backend}: {body}");
+                }
+                // A self-hosted server may be Ollama (`think`) or llama.cpp
+                // (a Jinja kwarg); which one is not knowable from here, so
+                // both go out and the server ignores the one it does not know.
+                "network" => {
+                    assert!(body.contains("\"think\":false"), "{backend}: {body}");
+                    assert!(body.contains("\"enable_thinking\":false"), "{backend}: {body}");
+                }
+                // Hosted providers reject switches they do not publish, and a
+                // 400 costs more than the thinking would have. Their default
+                // stands until one of them documents an off switch.
+                _ => {
+                    assert!(!body.contains("reasoning_effort"), "{backend}: {body}");
+                    assert!(!body.contains("\"think\""), "{backend}: {body}");
+                    assert!(!body.contains("enable_thinking"), "{backend}: {body}");
+                }
+            }
+        }
     }
 
     #[test]

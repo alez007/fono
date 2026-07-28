@@ -427,16 +427,14 @@ impl ToolCatalogStore {
     /// Called at connect and refresh, never on the request path — the whole
     /// point is that the model can be told the real names without anyone
     /// waiting for a round-trip to find them out.
-    pub fn set_place_names(&self, source: &str, names: &[String]) -> Result<()> {
-        let id = self.source_id(source, "sse")?;
-        self.conn.execute("DELETE FROM place_name WHERE source_id = ?1", params![id])?;
-        for n in names {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO place_name(source_id, name) VALUES (?1, ?2)",
-                params![id, n.trim()],
-            )?;
-        }
-        Ok(())
+    ///
+    /// Returns whether the stored set actually changed. Callers use that to
+    /// decide whether the warm prompt prefix is stale: these names are *in*
+    /// the prompt, so gaining or losing one invalidates a cached prefix built
+    /// from the old list, while a refresh that finds the same rooms must not
+    /// pay to rebuild it.
+    pub fn set_place_names(&self, source: &str, names: &[String]) -> Result<bool> {
+        self.replace_names("place_name", source, names)
     }
 
     /// Every place name across every source, sorted and de-duplicated.
@@ -455,16 +453,51 @@ impl ToolCatalogStore {
     ///
     /// Same timing as [`Self::set_place_names`] — learned at connect and
     /// refresh so naming a device costs nothing while the user is waiting.
-    pub fn set_device_names(&self, source: &str, names: &[String]) -> Result<()> {
+    ///
+    /// Returns whether the stored set actually changed, for the same reason as
+    /// [`Self::set_place_names`]. This is the one that bites in practice: a
+    /// lamp renamed in the home stays wrong in Fono's copy until something
+    /// rediscovers, and the assistant then tells the user, at length, that a
+    /// device they are looking at does not exist.
+    pub fn set_device_names(&self, source: &str, names: &[String]) -> Result<bool> {
+        self.replace_names("device_name", source, names)
+    }
+
+    /// Swap one source's rows in a name table, reporting whether anything moved.
+    ///
+    /// Compared as a set after trimming, because that is exactly how the names
+    /// reach the prompt: de-duplicated and sorted by the readers below. Two
+    /// refreshes that find the same rooms in a different order have changed
+    /// nothing a model could notice, and must not invalidate the warm prefix.
+    fn replace_names(&self, table: &str, source: &str, names: &[String]) -> Result<bool> {
         let id = self.source_id(source, "sse")?;
-        self.conn.execute("DELETE FROM device_name WHERE source_id = ?1", params![id])?;
-        for n in names {
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT name FROM {table} WHERE source_id = ?1"))?;
+        let before: std::collections::BTreeSet<String> = stmt
+            .query_map(params![id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let after: std::collections::BTreeSet<String> =
+            names.iter().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+
+        // A home that answers but lists nothing is almost always a home that
+        // has not finished waking up, not a home someone emptied. Keeping the
+        // last known names is the safe reading: the worst case is one stale
+        // refresh, where wiping them would leave the assistant insisting the
+        // house has no devices at all.
+        if after.is_empty() && !before.is_empty() {
+            return Ok(false);
+        }
+
+        self.conn.execute(&format!("DELETE FROM {table} WHERE source_id = ?1"), params![id])?;
+        for n in &after {
             self.conn.execute(
-                "INSERT OR IGNORE INTO device_name(source_id, name) VALUES (?1, ?2)",
-                params![id, n.trim()],
+                &format!("INSERT OR IGNORE INTO {table}(source_id, name) VALUES (?1, ?2)"),
+                params![id, n],
             )?;
         }
-        Ok(())
+        Ok(before != after)
     }
 
     /// Every device name across every source, sorted and de-duplicated.
@@ -831,6 +864,61 @@ mod tests {
 
         db.forget_sources_except(&["cabin".to_string()]).unwrap();
         assert_eq!(db.device_names().unwrap(), vec!["Attic lamp"]);
+    }
+
+    /// The refresh that runs at every startup has to say whether it found
+    /// anything different, because that answer decides whether the warm prompt
+    /// cache is thrown away. Getting it wrong either way is expensive: a false
+    /// "no change" leaves the assistant using yesterday's device list, and a
+    /// false "changed" makes the next command wait for a needless rebuild.
+    #[test]
+    fn a_refresh_reports_whether_the_names_actually_moved() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // First sight of a house is a change — there was nothing before.
+        assert!(db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap());
+        assert!(db.set_place_names("ha", &names(&["Kitchen"])).unwrap());
+
+        // Finding the same house again is not.
+        assert!(!db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap());
+        assert!(!db.set_place_names("ha", &names(&["Kitchen"])).unwrap());
+
+        // Order and stray spacing are not changes: the names are sorted and
+        // trimmed before they ever reach the model, so the prompt is identical.
+        assert!(!db.set_device_names("ha", &names(&["  Kitchen lights  ", ""])).unwrap());
+
+        // A rename is the case that matters — this is the one that used to
+        // leave fono insisting a lamp the user is looking at does not exist.
+        assert!(db.set_device_names("ha", &names(&["Lampa de sare"])).unwrap());
+        assert_eq!(db.device_names().unwrap(), vec!["Lampa de sare"]);
+
+        // And an addition.
+        assert!(db.set_device_names("ha", &names(&["Lampa de sare", "Hallway AC"])).unwrap());
+    }
+
+    /// A home that is still waking up answers with an empty list. Startup is
+    /// exactly when that happens, and wiping the catalogue would leave the
+    /// assistant telling the user their house has no devices in it.
+    #[test]
+    fn an_empty_answer_never_wipes_a_known_house() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap();
+        db.set_place_names("ha", &names(&["Kitchen"])).unwrap();
+
+        assert!(!db.set_device_names("ha", &[]).unwrap());
+        assert!(!db.set_place_names("ha", &[]).unwrap());
+        assert_eq!(db.device_names().unwrap(), vec!["Kitchen lights"]);
+        assert_eq!(db.place_names().unwrap(), vec!["Kitchen"]);
+
+        // Deliberately removing a server still forgets it — that path is
+        // `forget_sources_except`, and it is not weakened by the guard above.
+        db.forget_sources_except(&[]).unwrap();
+        assert!(db.device_names().unwrap().is_empty());
     }
 
     #[test]

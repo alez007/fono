@@ -24,6 +24,10 @@ pub mod agents;
 pub mod api_key_auth;
 pub mod assistant;
 pub mod audio_recovery;
+// Measures whether spoken commands actually work, against the home they will
+// be used in. Off by default so the shipped binary carries none of it.
+#[cfg(feature = "bench-actions")]
+pub mod bench_actions;
 pub mod cli;
 pub mod conversation_log;
 pub mod daemon;

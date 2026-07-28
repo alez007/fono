@@ -384,6 +384,38 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     ));
 
     // ---------------------------------------------------------------
+    // Refresh what the connected homes and services offer, once, at
+    // startup. The catalogue is a cache on disk, and until now nothing
+    // ever refreshed it outside the settings page — so renaming a lamp
+    // or adding a room left fono confidently insisting the device did
+    // not exist, indefinitely. Anything the user changed while fono was
+    // not running is picked up here instead.
+    //
+    // Backgrounded after a short delay so it never delays the hotkey
+    // being ready, and deliberately quiet: a home that is switched off
+    // logs a warning and leaves the last known catalogue in place, which
+    // is strictly better than an empty one. The prompt cache is only
+    // rebuilt if the refresh actually found something different.
+    // ---------------------------------------------------------------
+    if config.assistant.tools.enabled && !config.assistant.tools.mcp.is_empty() {
+        let db = paths.tool_catalog_db();
+        let config_path = paths.config_file();
+        let secrets_path = paths.secrets_file();
+        let orch_for_refresh = orchestrator.clone();
+        tokio::spawn(async move {
+            // Let model loading and the tray settle first; the first
+            // spoken command cannot arrive sooner than this anyway.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let secrets = Secrets::load(&secrets_path).unwrap_or_default();
+            let orch = orch_for_refresh.as_ref();
+            match refresh_all_servers(&db, &config_path, &secrets, orch).await {
+                Ok(_) => info!("startup refresh: device and room lists are up to date"),
+                Err(e) => warn!("startup refresh: {e}"),
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------
     // Background update checker — hits GitHub releases once on startup
     // and surfaces the result through `update_status` so the tray menu
     // (and IPC consumers) can render an "Update to vX.Y.Z" entry.
@@ -4510,8 +4542,6 @@ fn discover_tools_hook(
     paths: &Paths,
     orchestrator: Option<&Arc<SessionOrchestrator>>,
 ) -> fono_net::web_settings::DiscoverToolsFn {
-    use fono_core::tool_catalog::ToolCatalogStore;
-
     let db = paths.tool_catalog_db();
     let config_path = paths.config_file();
     let secrets_path = paths.secrets_file();
@@ -4547,76 +4577,115 @@ fn discover_tools_hook(
                 }));
             }
 
-            let cfg = Config::load(&config_path).map_err(|e| format!("load config: {e}"))?;
-            if cfg.assistant.tools.mcp.is_empty() {
-                return Err("no MCP servers configured — add one first".to_string());
-            }
-
-            let mut summaries = Vec::new();
-            for server in &cfg.assistant.tools.mcp {
-                let found = match ask_server(server, &secrets).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!("tool discovery: {} unreachable: {e}", server.name);
-                        summaries.push(serde_json::json!({ "server": server.name, "error": e }));
-                        continue;
-                    }
-                };
-                let tools = classify_all(&found);
-                let store =
-                    ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
-                let report = store
-                    .reconcile(&server.name, "sse", &tools)
-                    .map_err(|e| format!("reconcile {}: {e}", server.name))?;
-                // Remember the rooms too. Without them the model invents a
-                // name — asked in Romanian it sends "bucătărie" to a house
-                // whose rooms are all in English, and nothing happens.
-                if let Err(e) = store.set_place_names(&server.name, &found.places) {
-                    warn!("tool discovery: cannot store room names for {}: {e}", server.name);
-                }
-                // And the device names. The home only matches a name exactly,
-                // so a lamp called "Office outdoor light" cannot be found by
-                // asking for "outdoor light" or "outdoor office light".
-                if let Err(e) = store.set_device_names(&server.name, &found.devices) {
-                    warn!("tool discovery: cannot store device names for {}: {e}", server.name);
-                }
-                info!(
-                    "tool discovery: {} reported {} tool(s) ({} new, {} changed, {} missing)",
-                    server.name,
-                    tools.len(),
-                    report.added.len(),
-                    report.schema_changed.len(),
-                    report.went_missing.len(),
-                );
-                summaries.push(serde_json::json!({
-                    "server": server.name,
-                    "server_name": found.server.name,
-                    "server_version": found.server.version,
-                    "count": tools.len(),
-                    "report": report,
-                }));
-            }
-            // Connecting a server is the user saying they want it used. A
-            // separate master switch that silently stays off would leave
-            // them with a configured server that does nothing and no clue
-            // why, so a successful connection turns the feature on.
-            if summaries.iter().any(|s| s.get("error").is_none()) && !cfg.assistant.tools.enabled {
-                let mut cfg = cfg;
-                cfg.assistant.tools.enabled = true;
-                if let Err(e) = cfg.save(&config_path) {
-                    warn!("tool discovery: could not switch tool use on: {e}");
-                }
-            }
-            // Discovery is the biggest thing that can move the prompt: new
-            // tools, new rooms, new device names, all of which the assistant
-            // reads before it can answer. Re-warm so the first command after
-            // connecting a house does not pay for the whole catalogue.
-            if let Some(orch) = &orch {
-                orch.rewarm_assistant_head();
-            }
-            Ok(serde_json::json!({ "servers": summaries }))
+            refresh_all_servers(&db, &config_path, &secrets, orch.as_ref()).await
         })
     })
+}
+
+/// Ask every configured server what it offers, fold the answers into the
+/// catalogue, and re-warm the prompt cache only if something moved.
+///
+/// Shared by `POST /api/tools/discover` and the once-at-startup refresh, so
+/// the two can never drift apart — a house that looks right in the settings
+/// page is the same house the assistant was handed at boot.
+async fn refresh_all_servers(
+    db: &std::path::Path,
+    config_path: &std::path::Path,
+    secrets: &Secrets,
+    orch: Option<&Arc<SessionOrchestrator>>,
+) -> std::result::Result<serde_json::Value, String> {
+    use fono_core::tool_catalog::ToolCatalogStore;
+
+    let cfg = Config::load(config_path).map_err(|e| format!("load config: {e}"))?;
+    if cfg.assistant.tools.mcp.is_empty() {
+        return Err("no MCP servers configured — add one first".to_string());
+    }
+
+    let mut summaries = Vec::new();
+    // Whether anything the assistant reads before it can answer has
+    // moved. Accumulated across servers so one re-warm covers them all.
+    let mut prompt_dirty = false;
+    for server in &cfg.assistant.tools.mcp {
+        let found = match ask_server(server, secrets).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("tool discovery: {} unreachable: {e}", server.name);
+                summaries.push(serde_json::json!({ "server": server.name, "error": e }));
+                continue;
+            }
+        };
+        let tools = classify_all(&found);
+        let store = ToolCatalogStore::open(db).map_err(|e| format!("open tool catalog: {e}"))?;
+        let mut report = store
+            .reconcile(&server.name, "sse", &tools)
+            .map_err(|e| format!("reconcile {}: {e}", server.name))?;
+        // Remember the rooms too. Without them the model invents a
+        // name — asked in Romanian it sends "bucătărie" to a house
+        // whose rooms are all in English, and nothing happens.
+        match store.set_place_names(&server.name, &found.places) {
+            // The room list is part of the prompt, so a room appearing
+            // or disappearing makes the warm prefix stale exactly as a
+            // new tool does.
+            Ok(changed) => report.prompt_dirty |= changed,
+            Err(e) => {
+                warn!("tool discovery: cannot store room names for {}: {e}", server.name);
+            }
+        }
+        // And the device names. The home only matches a name exactly,
+        // so a lamp called "Office outdoor light" cannot be found by
+        // asking for "outdoor light" or "outdoor office light".
+        match store.set_device_names(&server.name, &found.devices) {
+            Ok(changed) => report.prompt_dirty |= changed,
+            Err(e) => {
+                warn!("tool discovery: cannot store device names for {}: {e}", server.name);
+            }
+        }
+        prompt_dirty |= report.prompt_dirty;
+        info!(
+            "tool discovery: {} reported {} tool(s) ({} new, {} changed, {} missing)",
+            server.name,
+            tools.len(),
+            report.added.len(),
+            report.schema_changed.len(),
+            report.went_missing.len(),
+        );
+        summaries.push(serde_json::json!({
+            "server": server.name,
+            "server_name": found.server.name,
+            "server_version": found.server.version,
+            "count": tools.len(),
+            "report": report,
+        }));
+    }
+    // Connecting a server is the user saying they want it used. A
+    // separate master switch that silently stays off would leave
+    // them with a configured server that does nothing and no clue
+    // why, so a successful connection turns the feature on.
+    if summaries.iter().any(|s| s.get("error").is_none()) && !cfg.assistant.tools.enabled {
+        let mut cfg = cfg;
+        cfg.assistant.tools.enabled = true;
+        if let Err(e) = cfg.save(config_path) {
+            warn!("tool discovery: could not switch tool use on: {e}");
+        }
+        // Switching tool use on adds the whole catalogue to what the
+        // assistant reads, so the warm prefix is certainly stale.
+        prompt_dirty = true;
+    }
+    // Discovery is the biggest thing that can move the prompt: new
+    // tools, new rooms, new device names, all of which the assistant
+    // reads before it can answer. Re-warm so the first command after
+    // connecting a house does not pay for the whole catalogue — but
+    // only when something actually moved. Re-warming a prefix that
+    // did not change throws away a good cache and makes the next
+    // command wait half a minute for an identical result.
+    if prompt_dirty {
+        if let Some(orch) = orch {
+            orch.rewarm_assistant_head();
+        }
+    } else {
+        info!("tool discovery: nothing changed; keeping the warm prompt cache");
+    }
+    Ok(serde_json::json!({ "servers": summaries }))
 }
 
 /// Ask one server what it offers. Errors are strings because they are shown

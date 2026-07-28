@@ -34,6 +34,28 @@ fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+/// Apply the *only* mutation Fono makes to a proxied request body:
+/// default `model` when the client omitted or blanked it. Returns the
+/// effective model, for the access log.
+///
+/// Split out from `forward_chat` so the scope limit can be asserted
+/// without a network call. Fono suppresses hidden reasoning on its *own*
+/// assistant requests, because thinking dominates time-to-first-token on
+/// the action path — but a client pointing at Fono's LLM server is not
+/// Fono's assistant, and forcing that preference on it would silently
+/// degrade a caller that wanted the model to think.
+fn default_model(json: &mut serde_json::Value, fallback: &str) -> String {
+    let client_model =
+        json.get("model").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
+    let Some(m) = client_model else {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(fallback.to_owned()));
+        }
+        return fallback.to_owned();
+    };
+    m.to_owned()
+}
+
 /// Forward a `/v1/chat/completions` request body to the cloud upstream
 /// and relay the response (SSE stream or single JSON) back verbatim.
 pub async fn forward_chat(
@@ -48,17 +70,7 @@ pub async fn forward_chat(
         }
     };
     let stream = json.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    // Default the model only when the client omits or blanks it — an
-    // explicit client-chosen model is honoured (ADR 0036).
-    let client_model =
-        json.get("model").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
-    // Reflect the effective model in the access log.
-    log.set_model(client_model.map_or_else(|| upstream.model.clone(), ToOwned::to_owned));
-    if client_model.is_none() {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(upstream.model.clone()));
-        }
-    }
+    log.set_model(default_model(&mut json, &upstream.model));
 
     let mut req = client().post(&upstream.chat_url).json(&json);
     if !upstream.api_key.is_empty() {
@@ -161,6 +173,49 @@ async fn relay(resp: reqwest::Response, stream: bool, log: &mut ReqLog) -> Respo
             .expect("proxy response builder"),
         Err(e) => {
             error_response(StatusCode::BAD_GATEWAY, &format!("reading upstream response: {e}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_model;
+
+    /// A client's request body reaches the upstream provider carrying
+    /// exactly what the client wrote, plus a model when it omitted one.
+    ///
+    /// The counterpart test in `fono-assistant` asserts that Fono's *own*
+    /// assistant requests suppress hidden reasoning, because thinking is
+    /// the largest single cost on the action path. This one draws the line
+    /// around that: someone pointing their editor or their agent at Fono's
+    /// LLM server is not Fono's assistant. Forcing `reasoning_effort` or
+    /// `enable_thinking` on them here would quietly degrade a caller who
+    /// wanted the model to think, and they would have no way to see why.
+    #[test]
+    fn a_proxied_request_keeps_the_thinking_settings_the_client_chose() {
+        let mut json = serde_json::json!({
+            "model": "some-reasoning-model",
+            "reasoning_effort": "high",
+            "messages": [],
+        });
+        let effective = default_model(&mut json, "fono-default");
+
+        assert_eq!(effective, "some-reasoning-model", "an explicit model is honoured");
+        assert_eq!(json["reasoning_effort"], "high", "Fono must not lower the client's effort");
+        assert!(json.get("think").is_none(), "Fono must not inject a switch the client omitted");
+        assert!(json.get("chat_template_kwargs").is_none());
+    }
+
+    /// The one mutation Fono is allowed to make (ADR 0036), and only when
+    /// the client left the field out or blank.
+    #[test]
+    fn a_missing_model_is_filled_in_and_nothing_else_is() {
+        for absent in [serde_json::json!({"messages": []}), serde_json::json!({"model": ""})] {
+            let mut json = absent;
+            let effective = default_model(&mut json, "fono-default");
+            assert_eq!(effective, "fono-default");
+            assert_eq!(json["model"], "fono-default");
+            assert!(json.get("reasoning_effort").is_none());
         }
     }
 }

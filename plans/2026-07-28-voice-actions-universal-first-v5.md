@@ -149,6 +149,77 @@ Traces `assistant-1785218020-0002`, `-1785218059-0003`, `-1785218132-0004`,
   domain"*) rather than an obligation. Fix: the obligation leads, says **required**, and
   the one-call economy is a separate rule so it cannot be read as licence to omit the
   domain. Ordering is now asserted by test, not just the wording.
+- **F39 — Home Assistant publishes no enum on the three slots that fail.** Read from the
+  live `tools/list` dump of the user's own house (26 tools): `area` is a bare
+  `{"type": "string"}` on all 22 tools that accept it, `name` is a bare
+  `{"type": "string"}`, `domain` is an unconstrained `{"type": "array", "items":
+  {"type": "string"}}`, and **not one tool declares a `required` list**. Enums *are*
+  published, but only on `device_class` (21 values), `media_class` (20) and
+  `todo_get_items.status` (3) — slots no recorded failure has ever touched. So a
+  purely schema-derived grammar (16b as first written) constrains tool name and field
+  types, fires its enum branch on `device_class`/`media_class` only, and its
+  required-fields branch on nothing at all. It cannot reach F33's invented area or F38's
+  omitted domain. Corollary: the enum for those three slots has to be *authored by Fono*
+  from live state, or it does not exist. Cross-check: `alez007/modelship-conversation`
+  @`7342bb6` (Apache-2.0) injects exactly these enums server-side from HA's own registry
+  — that patch exists *because* upstream omits them.
+
+---
+
+## The benchmark was blind, and every number before this is suspect
+
+Re-read of the last `bench-actions` run (`~/.local/state/fono/bench/actions/1785233801`)
+against its own traces. **Fixed 2026-07-28.**
+
+- **F40 — the harness could not see what the model did, and this is the same shape of bug
+  as F36.** Every case in that run reported `"calls": 0` and `"reply": ""`. The traces from
+  the *same* run show a tool call per turn. Cause: the harness reconstructed the turn by
+  reading `ConversationHistory` *after* `run_assistant_turn` returned, and a turn that acts
+  deliberately calls `forget_after_action`, which clears history — so the harness read an
+  emptied buffer. As with F36 the mechanism was fine and the observation point was one
+  crate away from the data. What this silently disabled, on every number on record:
+  - `routing_rate` was pinned at `0.0` — an artefact, not a finding, because `score_routing`
+    falls through to `expect_no_call` whenever there is no first call to inspect.
+  - `forbid_args` was **never enforced at all**, so invented arguments went unscored.
+  - `reply_truthful` and `reply_language_matched` were permanently `null` — meaning **F37's
+    language defect was unmeasured** and Task 20 of the benchmark plan looked complete but
+    asserted nothing.
+  - `retried()` was always false, so Task 3's non-idempotent-retry bound was unmeasured.
+  - `recovered` verdicts were unearned, being `all_good && !routed_first_try`.
+  Only `final_rate` was ever trustworthy, because `score_outcome` reads the live house
+  rather than history. **The 40 % baseline is therefore a valid outcome number and an
+  invalid routing number**, which matters for Task 22: a grammar that improves routing
+  could not have been observed doing so.
+  Fix: the pump writes a `TurnRecord` at the same instant, under the same lock, as the
+  history push it mirrors — so it cannot disagree with what the model was told, and it
+  survives the clear. Asserted by `what_a_turn_did_outlives_the_history_it_clears`, which
+  sits directly beside the test for the clear itself.
+- **F41 — with the harness sighted, the dominant failure is an invented argument, not a
+  malformed call.** First run of the repaired harness, six office cases (climate and
+  media_player, en + ro): routed 33 %, worked in the end 17 %. Four of six first calls were
+  `HassClimateSetTemperature` for a plain "turn on the AC" — the model reached for the
+  domain's most specific tool and invented the value it requires (`temperature: 24`, and
+  `temperature: ""` / `temperature: 0`, both refused as *"invalid slot info"*). Note the
+  shift: `domain: ["light"]` was present in four of five calls in the earlier run, so
+  **F38's wording fix appears to have worked** and the live failure is now F33-shaped
+  (wrong tool, invented argument), not F38-shaped. This is the evidence that settles
+  Task 8-as-code.
+- **F42 — both Romanian replies were in the wrong language, now visible for the first
+  time.** `reply_language_matched` was `null` on every case ever run (F40), so F37's fix
+  had never actually been checked. It fails: all three Romanian cases replied in English.
+  Track A's language work is **not** done, and the check that proves it only started
+  working today.
+- **F43 — a `names:` field is an alias list, and reading it verbatim produced an
+  uncommandable name.** The user's house records one speaker as `Office display, Boxa
+  birou` — a single entity carrying an English alias and a Romanian one, exactly the comma
+  convention `areas:` already splits on. The house parser took the line whole, so `name`
+  became a string Home Assistant refuses outright (`MatchFailedReason.NAME`), and a fixture
+  naming the Romanian half staged and scored correctly but **could not be put back
+  afterwards** — the run ended warning the home might have been left changed. Pre-existing
+  and latent; only a bilingual device exposed it. Fixed by splitting the list, keeping the
+  leading name as the only one ever *sent* and matching against all of them. The garage-door
+  safety check now reads every name too: a door recorded with a second-language alias is
+  still a door.
 
 **What this says about the plan's method.** Tier 1 was ordered by leverage and the ordering
 was right — but F36 shows a fourth question belongs beside the three universality
@@ -156,6 +227,13 @@ questions: *can this mechanism be observed working?* The retry passed every unit
 shipped, and was dead on arrival in the one code path that mattered. Nothing asserted that
 a corrective call was executed rather than spoken, because the assertion lived in a
 different crate from the bug.
+
+F40 is the same lesson one level up, and worse: the *instrument* had the defect. Three
+rounds of prompt rewording were graded against a routing number that was structurally
+incapable of being anything but zero, and a language fix was declared shipped while the
+check for it returned `null` on every case. So the fourth question has a companion:
+*can the thing that measures this be observed working?* A harness that reports a plausible
+number for the wrong reason is more expensive than one that crashes.
 
 ---
 
@@ -244,6 +322,15 @@ measurement in Task 9 is read honestly:
   failure (`brightness: 10`, `color: "#FFFFFF"`) is also caught by Task 4, because the
   colour was schema-invalid. If Task 9 shows a schema-*valid* invented argument still
   getting through, the code version becomes justified and belongs here.
+  **Settled 2026-07-28 — the condition is met, see F41.** The `bench-actions` traces show
+  schema-valid invented arguments getting through repeatedly and dominating the observed
+  failures: `brightness: 100`, `brightness: 10`, `temperature: 24` on a plain switch-on,
+  and `temperature: ""` / `temperature: 0` which Home Assistant refused as *"invalid slot
+  info"* despite `HassClimateSetTemperature` declaring the field a bare number. Task 4
+  cannot catch any of them by construction. **The code version of Task 8 is now
+  evidence-backed and is the highest-value remaining universal fix** — the model's
+  dominant error is no longer a malformed call but a well-formed call that answers a
+  question nobody asked.
 
 ### Track B — latency (independent of Tier 1; may proceed in parallel)
 
@@ -302,20 +389,161 @@ correctness risk and does not compete with Tier 1 for review attention.
   head *size* rather than what a turn actually decoded. The assertion that matters is
   still `decoded_prefix_tokens` in a trace.
 
-### Tier 2 — only if Task 9 shows Tier 1 fell short
+### Tier 2 — grammar (unblocked: three rounds of prompt wording have now failed)
 
-Not started, not designed further, deliberately.
+Prompt wording is no longer a candidate lever. F33/F37/F38 record three separate
+rewordings of the room hint, each verified present in the live prompt, each followed by a
+bare `{"area": "Master bedroom"}` that opened the curtains. The remaining honest lever is
+structural: make the malformed call unreachable rather than discouraged.
 
-- [ ] **Task 16. Lazy grammar for tool-call shape and tool name.**
-      `LlamaSampler::grammar_lazy` is in the pinned `llama-cpp-2` 0.1.150 — no new
-      dependency, no binary growth. Triggers on `<tool_call>`, so prose stays
-      unconstrained. Local backends only; cloud backends have native structured tool
-      calling and gain nothing.
-- [ ] **Task 17. Grammar constraining argument values to the schema.** Only if Task 4's
-      validate-and-retry proves too slow or too lossy — prevention saves the round trip
-      that recovery spends. Scope limit from v4 §14: schema *enums and types* only, never
-      room or device names. Constraining a value the model would otherwise refuse to
-      guess converts a clean "I could not find that" into a confident wrong action.
+**Why the scoping problem does not exist.** A *lazy* grammar is inert until a trigger
+string appears. No `<tool_call>` in the output, no constraint — so stories, jokes and
+explanations sample exactly as they do today. It is a property of the sampler, not a mode
+Fono selects. All template spellings of the opener go in the trigger list, and the trigger
+pattern's capture group marks where constraint begins, so the grammar describes only the
+JSON object that follows the opener.
+
+**Correction to this plan's premise about the binding.** The safe wrapper
+`LlamaSampler::grammar_lazy` (`llama-cpp-2` 0.1.150, `sampling.rs:329`) is behind that
+crate's `common` feature, which we do **not** enable — it links `libcommon`, worth roughly
+14 MB against a 25 MiB budget, so enabling it is not available to us. The *implementation*
+however lives in `libllama`, which we already link: `llama_sampler_init_grammar_lazy_patterns`
+is `LLAMA_API` and is present in the generated `llama-cpp-sys-2` bindings with no feature
+gate. Fono therefore calls the raw symbol and drives the returned sampler through the fully
+public `LlamaTokenDataArray` apply path, using the same layout-asserted cast precedent
+already established in `crates/fono-core/src/brain_tap.rs`. Net dependency and net binary
+growth: zero.
+
+**Why it cannot cost prefill.** A grammar is a sampler, not text. It never enters the
+prompt, so `PromptStateCacheKey` (which hashes prompt text and tokens) is unchanged, the
+pinned head stays valid, and enabling or rebuilding the grammar invalidates nothing. This
+is a strict advantage over every prompt-based attempt so far — each of *those* invalidated
+the cache. Cost is GBNF parsing at sampler construction: kilobytes of string, microseconds,
+once per generation. The honest downside is accuracy, not latency: constrained sampling can
+produce a worse *valid* call instead of an invalid one, which is what Task 22 exists to
+measure.
+
+**The universality boundary — the rule that keeps other servers safe.**
+
+> A grammar branch derived from a tool's *published schema* is universal and always on when
+> the setting is on. A grammar branch derived from the server's *observed live state* is
+> universal in mechanism but needs a field name to attach to, so the field names live in
+> vendor code. A grammar branch that *contradicts* a published schema is vendor-specific and
+> requires a vendor that claims it.
+
+The middle category is new, and F39 forced it: HA publishes no enum on `area`, `name` or
+`domain`, so a schema-only grammar constrains nothing that has ever failed. The enum has to
+come from the live house dump instead — which is not "the server's own truth" in the strict
+sense the first category means, but it is not our guess at intent either: a device name that
+is not in the house cannot be a correct answer. Fail-soft is the safeguard — no live state,
+no enum, today's behaviour.
+
+**How the middle category avoids becoming maintenance work.** The rejected alternative was
+`modelship-conversation`'s approach: a table mapping each tool to the device kinds it acts
+on (`HassLightSet` → `light`, `HassMediaPause` → `media_player`). That table is 26 rows
+today, it is derived from HA's *internal* handler registry which MCP does not expose, and
+every HA release that adds or renames a tool silently rots a row. Fono instead recognises
+**field names**, never tool names: a tool with an `area` field gets the room enum, a tool
+with a `name` field gets the device enum, a tool with a `domain` field gets the device-kind
+enum plus `__all__`. Three names, in `crates/fono/src/actions/vendor.rs`, drawn from HA's
+public intent API. A tool HA ships next year works with no change; a tool HA renames works
+with no change; a server with none of those fields gets no grammar at all.
+
+A server Fono has never seen receives exactly the constraints it declared about itself. A
+loose schema yields loose constraints, because that is what the server said. A tool with no
+schema gets no grammar branch at all — unconstrained, i.e. today's behaviour. The user's
+requirement ("shouldn't break things for other tools") is therefore structural, not a
+promise: an unfamiliar server *cannot* receive a Home-Assistant rule, because no vendor
+claims it for them.
+
+- [x] **Task 16a. `[assistant.tools].grammar`, off by default.** One setting obeyed by the
+      daemon, the benchmark and everything else — not a hidden env var, because the point
+      is to A/B it. *Done:* `crates/fono-core/src/config.rs` (`AssistantTools::grammar`,
+      `#[serde(default)]`, false) — and, because a setting nobody can reach is not a switch,
+      surfaced as a toggle in the web settings tools section
+      (`crates/fono-net/src/web_settings/assets/app.js`).
+- [x] **Task 16b-i. Schema-derived GBNF from the tool catalogue.** Mechanically, per enabled
+      tool, from `Tool.schema` in `crates/fono-core/src/tool_catalog.rs`: tool **name** must
+      be one of the enabled names; **required** fields must be present; field **types** must
+      match; a schema **enum** constrains to its listed values. No vendor knowledge, no
+      language knowledge. *Rationale corrected by F39:* against stock HA this branch is
+      largely inert — it binds the tool name and the field types, and its enum branch fires
+      only on `device_class`/`media_class`/`status`. It is still worth having (it is free,
+      and it is the only branch an unknown server ever sees), but on its own it kills neither
+      F33 nor F38. *Done:* `crates/fono-core/src/tool_grammar.rs`.
+- [x] **Task 16b-ii. Catalogue-derived enums for the slots HA leaves open.** Persist each
+      device's `domain` beside its name — `parse_devices` in
+      `crates/fono-assistant/src/mcp_client.rs` already reads it and was discarding it — then
+      build the `name`, `area` and `domain` branches from the store: room names from
+      `place_names()`, device names from `device_names()`, device kinds from the observed set
+      via `device_domains()`. Fail-soft: a slot with no live state gets no branch. *Done:*
+      `Device`/`set_devices`/`device_domains` in `crates/fono-core/src/tool_catalog.rs`, enum
+      authoring in `crates/fono-core/src/tool_grammar.rs`, field names in
+      `crates/fono/src/actions/vendor.rs`.
+      *Landed one step short of the original wording:* the device enum is the whole exposed
+      set, **not** scoped per tool to that tool's own domain. Scoping needs a tool→domain
+      mapping, and the only available source for it is the tool-name table this plan
+      explicitly rejected as unmaintainable (see the maintenance argument above). So
+      `HassLightSet`'s `name` slot currently offers every device, not only the lights — it
+      still cannot name a device the house does not have, which is the F33 class. Narrowing
+      it further would need a signal MCP does not publish; revisit only if Task 22 shows
+      wrong-device survives.
+- [x] **Task 16c. Wire it into the sampler chain.** One extra link before greedy in
+      `crates/fono-core/src/llama_gen.rs`, built only when tools are actually offered;
+      otherwise pass today's plain sampler. Local backends only — cloud providers enforce
+      required fields themselves. Kill path: setting off ⇒ no grammar object constructed.
+      *Done:* threaded through `GenParams::grammar` in
+      `crates/fono-assistant/src/llama_local.rs`, including the cold
+      `run_inference_with_model` fallback so a prefix-cache miss cannot silently disarm it.
+- [x] **Task 16d. Record `grammar: on|off` in the trace** so a scored run can never be
+      misattributed later. *Done:* at the assistant generation call site rather than in the
+      shared span helper, which polish also uses.
+- [ ] **Task 22. Measure the grammar A/B on identical text.** Two `bench-actions` runs, same
+      fixture, one number each, against the 40 % baseline already on record. Rationale: the
+      benchmark's whole value is that it removes the microphone confound — F36 showed two of
+      five live turns were misheard (`"lumidile"`, `"aparatul masinii"`), so a live-voice
+      comparison cannot attribute a change to the grammar. Ships only if it beats 40 %.
+      **Unblocked but re-based, 2026-07-28 — read F40 before running this.** The A/B had no
+      valid control until today: the harness could not see a tool call at all, so the
+      routing number on record is a structural zero, not a measurement. A grammar whose
+      entire purpose is to constrain *which call is emitted* was about to be graded on the
+      one statistic that could not respond to it. The 40 % is still usable as an **outcome**
+      baseline; the routing baseline has to be re-established from a sighted run first. Both
+      arms must also be run on the same fixture **after** the F43 alias fix, or a bilingual
+      device resolves differently between them.
+- [x] **Task 17. Vendor tightening: the `__all__` escape value.** *Folded forward into
+      16b-ii, not deferred behind Task 22.* The reason it was conditional no longer holds:
+      F39 established that Fono authors the `domain` enum itself, so the only question left
+      was whether that enum includes a room-wide value — and a `domain` enum *without* one
+      would remove the ability to say "turn everything off in here". Authoring the enum and
+      adding `__all__` to it are the same edit. Deferring it would have shipped a regression.
+      Note the mechanism landed one step short of the original wording: `__all__` is *offered*
+      in the enum, but `domain` is not yet made mandatory where HA declares it optional — that
+      part still contradicts the schema and still waits on Task 22.
+      Design, and why the two earlier options were rejected:
+      - **Rejected — keyword matching the transcript** for a device kind ("light/lumina/
+        lampa/…"). Fono supports 30+ languages; the table is unmaintainable and would have
+        missed `"lumidile"` anyway.
+      - **Rejected — unconditionally required `domain` with no escape.** Costs the ability
+        to say "turn everything off in here".
+      - **Chosen — mandatory field, enumerated value, `__all__` among the choices.** Zero
+        language knowledge in Fono: the model already demonstrated it can map
+        `dormitorul principal` → `"Master bedroom"`, so it can name a device kind when
+        forced to state one. The failure was *omission*, which is the path of least
+        resistance for any model; removing the silent default removes the class.
+      - **Strictly better than today:** `__all__` is auditable. Right now "curtains moved"
+        and "the model meant to move the curtains" are indistinguishable — both look like a
+        missing field. With an explicit value the trace says which, and room-wide can be
+        treated as the deliberate, riskier act it is (name what will be touched, or
+        confirm). That option does not exist while omission is legal.
+      - **Residual risk, stated:** the model may *choose* `__all__` when the user said "the
+        lights". Grammars do not fix wrong choices, only omissions — but that is one visible
+        failure mode instead of two invisible ones, and prompt wording has never been tested
+        at preventing a *stated* wrong value, which is a far easier ask than preventing
+        omission.
+      - **Wart, accepted:** `__all__` is not a real HA domain value; it must be intercepted
+        in Rust and translated to "omit `domain`" before the call goes out. Vendor code,
+        which is the right place for it.
 - [ ] **Task 18. Shortcuts / Tier 0 replay.** Design unchanged from v4 §8–§9 and the
       answers already given to §15 Q3: a `#/actions` route carrying the retrieved tools,
       rows for tools that have run only once and are not yet on the fast path, last run
@@ -329,16 +557,32 @@ Not started, not designed further, deliberately.
 - [ ] **Task 19. No-op detection.** `confirms` counts an already-on light as `Confirmed`
       (v4 §7.2) — correct for wording, wrong as promotion evidence. Gates Task 18; a
       correctness fix regardless of whether shortcuts ever ship.
-- [ ] **Task 20. Give the live house test a permanent home under `tests/`.** It is still
+- [x] **Task 20. Give the live house test a permanent home under `tests/`.** It is still
       `tmp/ha-recon/live_light_test.py` and will vanish when `tmp/` is pruned (v4 §12.1).
-- [ ] **Task 21. Pin reasoning-off on the action path with a test**, across all backends,
+      *Done.* Now `tests/live_house.py`, self-contained: the MCP-over-SSE client is
+      inlined (it used to import from a sibling scratch file), the tool catalogue is
+      fetched live rather than read from a scratch fixture, the hardcoded house address
+      became `HA_BASE` / `--base`, and the kitchen became `--area`. Deliberately not
+      wired into `check.sh` — it needs a real house and moves real lights.
+- [x] **Task 21. Pin reasoning-off on the action path with a test**, across all backends,
       including the scope limit that Fono's own LLM server must not force it. Guards a
       4–14× lever a refactor could silently drop.
-- [ ] **Task 22. Answer v4 §15 Q6 before Task 18 begins.** On a server whose payloads
+      *Done.* `thinking_switches` extracted from the request body so it can be asserted
+      without a network call, and `every_backend_is_told_not_to_think_before_it_acts`
+      names all six backends individually — adding a seventh without deciding this now
+      fails the test. The scope limit is pinned on the other side of the boundary:
+      `default_model` extracted in the LLM-server proxy, with two tests asserting a
+      client's `reasoning_effort` is passed through untouched and that filling in an
+      absent model is the only mutation Fono makes.
+- [ ] **Task 23. Answer v4 §15 Q6 before Task 18 begins.** On a server whose payloads
       `for_result` does not recognise, `Unknown` claims nothing by design — so nothing
       would ever be promoted. The two options are promotion on "no error, N runs" (weaker
       evidence, faster) or routing-only promotion marked plainly unverified in the UI. The
       second keeps the honesty ladder intact and is the recommendation.
+      *Renumbered from 22, 2026-07-28: two unrelated tasks carried that number — the
+      grammar A/B in Tier 2 and this one — so "Task 22" was ambiguous in a plan whose
+      other entries cross-reference it by number. Every existing reference to "Task 22"
+      means the grammar A/B.*
 
 ### Rejected, with reasons recorded
 

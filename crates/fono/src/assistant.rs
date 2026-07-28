@@ -46,6 +46,68 @@ use crate::session::{
     format_assistant_summary, AssistantToolMetric, AssistantToolOutcome, AssistantTurnMetrics,
 };
 
+/// What one finished turn did, kept beyond the end of the turn.
+///
+/// Deliberately a *record* rather than a view onto history: the two agree at
+/// the moment of writing and then history may legitimately be emptied. Only
+/// the fields an observer cannot reconstruct afterwards are here — a caller
+/// that wants latency or token counts has the trace.
+#[derive(Debug, Clone, Default)]
+pub struct TurnRecord {
+    /// Every tool call the model issued this turn, in the order it issued
+    /// them, each paired with the outcome the model was shown for it.
+    ///
+    /// Order is load-bearing. The **first** call is what "did it route
+    /// correctly without help" is scored on, and the ones after it are the
+    /// recovery ladder working; collapsing them into a count would hide the
+    /// distinction the ladder exists to create.
+    pub calls: Vec<RecordedCall>,
+    /// The reply as the user received it — spoken, or shown on screen when
+    /// there is no voice. Empty when the model only acted and said nothing.
+    pub reply: String,
+    /// Whether the user cut the reply off part way through. A truncated
+    /// reply is not evidence of a model that replied badly.
+    pub aborted: bool,
+}
+
+/// One tool call and the result the model read back.
+#[derive(Debug, Clone)]
+pub struct RecordedCall {
+    pub name: String,
+    /// The arguments exactly as the model emitted them, never
+    /// re-serialised: invalid JSON from a model is a finding in its own
+    /// right, and normalising it would erase the evidence.
+    pub arguments: String,
+    /// The executor's own verdict, which is also the text the model saw
+    /// before deciding whether to correct itself. `None` when the turn ended
+    /// before a result arrived.
+    pub outcome: Option<String>,
+}
+
+impl TurnRecord {
+    /// Note a call the model has just issued.
+    fn called(&mut self, call: &fono_assistant::ToolCall) {
+        self.calls.push(RecordedCall {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            outcome: None,
+        });
+    }
+
+    /// Attach a result to the oldest call still waiting for one.
+    ///
+    /// Positional rather than keyed by id, because this is the same sequence
+    /// the history push walks and calls are recorded in stream order — the
+    /// first unanswered call is the one this result belongs to. A backend
+    /// that omits ids is a wire-format quirk, not a reason to lose the
+    /// outcome.
+    fn answered(&mut self, summary: &str) {
+        if let Some(c) = self.calls.iter_mut().find(|c| c.outcome.is_none()) {
+            c.outcome = Some(summary.to_string());
+        }
+    }
+}
+
 /// Per-orchestrator assistant state. Owned by the
 /// [`crate::session::SessionOrchestrator`] inside an `Arc<Mutex<…>>`
 /// so the IPC handlers and the pump task share a single source of
@@ -65,6 +127,21 @@ pub struct AssistantSessionState {
     /// and can be reviewed in the history page. Disabled (and no file
     /// created) when `[conversations].enabled = false`.
     pub log: ConversationSink,
+    /// What the turn that just finished actually did.
+    ///
+    /// Exists because [`ConversationHistory`] is the wrong place to ask.
+    /// A turn that used a tool deliberately *clears* history when it ends
+    /// (see [`forget_after_action`]), so anything reading the buffer
+    /// afterwards to find out what happened finds an empty one — which is
+    /// how the action benchmark came to report zero tool calls on runs
+    /// whose traces plainly showed a call per turn, and with it a routing
+    /// score of zero, an unenforced forbidden-argument check and no
+    /// language verdict at all.
+    ///
+    /// Written at the same instant, under the same lock, as the history
+    /// push it mirrors — so it cannot disagree with what the model was
+    /// told, and it survives the clear that follows.
+    pub last_turn: TurnRecord,
     pub current_turn: Option<Arc<Notify>>,
     pub playback: Option<AudioPlayback>,
     /// Active full-duplex live-conversation session, when one is open.
@@ -91,6 +168,7 @@ impl AssistantSessionState {
         Self {
             history,
             log,
+            last_turn: TurnRecord::default(),
             current_turn: None,
             playback: None,
             #[cfg(feature = "realtime")]
@@ -985,17 +1063,23 @@ pub async fn run_assistant_turn(
         let mut s = state.lock().await;
         let provider = assistant.name();
         let mut acted = false;
+        // Reset here rather than at the top of the turn: the record describes
+        // the turn that just finished, and a turn that failed before reaching
+        // this point must not leave the previous turn's calls on display.
+        let mut record = TurnRecord { aborted: aborted_mid_stream, ..TurnRecord::default() };
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
                     // Persist before the move: the rolling log takes
                     // ownership, but the audit trail wants name + args.
                     s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
+                    record.called(&call);
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.log.record_tool_result(&summary, Some(provider));
+                    record.answered(&summary);
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -1006,8 +1090,10 @@ pub async fn run_assistant_turn(
             // it manage to say before I stopped it?" is exactly what
             // someone reviews later.
             s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
+            record.reply = full_reply.trim().to_string();
             s.history.push_assistant(full_reply.trim().to_string());
         }
+        s.last_turn = record;
         if acted {
             forget_after_action(&mut s.history);
         }
@@ -1269,23 +1355,28 @@ async fn drive_text_only_reply(
     {
         let mut s = state.lock().await;
         let mut acted = false;
+        let mut record = TurnRecord { aborted: aborted_mid_stream, ..TurnRecord::default() };
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
                     s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
+                    record.called(&call);
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.log.record_tool_result(&summary, Some(provider));
+                    record.answered(&summary);
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
         }
         if !full_reply.trim().is_empty() {
             s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
+            record.reply = full_reply.trim().to_string();
             s.history.push_assistant(full_reply.trim().to_string());
         }
+        s.last_turn = record;
         if acted {
             forget_after_action(&mut s.history);
         }
@@ -3056,6 +3147,65 @@ mod tests {
             history.snapshot().is_empty(),
             "the next command must start from the pinned head, not from this one"
         );
+    }
+
+    /// The turn record has to survive the clear above, because the two are
+    /// written one after the other on every acting turn.
+    ///
+    /// This is the bug the action benchmark shipped with: it reconstructed
+    /// what the model did by reading conversation history *after* the turn
+    /// returned, so every run reported zero tool calls and an empty reply
+    /// while the traces plainly showed a call per turn. That silently zeroed
+    /// the routing rate, disabled the forbidden-argument check entirely, and
+    /// left the reply's language and truthfulness unjudged.
+    ///
+    /// An observer must therefore never scrape history for this. The record
+    /// is the supported answer, and it is deliberately independent of it.
+    #[test]
+    fn what_a_turn_did_outlives_the_history_it_clears() {
+        let mut history =
+            fono_assistant::ConversationHistory::new(std::time::Duration::from_secs(3600), 12);
+        let mut record = super::TurnRecord::default();
+
+        let call = fono_assistant::ToolCall {
+            id: "local-1".into(),
+            name: "HassTurnOn".into(),
+            arguments: r#"{"area":"Office","domain":["light"]}"#.into(),
+        };
+        record.called(&call);
+        history.push_assistant_tool_calls(String::new(), vec![call]);
+        record.answered("turned on 1 light");
+        history.push_tool_result("local-1".into(), "turned on 1 light".into());
+        record.reply = "Done.".into();
+        history.push_assistant("Done.".into());
+
+        super::forget_after_action(&mut history);
+
+        assert!(history.snapshot().is_empty(), "history is emptied, as it should be");
+        assert_eq!(record.calls.len(), 1, "the record still knows a tool was called");
+        assert_eq!(record.calls[0].name, "HassTurnOn");
+        assert_eq!(record.calls[0].outcome.as_deref(), Some("turned on 1 light"));
+        assert_eq!(record.reply, "Done.");
+    }
+
+    /// Results attach to calls in order, so a turn that called twice can be
+    /// told apart from one that called once — which is the whole measurement
+    /// of the retry ladder.
+    #[test]
+    fn each_result_attaches_to_the_call_that_earned_it() {
+        let mut record = super::TurnRecord::default();
+        let call = |id: &str, name: &str| fono_assistant::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        };
+        record.called(&call("a", "HassLightSet"));
+        record.answered("no matching entity");
+        record.called(&call("b", "HassTurnOn"));
+        record.answered("turned on 1 light");
+
+        assert_eq!(record.calls[0].outcome.as_deref(), Some("no matching entity"));
+        assert_eq!(record.calls[1].outcome.as_deref(), Some("turned on 1 light"));
     }
 
     #[test]

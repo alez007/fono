@@ -1,6 +1,151 @@
 # Fono — Project Status
 Last updated: 2026-07-28
 
+## 2026-07-28 — The action benchmark was measuring nothing, and reporting a number for it
+
+F40–F43 in `plans/2026-07-28-voice-actions-universal-first-v5.md`. The harness
+reported `calls: 0` and an empty reply for every case it had ever run, while the
+traces from the same runs showed a tool call per turn. It reconstructed the turn
+by reading conversation history *after* the turn returned — and a turn that acts
+deliberately clears history (`forget_after_action`), so it read an emptied
+buffer. Same shape as F36: the mechanism was fine, the observation point was one
+crate away from the data.
+
+**What that silently disabled, on every number previously on record.** The
+routing rate was a structural zero rather than a measurement — with no first call
+to inspect, the scorer fell through to "expected no call". The
+forbidden-argument check never ran at all, so invented arguments went unscored.
+The reply's language and truthfulness were `null` on every case, which means
+**F37's language fix had never actually been checked** despite being recorded as
+shipped. The retry bound was unmeasured. Two "recovered" verdicts were unearned.
+Only the final-outcome rate was ever trustworthy, because that one reads the live
+house instead of history — so the 40 % baseline survives as an *outcome* number
+and is void as a *routing* number.
+
+This matters for the grammar A/B (Task 22, still open in the other session): a
+grammar exists to change **which call is emitted**, and it was about to be graded
+on the one statistic incapable of responding to it. The plan now says so at the
+task, and the second task also numbered 22 was renumbered to 23 so a session
+cannot confuse them.
+
+**The fix is a record, not a better read of history.** The pump writes a
+`TurnRecord` at the same instant, under the same lock, as the history push it
+mirrors — so it cannot disagree with what the model was told, and it outlives the
+clear that follows. Asserted by
+`what_a_turn_did_outlives_the_history_it_clears`, placed directly beside the test
+for the clear itself, because those two behaviours have to be read together.
+
+**What the repaired instrument immediately found.** Six new office cases — an air
+conditioner and a speaker, English and Romanian, the first fixtures outside the
+`light` domain. Routed 33 %, worked in the end 17 %. Four of six first calls
+reached for `HassClimateSetTemperature` to answer "turn on the AC", inventing the
+temperature it requires (`24`, and `""`/`0`, both refused as invalid). The
+failure class has *shifted*: the missing `domain` that motivated the grammar work
+was present in four of five calls last run, so that wording fix appears to have
+worked, and today's live failure is a wrong tool plus an invented argument. That
+settles a question the plan had left conditional — Task 8 as code (drop optional
+arguments the utterance does not support) is now evidence-backed, and it is
+universal. All three Romanian cases replied in English, so the language work is
+not done either; that check only began functioning today.
+
+**A latent bug the new fixtures exposed.** A `names:` field in the house dump is a
+comma-separated alias list, exactly like `areas:` — one speaker here is recorded
+as `Office display, Boxa birou`, an English name and a Romanian one on the same
+device. The parser took the line whole, so the name sent back was a string Home
+Assistant refuses outright, and a fixture naming the Romanian half scored fine
+but could not be put back afterwards; the run ended warning the home might have
+been left changed. Now split, with the leading name the only one ever sent and
+all of them matched against. The garage-door safety check reads every name too: a
+door recorded with a second-language alias is still a door. Two smaller ones from
+the same run — a motion sensor reports `on`/`off` and cannot be commanded, so the
+restore pass no longer aims at readings; and a volume case scored a clean pass on
+a call Home Assistant had refused, because nothing looked at the speaker, so
+levels are now asserted and restored rather than only switch states.
+
+Gate: fmt, clippy `-D warnings` (workspace and `--features bench-actions`), all
+test binaries green with zero failures, size budget 22.29 MiB / 25.00 MiB
+unchanged with the NEEDED allowlist clean. No new dependency; nothing here is on
+a shipped code path except the turn record.
+
+## 2026-07-28 — Grammar rails: the model can no longer name a room the house does not have
+
+Tier 2 of `plans/2026-07-28-voice-actions-universal-first-v5.md`, tasks 16a–16d
+and 17. Three rounds of prompt rewording had failed (F33/F37/F38), so the lever
+changed from discouraging the malformed call to making it unreachable. A lazy
+grammar constrains sampling only after `<tool_call>` appears, so prose, jokes and
+explanations are untouched, and it never enters the prompt — the warm prefix is
+unaffected.
+
+**Two of this plan's own premises turned out to be wrong, and both mattered.**
+
+*F39 — Home Assistant publishes no enum on the slots that fail.* Read from the
+live `tools/list` of the user's house (26 tools): `area` and `name` are bare
+strings, `domain` is an unconstrained array of strings, and **not one tool
+declares a `required` list**. Enums exist only on `device_class`, `media_class`
+and `todo_get_items.status` — slots no recorded failure has ever touched. So
+Task 16b as written would have constrained nothing that has ever gone wrong. The
+enum has to be *authored by Fono* from live state or it does not exist. Split
+into 16b-i (schema-only, mostly inert on HA but the only branch an unknown
+server ever sees) and 16b-ii (catalogue-derived).
+
+*The `common` feature is not enabled.* The plan asserted `LlamaSampler::grammar_lazy`
+was available; it is gated behind `llama-cpp-2`'s `common` feature, which links
+`libcommon` — roughly 14 MB against a 25 MiB budget, so not available to us. The
+implementation, however, is in `libllama`, which we already link:
+`llama_sampler_init_grammar_lazy_patterns` is `LLAMA_API` and ungated in the
+generated bindings. Fono calls the raw symbol and drives the sampler through the
+fully public `LlamaTokenDataArray` path, using the layout-asserted cast precedent
+from `crates/fono-core/src/brain_tap.rs`. Net dependency and net binary growth:
+zero. This is the least conventional part of the change and the part most worth
+re-reading.
+
+**Field names, never tool names — this is the maintenance argument.** The obvious
+prior art (`alez007/modelship-conversation@7342bb6`, Apache-2.0) injects these
+enums server-side, scoped per intent from HA's *internal* handler registry, which
+MCP does not expose. Copying it would mean hand-maintaining a 26-row tool table
+that silently rots whenever HA adds or renames a tool. Instead Fono recognises
+three **field names** — `area`, `name`, `domain` — in
+`crates/fono/src/actions/vendor.rs`, drawn from HA's public intent API. A tool HA
+ships next year works unchanged; a server with none of those fields gets no
+grammar at all. `crates/fono-core/src/tool_grammar.rs` itself knows no vendor and
+no language.
+
+Task 17 folded forward rather than deferred behind Task 22: once Fono authors the
+`domain` enum, shipping it *without* `__all__` would have cost the user "turn
+everything off in here". Authoring the enum and adding the escape are the same
+edit, so deferring would have shipped a regression. `__all__` is stripped before
+the call leaves (`drop_any_kind`, composing with `drop_empty_arguments` so the
+emptied array disappears rather than asking for nothing).
+
+**The switch is real, not just declared.** `[assistant.tools].grammar` is off by
+default, exposed as a toggle in the web settings tools section, and enforced at
+`crates/fono/src/actions/mod.rs:116` — off means no sampler link is constructed.
+It governs `bench-actions` too, since that goes through the same `actions::build`,
+which is what Task 22's A/B requires. Asserted by
+`the_switch_decides_whether_the_rails_exist_at_all`. The rails are also wired
+into the cold `run_inference_with_model` fallback, so a prefix-cache miss cannot
+silently disarm them — the F36 lesson about a mechanism that passes its tests and
+is dead in the path that matters.
+
+**Conversation redaction removed, and it was not cosmetic.** ADR 0040 reused
+`history::redact` on conversation insert. That pass masks any run of 20+ word
+characters, so entity ids like `binary_sensor.audi_e_tron_plug_lock_state`, turn
+ids and error type names all became `[REDACTED]`. Those rows are replayed into
+the prompt on resume (`crates/fono/src/session.rs:3588-3601`), so the model was
+reading `[REDACTED]` as content. A spoken conversation is prose, not where API
+keys get pasted — high false-positive rate, near-zero true-positive rate.
+Dictation keeps its `redact_secrets` knob. ADR 0040 amended with the reasoning.
+
+**Still owed: Task 22.** The grammar ships behind an off-by-default switch and is
+unmeasured. Two `bench-actions` runs on the same fixture against the 40 %
+baseline; it earns default-on only if it beats that. Constrained sampling can
+produce a worse *valid* call instead of an invalid one, and nothing here proves
+it does not.
+
+Gate: fmt, clippy `-D warnings` (default and `--features llama-local`), 37 test
+binaries with zero failures, size budget 22.30 MiB / 25.00 MiB with the NEEDED
+allowlist clean. No new dependency.
+
 ## 2026-07-28 — The retry existed, fired, and was read aloud instead of run
 
 Task 9 of `plans/2026-07-28-voice-actions-universal-first-v5.md`: the same four

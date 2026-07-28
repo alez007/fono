@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Spoken commands against a real home.
+#
+# No device is named anywhere in this file, and none ever should be. Each case
+# states what it needs — "any light", "a room with a light and something else
+# switchable in it" — and the name is filled in from whatever home the suite is
+# pointed at. That is what makes this file safe to commit, and it is also what
+# makes it somebody else's benchmark rather than one person's script: clone the
+# repository, point it at your own home, and every case either runs or reports
+# that your home has nothing to run it against.
+#
+# The cases are not a tour of the happy path. Each one is a failure that has
+# actually been observed, written down so it cannot come back unnoticed.
+
+suite_version = 2
+server = "Home Assistant"
+
+# ---------------------------------------------------------------------------
+# The ordinary case. If this fails nothing else is worth reading.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "switch_one_light_on"
+class = "plain_command"
+requires = { kind = "device", domain = "light" }
+precondition = "off"
+expect_device = "on"
+expect_tool = "HassTurnOn"
+
+[cases.utterances]
+en = "turn on the {device}"
+ro = "aprinde {device}"
+fr = "allume {device}"
+es = "enciende {device}"
+
+[[cases]]
+id = "switch_one_light_off"
+class = "plain_command"
+requires = { kind = "device", domain = "light" }
+precondition = "on"
+expect_device = "off"
+expect_tool = "HassTurnOff"
+
+[cases.utterances]
+en = "turn off the {device}"
+ro = "stinge {device}"
+fr = "éteins {device}"
+es = "apaga {device}"
+
+# ---------------------------------------------------------------------------
+# The room command, and the reason this harness watches the house rather than
+# the tool call.
+#
+# Asked in Romanian to turn on *the light* in a room, a model asked for the
+# whole room instead. That is a perfectly well-formed call — a room-wide
+# switch-on is a real thing to want — and inspecting it finds nothing wrong.
+# What was wrong only showed up in the house: the air conditioning came on.
+#
+# So this case is scored twice over. The call must carry the kind of device
+# that was asked for, and the other switchable thing in that room must still be
+# where it was. The second assertion is the one that catches it.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "room_command_names_the_kind_of_device"
+class = "room_command"
+requires = { kind = "area_with_bystander", domain = "light" }
+expect_device = "on"
+expect_bystander_unchanged = true
+expect_args = { domain = ["light"] }
+
+[cases.utterances]
+en = "turn on the lights in the {area}"
+ro = "aprinde lumina în {area}"
+fr = "allume la lumière dans {area}"
+es = "enciende la luz en {area}"
+
+# ---------------------------------------------------------------------------
+# A value nobody asked for.
+#
+# The brightness field exists, so a model fills it in — and a lamp that was
+# asked to come on comes on at forty percent. The switch-on is correct; the
+# extra argument is the defect, and only a forbidden-argument check sees it.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "plain_switch_on_invents_no_brightness"
+class = "invented_argument"
+requires = { kind = "dimmable_device", domain = "light" }
+precondition = "off"
+expect_device = "on"
+expect_tool = "HassTurnOn"
+forbid_args = ["brightness", "brightness_pct", "color", "color_temp"]
+
+[cases.utterances]
+en = "turn on the {device}"
+ro = "aprinde {device}"
+fr = "allume {device}"
+es = "enciende {device}"
+
+# ---------------------------------------------------------------------------
+# Choosing between two tools that look almost the same.
+#
+# Dimming and switching on are different tools with near-identical
+# descriptions, and a model that reaches for the dimmer when asked to dim is
+# doing the easy half. The point of pinning the tool name here is that a
+# switch-on to full brightness would satisfy the user and hide the confusion.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "dim_uses_the_brightness_tool"
+class = "tool_choice"
+requires = { kind = "dimmable_device", domain = "light" }
+precondition = "on"
+expect_device = "on"
+expect_tool = "HassLightSet"
+
+[cases.utterances]
+en = "set the {device} to thirty percent"
+ro = "pune {device} la treizeci la sută"
+fr = "règle {device} à trente pour cent"
+es = "pon {device} al treinta por ciento"
+
+# ---------------------------------------------------------------------------
+# A command that must never be repeated.
+#
+# The retry ladder is right about almost everything and dangerously wrong here:
+# asking twice for two degrees warmer is four degrees warmer. A second call is
+# the failure, whatever the server said about the first.
+#
+# The device is named rather than the room, because a thermostat is not
+# guaranteed to be filed under an area and a command addressed to nowhere
+# would fail for a reason that has nothing to do with repetition.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "relative_change_is_never_repeated"
+class = "non_idempotent"
+requires = { kind = "device", domain = "climate" }
+retry_allowed = false
+
+[cases.utterances]
+en = "make the {device} two degrees warmer"
+ro = "fă {device} cu două grade mai cald"
+fr = "monte {device} de deux degrés"
+es = "sube {device} dos grados"
+
+# ---------------------------------------------------------------------------
+# Requests that must produce no tool call at all.
+#
+# Without these a benchmark rewards a model for being trigger-happy, and the
+# fastest way to a perfect score is to act on everything. A question about the
+# house is a question; an impossible request deserves a plain no.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "a_question_about_state_is_answered_not_acted_on"
+class = "must_not_act"
+requires = { kind = "device", domain = "light" }
+expect_no_call = true
+
+[cases.utterances]
+en = "is the {device} on at the moment?"
+ro = "e aprinsă {device} acum?"
+fr = "est-ce que {device} est allumée en ce moment ?"
+es = "¿está encendida {device} ahora?"
+
+[[cases]]
+id = "an_impossible_request_is_refused_plainly"
+class = "must_not_act"
+requires = { kind = "device", domain = "light" }
+expect_no_call = true
+
+[cases.utterances]
+en = "paint the {device} blue and move it to the other room"
+ro = "vopsește {device} în albastru și mut-o în cealaltă cameră"
+fr = "peins {device} en bleu et déplace-la dans l'autre pièce"
+es = "pinta {device} de azul y muévela a la otra habitación"
+
+# ---------------------------------------------------------------------------
+# Switching something on that is not a light.
+#
+# Every case above this point is about lamps, which flatters a model: `light`
+# is the domain with the most training data behind it and the most obvious
+# vocabulary. An air conditioner is the same request in a domain that shares
+# almost none of that — and the tool is still the plain switch-on, not one of
+# the climate tools, which is the confusion worth measuring.
+#
+# Scored loosely on the resulting state on purpose: a climate device answers
+# with the mode it started in (`cool`, `heat`, `auto`, …) and never with `on`,
+# so pinning a mode here would be a fixture about one house's weather.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "switch_a_climate_device_on"
+class = "plain_command"
+requires = { kind = "device", domain = "climate" }
+precondition = "off"
+expect_device = "on"
+expect_tool = "HassTurnOn"
+# Nobody said how warm. The temperature field is one tool away and a model
+# that reaches for it has changed the request into a different one.
+forbid_args = ["temperature"]
+
+[cases.utterances]
+en = "turn on the {device}"
+ro = "pornește {device}"
+fr = "allume {device}"
+es = "enciende {device}"
+
+[[cases]]
+id = "switch_a_climate_device_off"
+class = "plain_command"
+requires = { kind = "device", domain = "climate" }
+precondition = "on"
+expect_device = "off"
+expect_tool = "HassTurnOff"
+
+[cases.utterances]
+en = "turn off the {device}"
+ro = "oprește {device}"
+fr = "éteins {device}"
+es = "apaga {device}"
+
+# ---------------------------------------------------------------------------
+# A number that is a destination, not a distance.
+#
+# Two volume tools sit side by side — one sets a level, the other nudges it —
+# and "set the volume to seventy" names a level. Reaching for the relative tool
+# gives a speaker seventy percent *louder* than it already was: the number is
+# right, the meaning is wrong, and nothing outside the tool name shows it.
+#
+# This is the same shape as the two-degrees-warmer case above, arrived at from
+# the opposite side: there the danger is repeating a relative command, here it
+# is treating an absolute one as relative in the first place.
+#
+# A second call is *not* forbidden here, unlike that case. Setting a level to
+# seventy twice lands on seventy, so if the model opens with the relative tool
+# and then corrects itself the ladder has genuinely repaired the damage — which
+# is worth recording as a recovery rather than punishing as a repeat.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "an_absolute_level_is_not_a_relative_change"
+class = "tool_choice"
+requires = { kind = "device", domain = "media_player" }
+expect_tool = "HassSetVolume"
+expect_args = { volume_level = 70 }
+# And the speaker has to actually be at seventy afterwards. Without this the
+# case passes on a call the server refused: right tool, right argument, nobody
+# checked whether it landed.
+expect_level = 70
+
+[cases.utterances]
+en = "set the volume to seventy on the {device}"
+ro = "setează volumul la 70 pe {device}"
+fr = "règle le volume à soixante-dix sur {device}"
+es = "pon el volumen a setenta en {device}"
