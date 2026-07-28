@@ -86,6 +86,20 @@ pub trait Vendor: Send + Sync {
         false
     }
 
+    /// Is running this tool a second time the same request as running it once?
+    ///
+    /// This is what decides whether a command that did not land may be handed
+    /// back to the model for one more go. "Be on" and "be off" name a state the
+    /// world should end in, so asking twice changes nothing; "two degrees
+    /// warmer" names a change, and asking twice is four degrees.
+    ///
+    /// Defaults to false, which costs only the retry: a vendor that cannot tell
+    /// gets the honest failure sentence instead of a second attempt, and that
+    /// is the safe direction to be wrong in.
+    fn repeatable(&self, _tool: &str) -> bool {
+        false
+    }
+
     /// Given a fresh reading of the world, is it as the user asked?
     ///
     /// `None` when this vendor cannot tell, which is not a failure.
@@ -183,6 +197,14 @@ impl Vendor for HomeAssistant {
     }
 
     fn checks(&self, tool: &str) -> bool {
+        desired_state(tool).is_some()
+    }
+
+    /// The same two intents, and for the same reason: they name a state the
+    /// world should end in rather than a change to make, so asking twice is
+    /// asking once. Everything else — brightness, position, a temperature step
+    /// — is left alone, because a wrong guess here doubles a real-world effect.
+    fn repeatable(&self, tool: &str) -> bool {
         desired_state(tool).is_some()
     }
 
@@ -367,6 +389,21 @@ mod tests {
         let ha = HomeAssistant;
         let only_the_area = r#"{"response_type": "action_done", "data": {"success": [{"name": "Hall", "type": "area"}], "failed": []}}"#;
         assert_eq!(ha.admission(only_the_area), Some(Admission::NothingWorked));
+    }
+
+    /// A switch-on that partly failed may be asked for again — the lamps that
+    /// obeyed are already in the state asked for, so a repeat cannot double
+    /// anything. A relative change may not, because twice is twice as much.
+    #[test]
+    fn only_a_command_naming_an_end_state_may_be_asked_for_twice() {
+        let ha = HomeAssistant;
+        assert!(ha.repeatable("HassTurnOn"), "being on twice is being on");
+        assert!(ha.repeatable("HassTurnOff"));
+        assert!(!ha.repeatable("HassLightSet"), "a brightness step must not be doubled");
+        assert!(!ha.repeatable("HassClimateSetTemperature"));
+        // A server we do not recognise gets no second attempt: it is the safe
+        // direction to be wrong in.
+        assert!(!Unknown.repeatable("HassTurnOn"));
     }
 
     /// The point of the whole rung: the server said it switched a lamp, and

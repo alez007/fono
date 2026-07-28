@@ -551,7 +551,7 @@ impl Assistant for OpenAiCompatChat {
         tokio::spawn(async move {
             // ── First turn ───────────────────────────────────────────
             let first = match runner
-                .run_chat_pump(initial_messages.clone(), tools, buffer_first_turn, &tx)
+                .run_chat_pump(initial_messages.clone(), tools.clone(), buffer_first_turn, &tx)
                 .await
             {
                 Ok(r) => r,
@@ -591,23 +591,60 @@ impl Assistant for OpenAiCompatChat {
                     );
                     return;
                 };
-                let _ = tx.send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone())))).await;
-                let outcome = (actions.execute)(call.clone()).await;
-                let _ = tx
-                    .send(Ok(TokenDelta::tool(ToolEvent::Result {
-                        tool_call_id: call.id.clone(),
-                        summary: outcome.summary.clone(),
-                        failed: outcome.failed,
-                    })))
-                    .await;
+                let mut messages = initial_messages;
+                let mut call = call;
+                // At most one correction. The first attempt is the model's
+                // own choice; if the server refused it outright the model is
+                // handed the objection and may fix it, and whatever comes
+                // back from that is the answer. A third go would be a model
+                // arguing with a house.
+                for attempt in 0..=1 {
+                    let _ = tx.send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone())))).await;
+                    let outcome = (actions.execute)(call.clone()).await;
+                    let _ = tx
+                        .send(Ok(TokenDelta::tool(ToolEvent::Result {
+                            tool_call_id: call.id.clone(),
+                            summary: outcome.summary.clone(),
+                            failed: outcome.failed,
+                        })))
+                        .await;
+                    append_tool_result(&mut messages, &call, &outcome.summary);
 
-                // Second turn: the model tells the user what happened. No
-                // `tools` field, so it cannot chain another action off the
-                // back of the first — one action per turn, deliberately.
-                let mut second_messages = initial_messages;
-                append_tool_result(&mut second_messages, &call, &outcome.summary);
-                if let Err(e) = runner.run_chat_pump(second_messages, None, false, &tx).await {
-                    let _ = tx.send(Err(e)).await;
+                    // Offering the tools again is a deliberate exception to
+                    // one-action-per-turn, and a narrow one: only after a
+                    // failure the executor judged safe to repeat, and only
+                    // once. The executor is the only thing that knows whether
+                    // running the command twice is the same request as running
+                    // it once, which is why the decision is not taken here.
+                    let may_retry = attempt == 0 && outcome.retryable;
+                    let offer = may_retry.then(|| tools.clone()).flatten();
+                    let pump =
+                        match runner.run_chat_pump(messages.clone(), offer, may_retry, &tx).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
+                    let Some(next) = pump.tool_call.filter(|_| may_retry) else {
+                        // The model answered in prose. If we had buffered it
+                        // against the possibility of a correction, say it now
+                        // — swallowing it would leave the user with silence.
+                        if may_retry && !pump.buffered_content.is_empty() {
+                            let _ = tx.send(Ok(TokenDelta::text(pump.buffered_content))).await;
+                        }
+                        return;
+                    };
+                    // A correction: the thought that preceded it is scaffolding
+                    // and would be spoken as a promise the retry has not kept.
+                    drop(pump.buffered_content);
+                    tracing::info!(
+                        target: "fono.assistant",
+                        "retrying {} as {} after a failure that changed nothing",
+                        call.name,
+                        next.name
+                    );
+                    call = next;
                 }
                 return;
             }

@@ -25,7 +25,7 @@ use fono_core::config::Config;
 use fono_core::paths::Paths;
 use fono_core::secrets::Secrets;
 use fono_core::tool_catalog::{ToolCatalogStore, VerifyClass};
-use fono_core::turn_trace::{current_span, ACTIONS_LANE};
+use fono_core::turn_trace::{current_instant, current_span, ACTIONS_LANE};
 use tracing::{debug, info, warn};
 use vendor::{Vendor, Verdict};
 
@@ -39,6 +39,9 @@ struct Runnable {
     verify: VerifyClass,
     /// The tool whose output observes this one's effect, when there is one.
     readback: Option<String>,
+    /// What the server said it accepts, kept so an obviously wrong argument
+    /// can be caught here rather than costing a round trip.
+    schema: serde_json::Value,
 }
 
 /// Build the tool set for this turn, or `None` when the user has no tools
@@ -87,7 +90,12 @@ pub fn build(cfg: &Config, paths: &Paths) -> Option<Arc<ActionTools>> {
         }));
         runnable.insert(
             r.name.clone(),
-            Runnable { endpoint, verify: r.verify_class, readback: r.readback_tool },
+            Runnable {
+                endpoint,
+                verify: r.verify_class,
+                readback: r.readback_tool,
+                schema: r.schema,
+            },
         );
     }
     if descriptors.is_empty() {
@@ -162,24 +170,51 @@ const CANNOT_ACT: &str = "You cannot control any devices or run any tools in thi
 /// the one lamp that was actually wanted failed. A room plus a kind of device
 /// is still one call; saying which kind is what keeps the room from being a
 /// blunt instrument.
+///
+/// The domain rule leads, and says *required*, because stating it second — after
+/// "act on the room in one call" — did not work. A later trace, with that
+/// wording in the prompt, still produced a bare `{"area": "Master bedroom"}`
+/// and moved the curtains and the roller. Two things were wrong with putting it
+/// second: the sentence opened with the permission ("act on the room in one
+/// call") and only then qualified it, and the qualification was phrased as
+/// advice ("pass that kind as the domain") rather than an obligation. The
+/// one-call economy is a separate rule now, so it cannot be read as licence to
+/// omit the domain.
+/// The fourth rule exists because the model picked the wrong tool, not the
+/// wrong target. Asked in Romanian and again in English to turn the bedroom
+/// lights on, it reached for the brightness-and-colour tool and invented both
+/// values; the house rejected the payload and the lights stayed off. The hint
+/// had been entirely about *targeting* and silent on *choosing*, while a
+/// couple of dozen near-identical signatures competed for the same request.
+/// The fifth rule is the other half of that failure: nobody had mentioned
+/// brightness, and a field is not a request.
+///
+/// Written as a numbered list rather than a paragraph, and shorter than the
+/// prose it replaces. Verbosity is not instruction strength — the paragraph
+/// version stated the domain rule at length and still failed to prevent a
+/// domain-less call.
 fn room_hint(store: &ToolCatalogStore) -> Option<String> {
     let names = store.place_names().ok()?;
     if names.is_empty() {
         return None;
     }
     let mut hint = format!(
-        "Rooms in this home, named exactly as they must be used: {}. \
-         Never translate or invent a room name — pick the closest one from this list. \
-         When the user asks for a room, act on the room in one call and do not name \
-         devices individually. When the user says which kind of device they mean — the \
-         lights, the heating, the blinds — pass that kind as the domain alongside the \
-         area, for example {{\"area\": \"Office\", \"domain\": [\"light\"]}}: a room \
-         without a domain acts on everything switchable in it, so asking for a room \
-         when the user asked for its lights will also start the air conditioning. \
-         Only leave the domain out when the user really did mean the whole room. \
-         When the user names a device rather than a room, act on \
-         it by that name and do not narrow the search to a room: a device's name often \
-         mentions somewhere it is not.",
+        "Rooms in this home, named exactly as they must be used: {}.\n\
+         Rules for acting on this home:\n\
+         1. Never translate or invent a room or device name — pick the closest one listed.\n\
+         2. Whenever the user says which kind of device they mean — the lights, the heating, \
+         the blinds — the domain is required, for example {{\"area\": \"Master bedroom\", \
+         \"domain\": [\"light\"]}}. Leave the domain out only when the user really meant \
+         everything in the room, because without it the command reaches every switchable \
+         device there and will open the blinds and start the air conditioning.\n\
+         3. One call for a room, not one per device: a room plus a domain is a single call.\n\
+         4. When the user names a device rather than a room, act on it by that name and do \
+         not narrow the search to a room: a device's name often mentions somewhere it is not.\n\
+         5. Use the simplest tool that does what was asked. A tool that sets brightness, \
+         colour or temperature is only for when the user asked for that value; to switch \
+         something on or off, use the plain on/off tool.\n\
+         6. Fill in only the arguments the user actually asked for. Never invent a value \
+         because the tool offers the field.",
         names.join(", ")
     );
 
@@ -191,7 +226,7 @@ fn room_hint(store: &ToolCatalogStore) -> Option<String> {
             use std::fmt::Write as _;
             let _ = write!(
                 hint,
-                " Devices in this home, named exactly as they must be used: {}. \
+                "\nDevices in this home, named exactly as they must be used: {}. \
                  Use one of these names verbatim — the home matches a name only exactly, \
                  so a shortened name or one with the words in a different order finds nothing.",
                 devices.join(", ")
@@ -253,6 +288,101 @@ fn drop_empty_arguments(args: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Check the arguments against what the server said it accepts.
+///
+/// Returns the server's own vocabulary for what is wrong, or `None` when
+/// nothing obviously is.
+///
+/// A small local model asked to turn on the bedroom lights sent
+/// `{"area": "Master bedroom", "brightness": 10, "color": "#FFFFFF"}` to a
+/// tool whose `color` is an enumeration of colour names. Nobody had mentioned
+/// brightness or colour; the model filled the fields in because they were
+/// there. Home Assistant answered *"Received invalid slot info"* and did
+/// nothing, twice, in two languages.
+///
+/// Catching that here rather than at the house is worth a round trip, but the
+/// real value is the sentence: an argument named against the schema the model
+/// was shown is a correction it can act on, where a server's rejection of the
+/// whole payload often is not.
+///
+/// Deliberately shallow. Only two things are checked — the type of a value,
+/// and membership of an enumeration — because those are the server's own
+/// unambiguous statements about itself. Required fields are not enforced: an
+/// advertised schema is routinely stricter than the behaviour behind it, and
+/// refusing a call the house would have accepted is a worse failure than
+/// letting it through.
+fn schema_complaint(schema: &serde_json::Value, args: &serde_json::Value) -> Option<String> {
+    let props = schema.get("properties")?.as_object()?;
+    let given = args.as_object()?;
+    let mut bad = Vec::new();
+    for (key, value) in given {
+        let Some(spec) = props.get(key) else {
+            // An argument the tool never advertised. Not necessarily wrong —
+            // servers extend themselves — so it is passed through.
+            continue;
+        };
+        if let Some(allowed) = spec.get("enum").and_then(|e| e.as_array()) {
+            if !allowed.contains(value) {
+                let names: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+                bad.push(format!("{key} must be one of {}", names.join(", ")));
+                continue;
+            }
+        }
+        if let Some(want) = spec.get("type").and_then(|t| t.as_str()) {
+            if !matches_json_type(want, value) {
+                bad.push(format!("{key} must be a {want}"));
+            }
+        }
+    }
+    (!bad.is_empty()).then(|| bad.join("; "))
+}
+
+/// Does a value match a JSON Schema `type` keyword?
+///
+/// `integer` accepts any number without a fractional part, matching the
+/// specification: a model that writes `21.0` for a whole number of degrees is
+/// not making the mistake this check is looking for.
+fn matches_json_type(want: &str, value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match want {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_f64().is_some_and(|n| n.fract() == 0.0),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => matches!(value, Value::Null),
+        // A type keyword we do not understand, or a list of them. Saying
+        // nothing is the safe answer.
+        _ => true,
+    }
+}
+
+/// Appended to a failure where nothing in the world moved.
+///
+/// The traces that motivated this all ended the same way: the house said in
+/// plain words what was wrong with the request, Fono read the objection aloud,
+/// and the user had to say the whole thing again. The correction was already
+/// in the model's hands and nothing invited it to use it. One sentence does,
+/// and it costs nothing on a call that worked.
+///
+/// Deliberately not a promise: a second failure is a real answer, and saying
+/// so beats a third attempt.
+const RETRY_INVITATION: &str = "Nothing was changed. If you can tell from this what was wrong \
+     with the request, correct it and call the tool once more; otherwise tell the user plainly \
+     what went wrong.";
+
+/// Appended to a failure where part of the request may already have landed.
+///
+/// Says nothing about what did or did not happen, because at this rung we
+/// genuinely do not know — a room-wide command that moved four things and
+/// missed two is the common case. Only offered where running the tool again
+/// is the same request as running it once, so a repeat cannot double an
+/// effect on the parts that did work.
+const RETRY_THE_REST: &str = "If you can tell from this what was wrong with the request, \
+     correct it and call the tool once more for what was missed; otherwise tell the user \
+     plainly which parts did not happen.";
+
 /// Run one call the model asked for and describe what happened.
 ///
 /// Never returns an error: a tool that failed is the news, not a fault in
@@ -261,15 +391,40 @@ async fn run_one(
     runnable: &std::collections::HashMap<String, Runnable>,
     call: ToolCall,
 ) -> ToolOutcome {
-    let bad = |s: String| ToolOutcome { summary: s, failed: true };
-    let ok = |s: String| ToolOutcome { summary: s, failed: false };
+    // Two ways for a call to end badly, and they are not equally safe to
+    // repeat. `nothing_happened` is for the cases where the request never
+    // reached the world — an unknown tool, an unreachable server, a payload
+    // the server refused — so a second go cannot double anything and is always
+    // offered. `not_as_asked` is for the cases where something may already have
+    // moved, and only the vendor can say whether asking again is the same
+    // request as asking once.
+    let nothing_happened = |s: String| ToolOutcome {
+        summary: format!("{s} {RETRY_INVITATION}"),
+        failed: true,
+        retryable: true,
+    };
+    let ok = ToolOutcome::worked;
 
     let Some(r) = runnable.get(&call.name) else {
-        return bad(format!("There is no tool called {}.", call.name));
+        return nothing_happened(format!("There is no tool called {}.", call.name));
     };
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let args = drop_empty_arguments(args);
+
+    // Never sent, so nothing moved and a correction is free. The complaint is
+    // phrased against the schema the model was shown, which is a more useful
+    // thing to hand back than the server's rejection of the whole payload.
+    if let Some(complaint) = schema_complaint(&r.schema, &args) {
+        warn!(tool = %call.name, args = %call.arguments, "actions: not sending {}: {complaint}", call.name);
+        current_instant(
+            "tool.rejected",
+            "actions",
+            ACTIONS_LANE,
+            serde_json::json!({ "tool": call.name, "args": args, "complaint": complaint }),
+        );
+        return nothing_happened(format!("{} was not sent: {complaint}.", call.name));
+    }
 
     // Running the command is the part the user is waiting on, and until this
     // span existed it was an unexplained gap between two model requests: a
@@ -299,11 +454,16 @@ async fn run_one(
     }));
 
     let res = match called {
-        Err(e) => return bad(format!("{} could not be run: {e}", call.name)),
+        // The server was never reached, so nothing moved. Worth one more go:
+        // the model may pick a different tool, and if it picks the same one
+        // the second failure is the honest answer.
+        Err(e) => return nothing_happened(format!("{} could not be run: {e}", call.name)),
         // The server objected. Its own words are the most useful thing we
-        // have, and they are what tells the user why.
+        // have: they tell the user why, and they are also precisely what the
+        // model needs to correct itself. A refused call did nothing, so
+        // trying again cannot double an effect.
         Ok(res) if res.is_error => {
-            return bad(format!("{} failed: {}", call.name, brief(&res.text)));
+            return nothing_happened(format!("{} failed: {}", call.name, brief(&res.text)));
         }
         Ok(res) => res,
     };
@@ -312,6 +472,15 @@ async fn run_one(
     // itself is the only thing that can say. Anything unrecognised gets no
     // opinion, so the rungs below simply do not fire.
     let vendor = vendor::for_result(&res.text);
+
+    // A command that may be safely asked for twice can be handed back for one
+    // more attempt; one that names a change rather than an end state cannot,
+    // because asking twice for two degrees warmer is four degrees.
+    let not_as_asked = |s: String| ToolOutcome {
+        summary: if vendor.repeatable(&call.name) { format!("{s} {RETRY_THE_REST}") } else { s },
+        failed: true,
+        retryable: vendor.repeatable(&call.name),
+    };
 
     // Second rung. A server can answer "fine" and mean nothing of the sort:
     // Home Assistant returns an ordinary, error-free result for a command that
@@ -323,10 +492,10 @@ async fn run_one(
     // devices that were missed is what lets the reply be true.
     match vendor.admission(&res.text) {
         Some(vendor::Admission::NothingWorked) => {
-            return bad(format!("{} did not work: {}", call.name, brief(&res.text)));
+            return not_as_asked(format!("{} did not work: {}", call.name, brief(&res.text)));
         }
         Some(vendor::Admission::PartlyWorked { failed }) => {
-            return bad(format!(
+            return not_as_asked(format!(
                 "{} worked for some devices but not for these: {}. Tell the user which ones \
                  did not respond, and do not claim the whole request succeeded.",
                 call.name,
@@ -347,7 +516,7 @@ async fn run_one(
                     // found some devices obeying and others not, and claiming
                     // more than was observed is the mistake this rung exists
                     // to stop.
-                    return bad(format!(
+                    return not_as_asked(format!(
                         "{} was accepted, but the devices are not in the state you asked for.",
                         call.name
                     ));
@@ -440,6 +609,7 @@ mod tests {
                 },
                 verify,
                 readback: Some("GetLiveContext".into()),
+                schema: serde_json::json!({}),
             },
         );
         m
@@ -506,6 +676,91 @@ mod tests {
         assert_eq!(drop_empty_arguments(args.clone()), args);
     }
 
+    /// Verbatim from two traces, one in Romanian and one in English: asked to
+    /// turn the bedroom lights on, the model reached for the brightness-and-
+    /// colour tool and invented both values. `#FFFFFF` is not a colour that
+    /// tool accepts, and the house threw the whole command away over it.
+    /// Naming the offending argument against the schema the model was shown
+    /// is a correction it can act on; "received invalid slot info" is not.
+    #[test]
+    fn a_value_outside_the_advertised_enumeration_is_named() {
+        let schema = serde_json::json!({
+            "properties": {
+                "area": {"type": "string"},
+                "color": {"enum": ["red", "white", "warm white"]},
+            }
+        });
+        let args = serde_json::json!({"area": "Master bedroom", "color": "#FFFFFF"});
+        let complaint =
+            schema_complaint(&schema, &args).expect("an invented colour is a complaint");
+        assert!(complaint.contains("color"), "{complaint}");
+        assert!(
+            complaint.contains("red"),
+            "the allowed values belong in the sentence: {complaint}"
+        );
+    }
+
+    /// A number where a word belongs is the other half of the same mistake,
+    /// and just as cheap to catch before it costs a round trip.
+    #[test]
+    fn a_value_of_the_wrong_type_is_named() {
+        let schema = serde_json::json!({"properties": {"name": {"type": "string"}}});
+        let complaint = schema_complaint(&schema, &serde_json::json!({"name": 7}))
+            .expect("a number is not a name");
+        assert!(complaint.contains("name must be a string"), "{complaint}");
+    }
+
+    /// The check must stay quiet about everything it is not sure of. An
+    /// advertised schema is routinely stricter than the behaviour behind it,
+    /// so refusing a call the house would have accepted is the worse failure:
+    /// a missing required field, an argument the tool never advertised, and a
+    /// whole number written with a decimal point all pass.
+    #[test]
+    fn the_schema_check_refuses_only_what_the_server_plainly_forbids() {
+        let schema = serde_json::json!({
+            "properties": {
+                "area": {"type": "string"},
+                "temperature": {"type": "integer"},
+            },
+            "required": ["area", "missing_one"],
+        });
+        let args = serde_json::json!({
+            "area": "Office",
+            "temperature": 21.0,
+            "undocumented": "servers extend themselves",
+        });
+        assert_eq!(schema_complaint(&schema, &args), None);
+        // A tool that advertises nothing can never be complained about.
+        assert_eq!(schema_complaint(&serde_json::json!({}), &args), None);
+    }
+
+    /// A call that never left Fono changed nothing, so the model is invited
+    /// to correct it inside the same turn rather than the user being asked to
+    /// say the whole thing again.
+    #[tokio::test]
+    async fn a_failure_that_changed_nothing_invites_one_correction() {
+        let out = run_one(&tools(VerifyClass::PostCondition), call("Nope")).await;
+        assert!(out.failed);
+        assert!(out.retryable, "an unknown tool moved nothing, so a second go is free");
+        assert!(out.summary.contains("call the tool once more"), "{}", out.summary);
+    }
+
+    /// The failure in two traces was choosing the wrong tool, not naming the
+    /// wrong room: asked to switch lights on, the model reached for the
+    /// brightness-and-colour tool and invented both values. The hint said
+    /// nothing about choosing between a couple of dozen near-identical
+    /// signatures, and nothing about leaving a field alone.
+    #[test]
+    fn the_room_hint_says_which_tool_to_use_and_not_to_invent_values() {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        store.set_place_names("home", &["Office".to_string()]).expect("names");
+        let hint = room_hint(&store).expect("names present means a hint");
+        let lower = hint.to_lowercase();
+        assert!(lower.contains("simplest tool"), "{hint}");
+        assert!(lower.contains("on/off tool"), "{hint}");
+        assert!(lower.contains("never invent a value"), "{hint}");
+    }
+
     /// A device named after somewhere it is not — a lamp called after the
     /// place it lights rather than the place it sits — was reported missing
     /// because the model narrowed its search to that room. The hint has to
@@ -525,6 +780,12 @@ mod tests {
     /// for *the light* in the office, the model asked for the office, and the
     /// air conditioning came on. The hint has to name the domain escape hatch,
     /// or a request for one kind of device keeps acting on all of them.
+    ///
+    /// Stating it was not enough. With the rule in the prompt but placed
+    /// *after* "act on the room in one call", a later trace still sent a bare
+    /// `{"area": "Master bedroom"}` and moved the curtains and the roller. So
+    /// the ordering is part of the fix, and is asserted: the obligation comes
+    /// before the economy, and it is phrased as an obligation.
     #[test]
     fn the_room_hint_asks_for_a_domain_when_the_user_named_a_kind_of_device() {
         let store = ToolCatalogStore::open_in_memory().expect("store");
@@ -533,6 +794,15 @@ mod tests {
         let lower = hint.to_lowercase();
         assert!(lower.contains("domain"), "{hint}");
         assert!(hint.contains("[\"light\"]"), "the worked example must survive: {hint}");
+        assert!(lower.contains("domain is required"), "advice was not enough: {hint}");
+
+        let domain_at = lower.find("the domain is required").expect("the obligation");
+        let one_call_at = lower.find("one call for a room").expect("the economy");
+        assert!(
+            domain_at < one_call_at,
+            "the obligation must come before the one-call economy, or the economy \
+             reads as licence to omit the domain: {hint}"
+        );
     }
 
     /// The home matches a device name only exactly: "outdoor office light"
@@ -642,9 +912,7 @@ mod tests {
     fn a_backend_that_cannot_act_is_told_so_instead_of_being_handed_tools() {
         let tools = Arc::new(ActionTools {
             descriptors: vec![serde_json::json!({"type": "function"})],
-            execute: Arc::new(|_| {
-                Box::pin(async { ToolOutcome { summary: String::new(), failed: false } })
-            }),
+            execute: Arc::new(|_| Box::pin(async { ToolOutcome::worked(String::new()) })),
             hint: Some("Rooms: Kitchen".into()),
         });
 

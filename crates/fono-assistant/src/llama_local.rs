@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
-use crate::history::{ChatRole, ToolCall};
+use crate::history::{ChatRole, ChatTurn, ToolCall};
 use crate::local_tools;
 use crate::traits::{
     Assistant, AssistantCacheTrigger, AssistantContext, AssistantPromptCacheSnapshot,
@@ -1945,6 +1945,38 @@ fn build_prompt_split(
     }
 }
 
+/// Render a completed assistant turn for replay on a later turn.
+///
+/// A turn where the model invoked a tool carries the call in `tool_calls` and
+/// usually has empty `content`. Rendering only `content` therefore erased the
+/// action entirely: history replayed the user's request followed by the model
+/// apologising, with no evidence a tool had ever run. The model then reasoned
+/// from its own confusion — one trace shows it announcing that the lights "did
+/// not respond" immediately after a call that succeeded, then calling again.
+///
+/// The call is spelled with [`local_tools::render_call`], the same wrapper the
+/// model is asked to produce, so a replayed call reads back in the syntax it
+/// was taught. It is rebuilt from the parsed name and arguments rather than the
+/// model's own bytes, because that is all history keeps — so this is a
+/// normalised spelling, not a transcript. That is fine here and would not be
+/// mid-turn: the *current* turn continues from the raw text precisely so the
+/// checkpoint saved moments earlier still matches (see the note in
+/// `reply_stream`), whereas a later turn has no such checkpoint to preserve.
+fn render_assistant(turn: &ChatTurn) -> String {
+    let mut out = String::new();
+    let content = turn.content.trim();
+    if !content.is_empty() {
+        out.push_str(content);
+    }
+    for call in &turn.tool_calls {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&local_tools::render_call(&call.name, &call.arguments));
+    }
+    out
+}
+
 fn build_gemma_prompt_split(
     ctx: &AssistantContext,
     user_text: &str,
@@ -1980,8 +2012,17 @@ fn build_gemma_prompt_split(
                     push_gemma_turn(&mut prefix, "user", content, markers);
                 }
             }
-            ChatRole::Assistant => push_gemma_turn(&mut prefix, "model", &turn.content, markers),
-            ChatRole::Tool => {}
+            ChatRole::Assistant => {
+                push_gemma_turn(&mut prefix, "model", &render_assistant(turn), markers);
+            }
+            ChatRole::Tool => {
+                push_gemma_turn(
+                    &mut prefix,
+                    "user",
+                    &local_tools::render_result(&turn.content),
+                    markers,
+                );
+            }
         }
     }
 
@@ -2005,19 +2046,23 @@ fn build_chatml_prompt_split(ctx: &AssistantContext, user_text: &str) -> (String
         prefix.push_str("<|im_end|>\n");
     }
     for turn in &ctx.history {
-        let role = match turn.role {
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-            ChatRole::System => "system",
-            ChatRole::Tool => continue,
+        let (role, content) = match turn.role {
+            ChatRole::User => ("user", turn.content.trim().to_string()),
+            ChatRole::Assistant => ("assistant", render_assistant(turn)),
+            ChatRole::System => ("system", turn.content.trim().to_string()),
+            // No tool role exists in the hand-rolled ChatML framing, so the
+            // answer comes back on the user channel — the same downgrade the
+            // Anthropic backend documents. Dropping it instead taught the model
+            // that acting on a request leaves no trace.
+            ChatRole::Tool => ("user", local_tools::render_result(&turn.content)),
         };
-        if turn.content.trim().is_empty() {
+        if content.trim().is_empty() {
             continue;
         }
         prefix.push_str("<|im_start|>");
         prefix.push_str(role);
         prefix.push('\n');
-        prefix.push_str(turn.content.trim());
+        prefix.push_str(content.trim());
         prefix.push_str("<|im_end|>\n");
     }
     prefix.push_str("<|im_start|>user\n");
@@ -2057,9 +2102,10 @@ fn tool_result_continuation(prompt: &str, call: &str, result: &str, model_name: 
     let reply_role =
         if model_name.to_ascii_lowercase().contains("gemma") { "model" } else { "assistant" };
     format!(
-        "{prompt}{call}{close}\n{open}user\nTool result: {result}{close}\n{open}{reply_role}\n",
+        "{prompt}{call}{close}\n{open}user\n{result}{close}\n{open}{reply_role}\n",
         close = m.close,
         open = m.open,
+        result = local_tools::render_result(result),
     )
 }
 
@@ -2095,7 +2141,7 @@ impl Assistant for LlamaLocalAssistant {
             actions.as_ref().map_or(&[][..], |a| &a.descriptors),
             ctx.instructions.as_deref(),
         );
-        let composed = crate::compose_system_prompt(&head, ctx.speaker_note.as_deref());
+        let composed = crate::compose_system_prompt(&head, ctx.turn_notes().as_deref());
         let ctx = if composed == ctx.system_prompt {
             std::borrow::Cow::Borrowed(ctx)
         } else {
@@ -2140,10 +2186,11 @@ impl Assistant for LlamaLocalAssistant {
         // evicts the right one: a turn carrying a speaker note would pin
         // "…tools, and you are talking to Ana", which the next turn — a
         // different speaker, or none — cannot use, having thrown away the head
-        // that every turn could.
+        // that every turn could. The same goes for the language note, which
+        // changes the moment the user switches language mid-conversation.
         let gen_params = GenParams {
             max_new_tokens,
-            pin_prefix: ctx.history.is_empty() && ctx.speaker_note.is_none(),
+            pin_prefix: ctx.history.is_empty() && ctx.turn_notes().is_none(),
             allow_capture: ctx.allow_brain_capture,
         };
         let started = Instant::now();
@@ -2202,81 +2249,158 @@ impl Assistant for LlamaLocalAssistant {
                     name,
                     arguments,
                 };
-                let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone()))));
-                let outcome = handle.block_on((actions.execute)(call.clone()));
-                let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Result {
-                    tool_call_id: call.id,
-                    summary: outcome.summary.clone(),
-                    failed: outcome.failed,
-                })));
-                // Second pass: word the result. Two things decide whether this
-                // pass costs a fifth of a second or half a minute, and a real
-                // trace paid the half minute — 21.6 s of it re-reading 974
-                // tokens it had just read:
-                //
-                //  * The call has to be spelled the way the model spelled it.
-                //    Re-serialising it as tidy JSON made this prompt diverge
-                //    from the checkpoint saved moments earlier, so that
-                //    checkpoint could never match.
-                //  * The cached prefix has to be THIS turn's completed
-                //    exchange, not the system prefix. The search only considers
-                //    entries shorter than the prefix it is given, so offering
-                //    the system prefix hid the deeper checkpoint — which, worse,
-                //    had just displaced the shallower entry that used to match,
-                //    leaving nothing but the system prompt to restore.
                 let closer = turn_markers(&model_name_owned).close;
-                let call_text = text.trim();
-                let cont = tool_result_continuation(
-                    &prompt,
-                    call_text,
-                    &outcome.summary,
-                    &model_name_owned,
-                );
-                let turn_prefix = format!("{prompt}{call_text}{closer}\n");
-                let (cont_prefix, cont_suffix) = match cont.strip_prefix(turn_prefix.as_str()) {
-                    Some(rest) if !rest.is_empty() => (turn_prefix, rest.to_string()),
-                    // Belt and braces: an empty suffix would generate from
-                    // nothing, so fall back to the old system-prefix split.
-                    _ => (
-                        cache_prefix.clone(),
-                        cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
-                    ),
-                };
-                // Some models open the wording pass with their own channel
-                // header. Hold the opening tokens only while they still look
-                // like one, so the header never reaches the speaker.
-                let mut head = Some(String::new());
-                me.run_inference_with_prefix_cache(
-                    &cont,
-                    &cont_prefix,
-                    &cont_suffix,
-                    PromptStateCacheLayer::F8ChatPrefix,
-                    // Never pinned: this pass's prefix carries this turn's own
-                    // words, so pinning it would evict the static head pin —
-                    // the one entry every later conversation depends on.
-                    GenParams { pin_prefix: false, ..gen_params },
-                    |delta| {
-                        let delta = delta.trim_start_matches('\u{feff}').to_string();
-                        if delta.is_empty() {
-                            return Ok(true);
-                        }
-                        if let Some(buf) = head.as_mut() {
-                            buf.push_str(&delta);
-                            if local_tools::maybe_preamble(buf) {
-                                return Ok(true);
+
+                // One pass of the model, holding back anything that might not
+                // be prose. Two kinds of thing get held: a channel header some
+                // models open with, which must never reach the speaker, and a
+                // tool call, which is either run or discarded but never read
+                // aloud.
+                //
+                // The call is watched for *throughout*, not just at the start,
+                // and on every pass rather than only where a correction is
+                // still allowed. Asking the model to name the devices that
+                // failed and then try again is asking for prose followed by a
+                // call; judging the reply only by how it opens released the
+                // prose and then recited the call. A trace shows two
+                // well-formed calls spoken as JSON while the lights stayed off
+                // — and, worse, stored in the conversation as something the
+                // assistant had said, so the next turn believed a command could
+                // be carried out by describing one.
+                //
+                // Returns the raw text (which the next prompt must reproduce
+                // exactly, or the checkpoint saved moments ago cannot match),
+                // the part that was spoken, and the part held back.
+                let mut run_pass =
+                    |full: &str, prefix: &str, suffix: &str| -> Result<(String, String, String)> {
+                        let mut buf = String::new();
+                        let mut spoken = String::new();
+                        let mut header_done = false;
+                        let text = me.run_inference_with_prefix_cache(
+                            full,
+                            prefix,
+                            suffix,
+                            PromptStateCacheLayer::F8ChatPrefix,
+                            // Never pinned: this pass's prefix carries this
+                            // turn's own words, so pinning it would evict the
+                            // static head pin — the one entry every later
+                            // conversation depends on.
+                            GenParams { pin_prefix: false, ..gen_params },
+                            |delta| {
+                                buf.push_str(delta.trim_start_matches('\u{feff}'));
+                                if !header_done {
+                                    if local_tools::maybe_preamble(&buf) {
+                                        return Ok(true);
+                                    }
+                                    buf = local_tools::strip_preamble(&buf).to_string();
+                                    header_done = true;
+                                }
+                                let (speak, hold) = local_tools::split_speakable(&buf);
+                                let flush = speak.to_string();
+                                buf = hold.to_string();
+                                if flush.is_empty() {
+                                    return Ok(true);
+                                }
+                                spoken.push_str(&flush);
+                                deltas_emitted = deltas_emitted.saturating_add(1);
+                                Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok())
+                            },
+                        )?;
+                        Ok((text, spoken, buf))
+                    };
+
+                // Run the call, word the result, and — at most once, and only
+                // for a failure the executor judged safe to repeat — let the
+                // model correct itself instead of ending the turn in an
+                // apology the user has to answer by speaking again.
+                let mut call = call;
+                let mut base = prompt.clone();
+                let mut call_text = text.trim().to_string();
+                let mut attempt = 0;
+                loop {
+                    let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone()))));
+                    let outcome = handle.block_on((actions.execute)(call.clone()));
+                    let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Result {
+                        tool_call_id: call.id.clone(),
+                        summary: outcome.summary.clone(),
+                        failed: outcome.failed,
+                    })));
+
+                    // Word the result. Two things decide whether this pass
+                    // costs a fifth of a second or half a minute, and a real
+                    // trace paid the half minute — 21.6 s of it re-reading 974
+                    // tokens it had just read:
+                    //
+                    //  * The call has to be spelled the way the model spelled
+                    //    it. Re-serialising it as tidy JSON made this prompt
+                    //    diverge from the checkpoint saved moments earlier, so
+                    //    that checkpoint could never match.
+                    //  * The cached prefix has to be THIS turn's completed
+                    //    exchange, not the system prefix. The search only
+                    //    considers entries shorter than the prefix it is given,
+                    //    so offering the system prefix hid the deeper
+                    //    checkpoint — which, worse, had just displaced the
+                    //    shallower entry that used to match, leaving nothing
+                    //    but the system prompt to restore.
+                    let cont = tool_result_continuation(
+                        &base,
+                        &call_text,
+                        &outcome.summary,
+                        &model_name_owned,
+                    );
+                    let turn_prefix = format!("{base}{call_text}{closer}\n");
+                    let (cont_prefix, cont_suffix) = match cont.strip_prefix(turn_prefix.as_str()) {
+                        Some(rest) if !rest.is_empty() => (turn_prefix, rest.to_string()),
+                        // Belt and braces: an empty suffix would generate from
+                        // nothing, so fall back to the old system-prefix split.
+                        _ => (
+                            cache_prefix.clone(),
+                            cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
+                        ),
+                    };
+                    let may_retry = attempt == 0 && outcome.retryable;
+                    let (raw, spoken, held) = run_pass(&cont, &cont_prefix, &cont_suffix)?;
+
+                    let parsed = local_tools::parse_call(&held);
+                    let retry =
+                        may_retry.then(|| parsed.clone()).flatten().map(|(name, arguments)| {
+                            ToolCall {
+                                id: format!("local-{}", started.elapsed().as_nanos()),
+                                name,
+                                arguments,
                             }
-                            let flush = local_tools::strip_preamble(buf).to_string();
-                            head = None;
-                            if flush.is_empty() {
-                                return Ok(true);
-                            }
+                        });
+                    let Some(next) = retry else {
+                        // Nothing more to run. Whatever was held back is either
+                        // prose — say it, swallowing it would leave the user
+                        // with silence — or a call we are not allowed to make.
+                        // A call is never spoken: reciting JSON tells the user
+                        // nothing and teaches the conversation that describing
+                        // a command is a way of carrying one out.
+                        if let Some((name, _)) = parsed {
+                            warn!(
+                                "{name} was proposed after the correction was already spent; not \
+                                 running it and not reading it out"
+                            );
+                        } else if !held.trim().is_empty() {
                             deltas_emitted = deltas_emitted.saturating_add(1);
-                            return Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok());
+                            let _ = tx.blocking_send(Ok(TokenDelta::text(held.clone())));
+                            return Ok(format!("{spoken}{held}"));
                         }
-                        deltas_emitted = deltas_emitted.saturating_add(1);
-                        Ok(tx.blocking_send(Ok(TokenDelta::text(delta))).is_ok())
-                    },
-                )
+                        return Ok(spoken);
+                    };
+                    info!(
+                        "retrying {} as {} after a failure that changed nothing",
+                        call.name, next.name
+                    );
+                    base = cont;
+                    // The next prompt must reproduce what the model actually
+                    // wrote, call and all, or the checkpoint saved a moment ago
+                    // cannot match and the whole conversation is re-read.
+                    call_text = raw.trim().to_string();
+                    call = next;
+                    attempt += 1;
+                }
             })();
             let elapsed_ms = started.elapsed().as_millis() as u64;
             match result {
@@ -2521,6 +2645,131 @@ mod tests {
     }
 
     #[test]
+    fn tool_turns_survive_into_the_replayed_prompt() {
+        // The defect this guards: `ChatRole::Tool` was dropped and an assistant
+        // turn rendered only its `content`, so a turn that switched a light on
+        // replayed as the user asking and the model apologising — no call, no
+        // result. The model then reasoned from that, announced the device had
+        // not responded, and called again.
+        let call = ToolCall {
+            id: "local-1".into(),
+            name: "HassTurnOn".into(),
+            arguments: r#"{"area":"Master bedroom","domain":["light"]}"#.into(),
+        };
+        let mut acted = turn(ChatRole::Assistant, "");
+        acted.tool_calls = vec![call];
+        let mut answered = turn(ChatRole::Tool, "turned on 3 lights");
+        answered.tool_call_id = Some("local-1".into());
+
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let ctx = AssistantContext {
+                system_prompt: "Be concise.".into(),
+                history: vec![
+                    turn(ChatRole::User, "turn on the light in the master bedroom"),
+                    acted.clone(),
+                    answered.clone(),
+                    turn(ChatRole::Assistant, "Done."),
+                ],
+                ..AssistantContext::default()
+            };
+            let p = build_prompt(&ctx, "and the kitchen", model);
+            assert!(p.contains("HassTurnOn"), "the call must be replayed for {model:?}");
+            assert!(
+                p.contains("Master bedroom"),
+                "the call's arguments must be replayed for {model:?}"
+            );
+            assert!(
+                p.contains("turned on 3 lights"),
+                "the tool's answer must be replayed for {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replayed_call_is_spelled_the_way_the_model_is_asked_to_spell_it() {
+        // A call read back in a syntax the model was never told to produce
+        // teaches it the wrong shape. Both directions go through
+        // `local_tools::render_call`, so this pins them together.
+        let mut acted = turn(ChatRole::Assistant, "");
+        acted.tool_calls = vec![ToolCall {
+            id: "local-1".into(),
+            name: "HassTurnOff".into(),
+            arguments: r#"{"name":"Lampa de sare"}"#.into(),
+        }];
+        assert_eq!(
+            render_assistant(&acted),
+            local_tools::render_call("HassTurnOff", r#"{"name":"Lampa de sare"}"#),
+        );
+    }
+
+    #[test]
+    fn narration_and_call_in_one_turn_both_survive() {
+        // A model may narrate and then call in the same breath. Keeping only
+        // one of the two would leave history describing an action with no
+        // action, or an action nobody explained.
+        let mut both = turn(ChatRole::Assistant, "Right away.");
+        both.tool_calls = vec![ToolCall {
+            id: "local-1".into(),
+            name: "HassTurnOn".into(),
+            arguments: r#"{"area":"Office"}"#.into(),
+        }];
+        let rendered = render_assistant(&both);
+        assert!(rendered.starts_with("Right away."), "narration kept: {rendered:?}");
+        assert!(rendered.contains("HassTurnOn"), "call kept: {rendered:?}");
+    }
+
+    #[test]
+    fn a_cleared_log_rebuilds_the_very_first_prompt() {
+        // Why clearing after an action keeps the next command fast. The cache is
+        // keyed on content and looked up by token *prefix*, so a head that is no
+        // longer at the front is a head that cannot be found — an accumulating
+        // log pushes it back and the next command pays a full cold prefill.
+        // Emptying the log makes the following command byte-identical to a first
+        // one, which is exactly the case the pinned checkpoint was stored for.
+        let system = "You are Fono, a terse assistant.";
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let first =
+                AssistantContext { system_prompt: system.into(), ..AssistantContext::default() };
+            let (fresh_prefix, _) = build_prompt_split(&first, "turn on the office light", model);
+
+            // The same context after a command that actuated something and was
+            // then forgotten: history is empty again.
+            let after_clearing =
+                AssistantContext { system_prompt: system.into(), ..AssistantContext::default() };
+            let (next_prefix, _) =
+                build_prompt_split(&after_clearing, "turn off the office light", model);
+            assert_eq!(
+                fresh_prefix, next_prefix,
+                "a forgotten command must leave the cacheable prefix untouched for {model:?}"
+            );
+
+            // And for contrast: had the exchange been kept, the head would no
+            // longer be all there is in front of the new command.
+            let mut acted = turn(ChatRole::Assistant, "");
+            acted.tool_calls = vec![ToolCall {
+                id: "local-1".into(),
+                name: "HassTurnOn".into(),
+                arguments: r#"{"area":"Office","domain":["light"]}"#.into(),
+            }];
+            let kept = AssistantContext {
+                system_prompt: system.into(),
+                history: vec![
+                    turn(ChatRole::User, "turn on the office light"),
+                    acted,
+                    turn(ChatRole::Tool, "turned on 1 light"),
+                    turn(ChatRole::Assistant, "Done."),
+                ],
+                ..AssistantContext::default()
+            };
+            let (kept_prefix, _) = build_prompt_split(&kept, "turn off the office light", model);
+            assert!(
+                kept_prefix.len() > next_prefix.len(),
+                "keeping the exchange must be the longer prompt for {model:?}"
+            );
+        }
+    }
+
+    #[test]
     fn assistant_base_prefix_leads_chat_prefix() {
         // Workstream C: the prewarmed F8System base must be a textual prefix of
         // the live F8ChatPrefix prompt prefix for any history, otherwise
@@ -2760,11 +3009,9 @@ mod tests {
                 let recorder = Arc::clone(&recorder);
                 Box::pin(async move {
                     recorder.lock().expect("poisoned").push(call);
-                    ToolOutcome {
-                        summary: "{\"success\": [{\"name\": \"Kitchen light\"}], \"failed\": []}"
-                            .into(),
-                        failed: false,
-                    }
+                    ToolOutcome::worked(
+                        "{\"success\": [{\"name\": \"Kitchen light\"}], \"failed\": []}".into(),
+                    )
                 })
             }),
         });

@@ -532,7 +532,16 @@ pub async fn run_assistant_turn(
         system_prompt,
         instructions,
         speaker_note,
-        language,
+        // The language Fono actually heard, not the configured hint — which is
+        // `None` in auto-detect mode, i.e. exactly when naming the language
+        // matters. `metrics.language` was updated above from the recogniser's
+        // own verdict, and is normalised here because it may arrive as a name
+        // ("romanian") rather than a code.
+        language: metrics
+            .language
+            .as_deref()
+            .map(fono_stt::lang::whisper_lang_to_code)
+            .or(language),
         history: history_snapshot,
         active_window_context,
         screen_capture: screen_capture_fn,
@@ -975,6 +984,7 @@ pub async fn run_assistant_turn(
     {
         let mut s = state.lock().await;
         let provider = assistant.name();
+        let mut acted = false;
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
@@ -982,6 +992,7 @@ pub async fn run_assistant_turn(
                     // ownership, but the audit trail wants name + args.
                     s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
+                    acted = true;
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.log.record_tool_result(&summary, Some(provider));
@@ -996,6 +1007,9 @@ pub async fn run_assistant_turn(
             // someone reviews later.
             s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
             s.history.push_assistant(full_reply.trim().to_string());
+        }
+        if acted {
+            forget_after_action(&mut s.history);
         }
     }
 
@@ -1098,6 +1112,34 @@ pub async fn run_assistant_turn(
         }));
     }
     Ok(any_audio)
+}
+
+/// Drop the rolling conversation log after a turn that actuated something.
+///
+/// A spoken command is self-contained: "turn on the light in the master
+/// bedroom" names its own room and its own device, and the next command
+/// names its own too. Replaying the previous command as context adds no
+/// information a model can use, and measurably harms routing — across
+/// traced turns, commands issued with a non-empty log sent the required
+/// `domain` argument 16% of the time against 69% from a clean log, and
+/// the misses landed on whatever else shared the room (curtains, a
+/// roller, a thermostat).
+///
+/// Clearing here also keeps the *cached* prompt prefix usable. The
+/// system head is attached to the first user turn, so an accumulating
+/// log pushes it away from the front of the prompt; the cache looks up a
+/// token *prefix*, so a head that is no longer first is a head that is
+/// no longer found, and the next command pays a full cold prefill (41.8 s
+/// was observed). With the log cleared, every command starts at the
+/// pinned head and the fast path is taken every time.
+///
+/// Only the model's view is dropped. The saved thread in the history
+/// page is untouched: continuity there is for the person reading it
+/// later, which is a different question from what helps the model route
+/// the next command. (The tray's "Forget conversation" closes that
+/// thread too, deliberately — this is the narrower half of it.)
+fn forget_after_action(history: &mut fono_assistant::ConversationHistory) {
+    history.clear();
 }
 
 /// Upper bound on the character count fed to [`read_dwell`] when sizing
@@ -1226,11 +1268,13 @@ async fn drive_text_only_reply(
     // Push tool exchange + the reply into history under a single lock.
     {
         let mut s = state.lock().await;
+        let mut acted = false;
         for event in tool_event_log {
             match event {
                 ToolEvent::Called(call) => {
                     s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
+                    acted = true;
                 }
                 ToolEvent::Result { tool_call_id, summary, .. } => {
                     s.log.record_tool_result(&summary, Some(provider));
@@ -1241,6 +1285,9 @@ async fn drive_text_only_reply(
         if !full_reply.trim().is_empty() {
             s.log.record_assistant(full_reply.trim(), aborted_mid_stream, None, Some(provider));
             s.history.push_assistant(full_reply.trim().to_string());
+        }
+        if acted {
+            forget_after_action(&mut s.history);
         }
     }
 
@@ -2981,6 +3028,46 @@ mod tests {
         assert_eq!(classify_tool_outcome("cancelled by the user", false), AssistantToolOutcome::Ok);
         // And the executor's verdict is equally decisive the other way.
         assert_eq!(classify_tool_outcome("Done.", true), AssistantToolOutcome::Failed);
+    }
+
+    #[test]
+    fn a_command_leaves_nothing_behind_for_the_next_one() {
+        // Each spoken command is its own turn. What the previous command
+        // did is not context for the next one, and carrying it measurably
+        // hurt routing, so the model's view is emptied once something has
+        // actually been actuated.
+        let mut history =
+            fono_assistant::ConversationHistory::new(std::time::Duration::from_secs(3600), 12);
+        history.push_user("turn on the light in the master bedroom".into());
+        history.push_assistant_tool_calls(
+            String::new(),
+            vec![fono_assistant::ToolCall {
+                id: "local-1".into(),
+                name: "HassTurnOn".into(),
+                arguments: r#"{"area":"Master bedroom","domain":["light"]}"#.into(),
+            }],
+        );
+        history.push_tool_result("local-1".into(), "turned on 3 lights".into());
+        history.push_assistant("Done.".into());
+        assert!(!history.snapshot().is_empty(), "the turn was recorded");
+
+        super::forget_after_action(&mut history);
+        assert!(
+            history.snapshot().is_empty(),
+            "the next command must start from the pinned head, not from this one"
+        );
+    }
+
+    #[test]
+    fn a_plain_conversation_is_not_forgotten() {
+        // Only actuation clears the log. Asking a question and following up
+        // on the answer is the case history exists for, and the caller only
+        // reaches `forget_after_action` when a tool actually ran.
+        let mut history =
+            fono_assistant::ConversationHistory::new(std::time::Duration::from_secs(3600), 12);
+        history.push_user("what is the capital of France".into());
+        history.push_assistant("Paris.".into());
+        assert_eq!(history.snapshot().len(), 2, "a question and its answer both persist");
     }
 
     #[test]

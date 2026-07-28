@@ -1,6 +1,136 @@
 # Fono — Project Status
 Last updated: 2026-07-28
 
+## 2026-07-28 — The retry existed, fired, and was read aloud instead of run
+
+Task 9 of `plans/2026-07-28-voice-actions-universal-first-v5.md`: the same four
+commands, re-measured after Tier 1. Traces `assistant-1785218020-0002` through
+`-1785218202-0005`. Three defects, recorded as F36–F38 in that plan.
+
+**F36 is the severe one, and it is a self-inflicted wound.** In `…132-0004` the
+model did exactly what Tier 1 asked: handed a partial-failure result, it emitted
+two corrective `HassTurnOn` calls with `domain: ["light"]`, naming the devices
+that had not responded. Neither ran. Both were **spoken as raw JSON** — 289
+characters, 24 seconds of TTS. On the first pass a call is recognised, held back
+and executed; on the correction pass the same text was handed to the speech
+splitter. So Tier 1's central mechanism had never been exercised end to end, and
+those four traces do not measure what Task 9 intended. **Task 9 must be re-run.**
+
+The fix makes the invariant unconditional rather than per-pass: a tool call is
+never speakable, on any pass, including the final one after the retry is spent.
+`crates/fono-assistant/src/local_tools.rs` gained the split (speakable prefix,
+held call tail) with tests for a call after prose, a call arriving mid-stream,
+and a bare angle bracket that never becomes a call. The reason the unit tests
+all passed while the feature was dead: they asserted on the parser, and the bug
+was in the *routing* one crate away.
+
+**F37 — position was necessary and not sufficient.** Task 5 moved "Match the
+user's language" to immediately before generation, and both Romanian commands
+still got English replies. The prompt asks the model to *infer* the language; a
+weak model reading a house full of English device names infers English. The
+detected language was known all along — `stt.transcribe` reports it, and
+`AssistantContext::language` was carried to every backend and read by none. It
+now travels in the volatile tail beside the speaker note, stated as a fact. The
+pin guard covers it, or a Romanian turn would pin a head no other turn can use.
+
+**F38 — a rule can be present and still read as optional.** The bare
+`{"area": "Master bedroom"}` that moved the curtains happened *with* the domain
+rule in the prompt. It opened with the permission ("act on the room in one
+call") and only then qualified it, as advice rather than obligation. The
+obligation now leads and says *required*; the one-call economy is a separate
+rule so it cannot be read as licence to omit the domain. The **ordering** is
+asserted by test, not just the wording — stating it was already tried.
+
+Gate: fmt, clippy `-D warnings` (including `--features llama-local`), and the
+full test suite clean. No new dependencies.
+
+## 2026-07-28 — An action benchmark that runs against the real house
+
+`fono bench-actions`, behind the non-default `bench-actions` feature, so the
+shipped binary is unchanged (size gate: 22.16 MiB, same as before).
+
+**It reuses the production path rather than imitating it.** The existing
+`crates/fono-bench/src/assistant_tool_use.rs` hand-rolls an OpenAI request and
+therefore grades *the model*; everything Fono does around the model — the room
+hint, blank-argument trimming, schema validation, the retry ladder, the vendor
+admission ladder, readback verification — was bypassed. The new harness drives
+`run_assistant_turn` with `pre_transcribed: Some(…)`, `tts: None`,
+`overlay: None`, which was already supported (`crates/fono/src/assistant.rs:193-198`),
+so a text turn is the voice turn minus the microphone. **Rule going forward:
+never add a second text-in path — if a text turn needs behaviour that does not
+exist, add it to `run_assistant_turn` so the voice path gets it too.**
+
+**Fixtures name no devices.** A case states a requirement — "any light", "an
+area with a light and another switchable device" — resolved at run time against
+the live `GetLiveContext` dump (`crates/fono/src/bench_actions/house.rs`). This
+replaced an earlier design that used a gitignored role→name map: discovery is
+strictly better, because it needs no user-authored config, survives a renamed
+lamp, and finds the bystander automatically. An unsatisfiable requirement is
+`Skipped`, never `Failed`. Selection is sorted-then-first so two runs compare.
+
+**Three rates, not one** (`crates/fono/src/bench_actions/runner.rs:520-580`):
+routing (model unaided), first-try, and final. Routing is deliberately *not* a
+success rate — the first live run printed "right first time 100% / right in the
+end 0%" for a case that chose the right tool and still failed at the server.
+The two success rates now nest by construction, with a test pinning it.
+
+**Safety without a fidelity cost.** An earlier draft proposed a role allowlist;
+dropped, because the harness hands the model the same catalogue the assistant
+gets every day, and narrowing it would change the routing problem. What is
+actually different is *unattended and repetitive*, which is answered by
+per-case restore plus a five-line exclusion of locks, alarms and garage covers
+from **target selection only** — the model may still call them.
+
+Two real bugs found by running it, both fixed with regression tests:
+
+- Server names were matched exactly, so a fixture saying `Home Assistant` could
+  not find a config saying `HomeAssistant`. Now matched loosely, and a missing
+  server skips that fixture instead of aborting the suite.
+- A real house has a `switch` named "Basement lights", which by domain alone
+  looked like a valid bystander for "turn on the lights in the Basement" —
+  asserting it must not move would have failed a model for agreeing with the
+  user. Bystanders now need a name that does not read as the requested domain.
+
+**Live finding, not a harness bug:** asked "turn on the Balcony lights", the
+local `gemma-4-e2b` put the device name in the `area` slot, and despite the
+server replying `INVALID_AREA` and Fono explicitly inviting a correction, it
+gave up after one call rather than retrying with `name`. That is the first
+thing this harness exists to measure, and it is now measurable.
+
+Plan: `plans/2026-07-28-action-benchmark-v3.md`. Next slices are the cassette
+(record/replay/fault-injection), then a notes MCP server — the only family with
+no private nouns, so the only one that can gate CI.
+
+## 2026-07-28 — Two debts paid: the live house test, and thinking-off
+
+Both are guards rather than features — they stop something already working from
+being lost quietly.
+
+**The live house test has a permanent home.** It was `tmp/ha-recon/live_light_test.py`,
+which is on the ignore list and would have vanished the next time that directory
+was pruned. It is now `tests/live_house.py`, and self-contained: the MCP-over-SSE
+client that used to be imported from a sibling scratch file is inlined, the tool
+catalogue is fetched live instead of read from a scratch fixture, the house
+address moved from a hardcoded IP to `HA_BASE` / `--base`, and the hardcoded
+kitchen became `--area`. Deliberately *not* wired into `check.sh`: it needs a
+real house and it moves real lights.
+
+**Thinking-off is now pinned by tests, on both sides of the boundary.**
+Suppressing hidden reasoning is the largest single lever on how long a command
+takes — a measured trace spent 10.8 s of a 12.4 s command inside the model — and
+it is exactly the kind of thing a refactor drops without anyone noticing, because
+nothing breaks when it goes: the reply is still correct, only slow. The switches
+are now built by a small function that can be asserted without a network call,
+and a test names all six backends individually, so adding a seventh without
+deciding this fails the test rather than silently defaulting.
+
+The other side of that boundary matters as much. Someone pointing their editor or
+their agent at Fono's own LLM server is *not* Fono's assistant, and forcing
+Fono's preference on them would quietly degrade a caller who wanted the model to
+think. Two tests now pin that a proxied request reaches the provider carrying
+exactly what the client wrote, and that filling in an absent model is the only
+change Fono makes.
+
 ## 2026-07-28 — What Fono is told about itself now comes last, where it is read
 
 Fono's instructions — who it is, how long an answer should be, and to reply in
@@ -55,6 +185,42 @@ refresh, and refreshing when nothing actually changed costs almost nothing.
 assistant reads before it can answer, which is the number that matters most on a
 local model.
 
+## 2026-07-28 — Fono now fixes its own mistake instead of asking you to repeat yourself
+
+Four traces of one small model being asked, in Romanian and in English, to turn
+the bedroom lights on. All four ended the same way: the house said in plain words
+what was wrong with the request, Fono read the objection aloud, and the user had
+to say the whole thing again. The correction was already in the model's hands and
+nothing invited it to use it.
+
+**Asking again, once.** When a command fails in a way that changed nothing —
+the house refused it, the server could not be reached, the tool does not exist —
+the model is now handed the objection along with the tools it had, and may try
+once more inside the same turn. Only once, and only where trying twice is the
+same request as trying once: switching something on or off qualifies, because a
+lamp that is already on stays on, while "two degrees warmer" does not, because
+twice is four degrees. A command that partly worked gets the same second chance
+for the parts that were missed. Where Fono cannot tell whether repeating is safe,
+it says what went wrong and stops, which is the safe direction to be wrong in.
+
+**Catching a bad request before the house sees it.** Asked to turn the lights on,
+the model reached for the brightness-and-colour command and invented both values.
+`#FFFFFF` is not a colour that command accepts, so the house threw the whole
+request away and the lights stayed off — twice, in two languages. Fono now checks
+the values against what the server said it accepts, and when something is plainly
+wrong it does not send the command at all: it names the offending value back to
+the model, which is a correction it can act on where "received invalid slot info"
+is not. Deliberately cautious — only the type of a value and a list of allowed
+words are checked, because a published description of a command is routinely
+stricter than the command itself, and refusing something the house would have
+accepted is the worse mistake.
+
+**Saying which command to use.** The advice Fono gives about the home was
+entirely about *which room and which device* and silent on *which command*, while
+a couple of dozen near-identical ones competed for the same request. It is now a
+short numbered list rather than a paragraph — shorter than what it replaced — and
+two of the rules are new: use the simplest command that does what was asked, and
+fill in only the values that were actually asked for.
 
 ## 2026-07-27 — A saved conversation that could never be reused, and one empty word
 

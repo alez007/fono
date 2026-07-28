@@ -108,6 +108,57 @@ restored it in 3 ms and prefilled 37, 2 and 2 tokens respectively. Total turn ti
 
 ---
 
+## Task 9 measurement — the same four commands, after Tier 1
+
+Traces `assistant-1785218020-0002`, `-1785218059-0003`, `-1785218132-0004`,
+`-1785218202-0005`. Same model, same house, same four commands, in order.
+
+| trace | spoken | what happened |
+|---|---|---|
+| `…020-0002` | Romanian, "turn the lights on" | partial — lights answered, reply in **English** |
+| `…059-0003` | Romanian, "the salt lamp" | nothing ran |
+| `…132-0004` | English, "turn on the light" | partial — **curtains and roller moved again**; retry fired and was **spoken, not run** |
+| `…202-0005` | English, "turn off the light" | nothing ran |
+
+- **F36 — the retry was correct and unreachable. This is the severe one.** In `…132-0004`
+  the model, handed the partial-failure result, did exactly what Task 1 asked of it: it
+  emitted two corrective calls, both `HassTurnOn` with `domain: ["light"]`, naming the
+  devices that had not responded. Neither was executed. Both were **read out loud as raw
+  JSON** — 289 characters of tail, 24 seconds of synthesised speech.
+  The cause is that the correction pass treated the model's output as prose. On the first
+  pass a tool call is recognised, held back and executed; on the correction pass the same
+  text was routed to the speech splitter. So Tier 1's central mechanism has never actually
+  been exercised end to end, and the four traces do **not** measure what Task 9 intended.
+  The invariant this violated, now enforced unconditionally: *a tool call is never
+  speakable, on any pass.*
+- **F37 — the language instruction is not enough on its own.** Task 5 moved *"Match the
+  user's language"* to the end of the head, immediately before generation, and both
+  Romanian commands still received English replies. So position was necessary and not
+  sufficient. The prompt asks the model to *infer* the language from the transcript; a
+  weak model reads a house full of English device names and answers in English. The
+  detected language was known to Fono the whole time — `stt.transcribe` reports it, and
+  `AssistantContext::language` was carried to every backend and **read by none**.
+  Fix: state the language as a fact per turn, in the volatile tail beside the speaker note,
+  rather than hoping it is deduced. Universal — every backend gets the same note, and a
+  strong model that was already correct sees a statement it agrees with.
+- **F38 — a rule can be present and still be read as optional.** `…132-0004` sent a bare
+  `{"area": "Master bedroom"}` and moved the curtains, with the Task 6 hint in the prompt
+  and its domain rule *stated*. Two things were wrong with how it was stated: the sentence
+  opened with the permission (*"act on the room in one call"*) and only afterwards
+  qualified it, and the qualification was phrased as advice (*"pass that kind as the
+  domain"*) rather than an obligation. Fix: the obligation leads, says **required**, and
+  the one-call economy is a separate rule so it cannot be read as licence to omit the
+  domain. Ordering is now asserted by test, not just the wording.
+
+**What this says about the plan's method.** Tier 1 was ordered by leverage and the ordering
+was right — but F36 shows a fourth question belongs beside the three universality
+questions: *can this mechanism be observed working?* The retry passed every unit test,
+shipped, and was dead on arrival in the one code path that mattered. Nothing asserted that
+a corrective call was executed rather than spoken, because the assertion lived in a
+different crate from the bug.
+
+---
+
 ## Implementation Plan
 
 ### Tier 1 — universal correctness
@@ -168,11 +219,15 @@ Ordered by leverage. Tasks 1–3 are one coherent change and should land togethe
       "implied"; the conservative version — drop optional arguments the user's words do
       not support when a simpler sibling tool exists — is the safe starting point, and
       Task 9 will show whether it is sufficient.
-- [ ] **Task 9. Re-measure the same four commands and gate Tier 2 on the result.**
+- [x] **Task 9. Re-measure the same four commands and gate Tier 2 on the result.**
       Assert on *tool chosen* and *arguments sent*, not on latency. Rationale: every claim
       in Tier 1 is a hypothesis until a trace agrees. This task is the decision point for
       whether Tier 2 is needed at all, and it is the reason Tier 2 is not being built
-      speculatively.
+      speculatively. **Measured 2026-07-28 — see F36–F38.** The verdict is that Tier 1's
+      retry was *correct and unreachable*: it fired, produced two well-formed corrective
+      calls, and both were read aloud as JSON instead of executed. Tier 2 is **not**
+      unblocked by this result, because the measurement did not test what it was meant to.
+      Task 9 must be re-run once F36 is fixed.
 
 **Status, 2026-07-28.** Tasks 1–8 shipped. Two qualifications, recorded so the
 measurement in Task 9 is read honestly:

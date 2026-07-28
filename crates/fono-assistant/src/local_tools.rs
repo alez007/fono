@@ -108,6 +108,33 @@ pub fn instructions(descriptors: &[Value]) -> String {
     s
 }
 
+/// Spells a tool call the way [`instructions`] asks for it, for replaying a
+/// completed exchange back to the model on a later turn.
+///
+/// Rendering it here rather than at the call site keeps the asked-for shape and
+/// the replayed shape in one file. A model that reads back a call in a syntax
+/// it was never told to produce learns the wrong lesson about what a call looks
+/// like, and the two spellings have no reason to agree unless they are written
+/// next to each other.
+#[must_use]
+pub fn render_call(name: &str, arguments: &str) -> String {
+    let args = arguments.trim();
+    let args = if args.is_empty() { "{}" } else { args };
+    format!("{OPEN}{{\"name\": \"{name}\", \"arguments\": {args}}}{CLOSE}")
+}
+
+/// Labels a tool's answer for the model.
+///
+/// The single definition used both to continue the current turn and to replay
+/// the exchange on later turns. These were separate strings once; that is
+/// precisely the kind of drift that silently costs a cache match, because the
+/// prompt continued mid-turn must remain a prefix of the prompt built next
+/// turn.
+#[must_use]
+pub fn render_result(summary: &str) -> String {
+    format!("Tool result: {}", summary.trim())
+}
+
 /// Whether `text` — a reply generated so far — could still turn out to be a
 /// tool call.
 ///
@@ -123,6 +150,38 @@ pub fn could_be_call(text: &str) -> bool {
         return true;
     }
     OPENERS.iter().any(|o| t.starts_with(o) || o.starts_with(t))
+}
+
+/// Split a partly-generated reply into what is safe to speak now and what must
+/// be held back because it may be the start of a tool call.
+///
+/// [`could_be_call`] only judges a reply *as a whole*, which is right when the
+/// model does as it is told and emits a call and nothing else. It is wrong the
+/// moment a call arrives *after* prose — and that is exactly what Fono now asks
+/// for on a correction: say which devices did not respond, then try again. A
+/// trace of that turn shows the consequence in full. The model said "I will try
+/// turning on those specific lights now for you" and then emitted two perfectly
+/// good calls; because the reply had already been released as prose, the calls
+/// were streamed to the speaker instead of the house. The user heard raw JSON
+/// read aloud, the lights stayed off, and — worse — the spoken text went into
+/// the conversation as something the assistant had said, so the next turn
+/// believed a command could be carried out by describing it.
+///
+/// The split is deliberately narrow: text is held only when its tail is the
+/// opening tag, complete or half-arrived. Prose containing an angle bracket
+/// ("5 < 3") is not a prefix of the tag and streams untouched, and a single
+/// held `<` is released by the very next token if it turns out to be nothing.
+#[must_use]
+pub fn split_speakable(text: &str) -> (&str, &str) {
+    if let Some(at) = text.find(OPEN) {
+        return text.split_at(at);
+    }
+    // Longest tail that is still an unfinished opening tag.
+    let max = OPEN.len().min(text.len()).saturating_sub(1);
+    (1..=max)
+        .rev()
+        .find(|&i| text.is_char_boundary(text.len() - i) && text.ends_with(&OPEN[..i]))
+        .map_or((text, ""), |i| text.split_at(text.len() - i))
 }
 
 /// Pulls the tool call out of a finished reply, as `(name, arguments_json)`.
@@ -269,6 +328,49 @@ mod tests {
         assert!(parse_call("I will turn on the light in the master bedroom.").is_none());
         assert!(parse_call("<tool_call>not json</tool_call>").is_none());
         assert!(parse_call("{\"arguments\": {}}").is_none());
+    }
+
+    /// A call that arrives *after* prose must still be run, not read out.
+    ///
+    /// This is the shape a correction takes — name what failed, then try again —
+    /// and getting it wrong meant a user heard two well-formed calls recited as
+    /// JSON while the lights stayed off.
+    #[test]
+    fn a_call_after_prose_is_held_back_and_the_prose_is_not() {
+        let (speak, hold) = split_speakable("Trying again.\n\n<tool_call>{\"name\": \"X\"}");
+        assert_eq!(speak, "Trying again.\n\n");
+        assert_eq!(hold, "<tool_call>{\"name\": \"X\"}");
+    }
+
+    /// The tag arrives a token at a time, so a partial tail must be held too —
+    /// otherwise the first fragment escapes and the rest is spoken after it.
+    #[test]
+    fn a_half_arrived_tag_is_held_until_it_is_settled() {
+        for tail in ["<", "<to", "<tool_cal"] {
+            let text = format!("Trying again. {tail}");
+            let (speak, hold) = split_speakable(&text);
+            assert_eq!(speak, "Trying again. ", "tail {tail:?}");
+            assert_eq!(hold, tail, "tail {tail:?}");
+        }
+    }
+
+    /// Prose that merely contains an angle bracket is not a call and must not
+    /// be delayed — held text is released the moment it cannot be the tag.
+    #[test]
+    fn an_angle_bracket_in_prose_streams_untouched() {
+        let (speak, hold) = split_speakable("Anything under 5 < 3 is wrong.");
+        assert_eq!(speak, "Anything under 5 < 3 is wrong.");
+        assert!(hold.is_empty());
+    }
+
+    /// Multi-byte text must never be split mid-character; Fono is spoken to in
+    /// Romanian, and a panic here would take the whole turn down.
+    #[test]
+    fn splitting_never_lands_inside_a_character() {
+        for text in ["Am aprins lumina în birou.", "Gata — încerc din nou. <", "«»<t"] {
+            let (speak, hold) = split_speakable(text);
+            assert_eq!(format!("{speak}{hold}"), text);
+        }
     }
 
     /// Holding back only while ambiguous is what keeps ordinary conversation

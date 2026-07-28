@@ -104,21 +104,47 @@ pub fn compose_head(context: &str, tool_block: Option<&str>, instructions: Optio
 }
 
 /// Compose the system block a backend will actually send: the steady head
-/// first, the volatile speaker note last.
+/// first, the volatile per-turn notes last.
 ///
 /// The head — greeting, rooms, devices, tool descriptions — changes only when
 /// the house does, so a backend that checkpoints its prompt can keep it for
-/// days. The speaker note changes from one turn to the next. Putting the note
-/// last is what lets a change of speaker cost a handful of tokens instead of
-/// throwing away nine hundred tokens of perfectly good device list.
+/// days. The notes change from one turn to the next. Putting them last is what
+/// lets a change of speaker cost a handful of tokens instead of throwing away
+/// nine hundred tokens of perfectly good device list.
 #[must_use]
-pub fn compose_system_prompt(head: &str, speaker_note: Option<&str>) -> String {
-    speaker_note.map(str::trim).filter(|n| !n.is_empty()).map_or_else(
+pub fn compose_system_prompt(head: &str, notes: Option<&str>) -> String {
+    notes.map(str::trim).filter(|n| !n.is_empty()).map_or_else(
         // Leave the head byte-identical to what the cache pinned — trailing
         // whitespace and all — when there is nothing to add.
         || head.to_string(),
         |note| format!("{}\n\n{note}", head.trim_end()),
     )
+}
+
+/// Name the language to reply in, for a BCP-47 code Fono recognises.
+///
+/// *"Match the user's language"* is in the behavioural rules, and a small model
+/// ignores it: four traces of Romanian and English commands came back in English
+/// every time, including the two spoken in Romanian. The rule asks the model to
+/// do two things at once — work out which language it just heard, and then use
+/// it — and the first is the one it fails, silently and with no way to tell.
+///
+/// Naming the language removes the inference. Fono has already decided which
+/// language this was, minutes more reliably than the model can, because that
+/// same decision picks the speech recogniser and the voice that speaks the
+/// answer. Saying it plainly costs a handful of tokens and needs nothing of the
+/// model but obedience.
+///
+/// Deliberately silent on a code that is not in the curated list: rendering
+/// *"Reply in haw."* is worse than saying nothing, because it asks the model to
+/// decode a language tag mid-instruction. Those fall back to the general rule,
+/// which is exactly today's behaviour.
+#[must_use]
+pub fn language_note(code: &str) -> Option<String> {
+    let code = code.trim();
+    let name = fono_core::languages::display_name(code);
+    // `display_name` echoes the code back when it does not know it.
+    (!code.is_empty() && name != code).then(|| format!("Reply in {name}."))
 }
 
 /// One token delta yielded by [`Assistant::reply_stream`]. Most
@@ -205,6 +231,30 @@ pub type ToolExecFn =
 pub struct ToolOutcome {
     pub summary: String,
     pub failed: bool,
+    /// Whether the model may be given one more go at this, with the tools
+    /// still offered, instead of the turn ending in an apology.
+    ///
+    /// Four traces of one small model asking for the bedroom lights ended the
+    /// same way: the house objected in plain words, Fono read the objection
+    /// aloud, and the user had to say the whole thing again. The correction
+    /// the model needed was already in its hands — the server's own error text
+    /// — and nothing used it.
+    ///
+    /// Only the executor can set this, because only the executor knows whether
+    /// running the command a second time is harmless. Two cases qualify:
+    /// nothing happened at all, so there is nothing to double; or the command
+    /// asks for an absolute end state ("be on", "be off"), where asking twice
+    /// and asking once are the same request. A relative change — two degrees
+    /// warmer — is never retried, because twice is four degrees.
+    pub retryable: bool,
+}
+
+impl ToolOutcome {
+    /// A tool that did what was asked, with no second chance needed.
+    #[must_use]
+    pub fn worked(summary: String) -> Self {
+        Self { summary, failed: false, retryable: false }
+    }
 }
 
 /// The tools Fono may let the model invoke this turn, and how to run
@@ -290,18 +340,35 @@ pub struct AssistantContext {
 }
 
 impl AssistantContext {
-    /// The system block to send: the steady head, then the speaker note.
+    /// The volatile tail: which language to reply in, then who is speaking.
+    ///
+    /// Both change from one turn to the next, so both are composed *after* the
+    /// steady head rather than woven into it — see [`compose_system_prompt`].
+    /// The language is named rather than inferred because Fono already knows it
+    /// and a small model demonstrably does not act on being told to work it out.
+    #[must_use]
+    pub fn turn_notes(&self) -> Option<String> {
+        let lang = self.language.as_deref().and_then(language_note);
+        match (lang, self.speaker_note.as_deref().map(str::trim).filter(|n| !n.is_empty())) {
+            (None, None) => None,
+            (Some(l), None) => Some(l),
+            (None, Some(s)) => Some(s.to_string()),
+            (Some(l), Some(s)) => Some(format!("{l} {s}")),
+        }
+    }
+
+    /// The system block to send: the steady head, then this turn's notes.
     ///
     /// Backends that pass the system prompt straight through should use this
     /// rather than [`system_prompt`](Self::system_prompt), so the behavioural
-    /// rules land after the context and the volatile speaker note lands last.
+    /// rules land after the context and the volatile notes land last.
     /// A backend that appends more steady material of its own — the embedded
     /// one describes the user's tools in the system prompt — must build the
     /// head with [`compose_head`] and call [`compose_system_prompt`] itself.
     #[must_use]
     pub fn system_block(&self) -> String {
         let head = compose_head(&self.system_prompt, None, self.instructions.as_deref());
-        compose_system_prompt(&head, self.speaker_note.as_deref())
+        compose_system_prompt(&head, self.turn_notes().as_deref())
     }
 }
 
@@ -482,4 +549,78 @@ pub trait RealtimeAssistant: Send + Sync {
     /// PCM sample rate (Hz) the model expects on the mic-input stream.
     /// The capture path resamples to this before forwarding.
     fn native_input_rate(&self) -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_language_is_named_for_codes_fono_knows() {
+        assert_eq!(language_note("ro").as_deref(), Some("Reply in Romanian."));
+        assert_eq!(language_note("en").as_deref(), Some("Reply in English."));
+        // Whitespace is incidental, not a different language.
+        assert_eq!(language_note(" ro ").as_deref(), Some("Reply in Romanian."));
+    }
+
+    #[test]
+    fn an_unknown_code_says_nothing_rather_than_something_confusing() {
+        // "Reply in haw." asks the model to decode a language tag mid-sentence,
+        // which is worse than falling back to the general behavioural rule.
+        assert!(language_note("haw").is_none());
+        assert!(language_note("").is_none());
+        assert!(language_note("   ").is_none());
+    }
+
+    #[test]
+    fn the_turn_notes_carry_language_then_speaker() {
+        let ctx = AssistantContext {
+            language: Some("ro".into()),
+            speaker_note: Some("You are talking to Ana.".into()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.turn_notes().as_deref(), Some("Reply in Romanian. You are talking to Ana."));
+    }
+
+    #[test]
+    fn either_note_alone_is_enough_and_neither_is_fine() {
+        let lang = AssistantContext { language: Some("ro".into()), ..Default::default() };
+        assert_eq!(lang.turn_notes().as_deref(), Some("Reply in Romanian."));
+
+        let who = AssistantContext {
+            speaker_note: Some("You are talking to Ana.".into()),
+            ..Default::default()
+        };
+        assert_eq!(who.turn_notes().as_deref(), Some("You are talking to Ana."));
+
+        assert!(AssistantContext::default().turn_notes().is_none());
+    }
+
+    #[test]
+    fn the_notes_land_behind_everything_steady() {
+        // The whole point of composing them separately: a change of language or
+        // speaker must cost the notes, never the device list in front of them.
+        let ctx = AssistantContext {
+            system_prompt: "You are Fono.\n\nRooms: Kitchen, Office.".into(),
+            instructions: Some("Keep replies short.".into()),
+            language: Some("ro".into()),
+            ..Default::default()
+        };
+        let block = ctx.system_block();
+        assert!(block.starts_with("You are Fono.\n\nRooms: Kitchen, Office."), "{block}");
+        assert!(block.ends_with("Reply in Romanian."), "{block}");
+        // Rules after the context, notes after the rules.
+        let rules = block.find("Keep replies short.").expect("instructions present");
+        let notes = block.find("Reply in Romanian.").expect("language note present");
+        assert!(rules < notes, "{block}");
+    }
+
+    #[test]
+    fn a_turn_with_no_notes_leaves_the_head_byte_identical() {
+        // A pinned prefix is only reusable while it stays a *byte* prefix of the
+        // live prompt, so the no-notes path must not so much as trim.
+        let head = "You are Fono.\n\nRooms: Kitchen.\n";
+        assert_eq!(compose_system_prompt(head, None), head);
+        assert_eq!(compose_system_prompt(head, Some("   ")), head);
+    }
 }
