@@ -16,7 +16,14 @@ workspace = true
 default = ["groq", "wyoming"]
 # Cloud backends — each behind a feature flag per Phase 4 Task 4.3.
 groq = ["dep:reqwest", "dep:fono-http"]
-openai = ["dep:reqwest", "dep:fono-http"]
+# OpenAI STT — batch `/v1/audio/transcriptions` plus, when live preview
+# is on, a realtime transcription session over WebSocket
+# (`gpt-live-transcribe`). The socket needs `tokio-tungstenite` (shared
+# with Deepgram streaming / Speechmatics) and `base64` for the audio
+# frames (shared with OpenRouter / Gemini); both are already in the
+# shipped binary's dependency graph, so these edges are net-zero on
+# binary size (AGENTS size rule).
+openai = ["dep:reqwest", "dep:fono-http", "dep:tokio-tungstenite", "dep:base64"]
 # OpenRouter STT — OpenAI-compatible /v1/audio/transcriptions proxy
 # that routes to upstream providers (Groq Whisper, …) via the model
 # id. Reuses Groq's warm_client + encode_wav helpers, so the feature
@@ -54,7 +61,10 @@ wyoming = ["dep:fono-net-codec"]
 # Live-dictation streaming primitives + per-backend stream_transcribe
 # implementations. Plan R1/R3. Off by default until v0.2.0-alpha proves
 # the slim build remains slim.
-streaming = ["dep:futures", "dep:tokio-stream"]
+# `fono-audio` supplies the capture-rate -> provider-rate resampler the
+# OpenAI realtime session needs (24 kHz PCM). Already in the binary's
+# dependency graph, so the edge is net-zero on binary size.
+streaming = ["dep:futures", "dep:tokio-stream", "dep:fono-audio"]
 # Hardware acceleration features — forward to whisper-rs, which then
 # forwards to whisper-rs-sys's CMake build. Off by default because
 # they require the corresponding SDK / headers at build time. See
@@ -86,6 +96,7 @@ whisper-rs = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 fono-net-codec = { path = "../fono-net-codec", optional = true }
+fono-audio = { path = "../fono-audio", optional = true }
 
 [dev-dependencies]
 # Integration tests for the Wyoming client need the codec directly to

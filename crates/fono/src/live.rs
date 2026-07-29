@@ -342,6 +342,28 @@ impl LiveSession {
                             return;
                         }
                     }
+                    Ok(FrameEvent::Silent { pcm, .. }) => {
+                        // An intra-segment pause. It goes on the wire so
+                        // the recogniser hears the real timeline, and it
+                        // is charged to the budget because we are paying
+                        // to send it — but it is deliberately kept out of
+                        // the prosody tail and out of the speaker-
+                        // verification accumulator, both of which want
+                        // voiced audio only.
+                        let dur = Duration::from_secs_f32(pcm.len() as f32 / sample_rate as f32);
+                        let verdict = budget_for_pump
+                            .lock()
+                            .map(|mut b| b.record(dur))
+                            .unwrap_or(BudgetVerdict::Continue);
+                        if matches!(verdict, BudgetVerdict::StopStreaming) {
+                            warn!("budget controller asked to stop streaming");
+                            let _ = sf_tx.send(StreamFrame::Eof);
+                            return;
+                        }
+                        if sf_tx.send(StreamFrame::Pcm(pcm)).is_err() {
+                            return;
+                        }
+                    }
                     Ok(FrameEvent::SegmentBoundary { .. }) => {
                         if prosody_on {
                             let tail_vec: Vec<f32> = tail.iter().copied().collect();

@@ -1,8 +1,8 @@
 # ADR 0017 — Cloud STT language stickiness (in-memory rerun-target cache)
 
 Date: 2026-04-28
-Status: Accepted — partially superseded for OpenAI models that accept a
-plural `languages[]` field (see the amendment at the bottom)
+Status: Accepted — amended twice; OpenAI now receives no language field
+at all (see the second amendment at the bottom)
 Supersedes: relevant portions of [ADR 0016](0016-language-allow-list.md)
 
 ## Context
@@ -163,3 +163,40 @@ providers they still apply to:
 
 `cloud_rerun_on_language_mismatch` remains as documented, but is now a
 legacy knob: it has no effect on plural-`languages[]` models.
+
+## Second amendment — 2026-07-29 (same day): OpenAI gets no language at all
+
+Amendment point 1 above is **withdrawn for OpenAI**. Sending the
+allow-list turned out to be the cause of a worse bug than the one it
+fixed, and the measurements are unambiguous.
+
+Reported symptom: a Romanian question, correctly transcribed into
+Romanian, answered by the assistant in English, with the turn summary
+line reading `| en |`.
+
+Probe (45 calls, `gpt-transcribe`, the five Romanian fixtures under
+`tests/fixtures/equivalence/`, three repetitions per condition, plus
+French / Chinese / English cross-checks):
+
+| condition | reported language |
+|---|---|
+| `languages[]=en,ro` (what Fono sent) | `en` on 15/15 Romanian clips |
+| no language field | `ro` on 15/15 |
+| `languages[]=ro,en` | `ro` on 15/15 |
+
+The cross-checks isolate the rule: **whenever `en` is the first
+`languages[]` entry the endpoint reports `en`, whatever the audio** —
+Chinese audio with `languages[]=en,ro` came back tagged `en`; the same
+clip with `languages[]=fr,ro` came back correctly tagged `zh`. The
+transcript text was correct in every single call; only the label lied.
+The field does not constrain decoding either: sending `languages[]=ro`
+on French audio still reported `fr`.
+
+Since a wrong label steers the TTS voice and the assistant's reply
+language, and the field buys neither constraint nor accuracy, Fono now
+sends **no** `language` and **no** `languages[]` to OpenAI — batch and
+realtime, for any allow-list size, including a single configured
+language. `general.languages` applies to OpenAI purely as a
+post-validation filter on the detection that comes back; an
+out-of-list detection reports `None` (rule 2's "do not act on
+language"). Rules 1–5 are unchanged for every other backend.

@@ -543,6 +543,10 @@ pub fn build_streaming_stt(
             let languages = effective_languages(cfg, general);
             build_deepgram_streaming(cfg, secrets, languages, cloud_rerun, cadence).map(Some)
         }
+        SttBackend::OpenAI if cloud_streaming => {
+            let languages = effective_languages(cfg, general);
+            build_openai_streaming(cfg, secrets, languages, prompts, cloud_rerun, cadence).map(Some)
+        }
         other => {
             // When live preview is off the user explicitly asked for
             // batch mode; calling that "a fallback" is misleading.
@@ -552,8 +556,8 @@ pub fn build_streaming_stt(
                 let label = fono_core::providers::stt_backend_str(other);
                 tracing::warn!(
                     "streaming STT not yet supported for backend {label} — live \
-                     transcript preview currently needs `local`, `groq`, or \
-                     `deepgram`; live dictation will fall back to batch"
+                     transcript preview currently needs `local`, `groq`, \
+                     `deepgram`, or `openai`; live dictation will fall back to batch"
                 );
             }
             Ok(None)
@@ -637,6 +641,51 @@ fn build_deepgram_streaming(
     Err(anyhow!(
         "Deepgram streaming STT requested but this binary was built without \
          the `deepgram` feature on `fono-stt`"
+    ))
+}
+
+/// OpenAI live transcription — a realtime transcription session running
+/// `gpt-live-transcribe`. Only reached when live preview is on; with
+/// preview off the batch backend keeps handling dictation, which is both
+/// cheaper per minute and the path the user asked for.
+#[cfg(all(feature = "streaming", feature = "openai"))]
+fn build_openai_streaming(
+    cfg: &Stt,
+    secrets: &Secrets,
+    languages: Vec<String>,
+    prompts: std::collections::HashMap<String, String>,
+    cloud_rerun: bool,
+    cadence: fono_core::config::PreviewCadence,
+) -> Result<Arc<dyn crate::streaming::StreamingStt>> {
+    let (key, model) = resolve_cloud(cfg, secrets, &SttBackend::OpenAI, "openai")?;
+    bootstrap_language_cache(&languages, crate::openai::BACKEND_KEY);
+    let cadence_opt = match cadence {
+        fono_core::config::PreviewCadence::Interval(ms) => {
+            Some(std::time::Duration::from_millis(u64::from(ms)))
+        }
+        fono_core::config::PreviewCadence::DisabledFinalizeOnly => None,
+    };
+    Ok(Arc::new(
+        crate::openai_streaming::OpenAiStreaming::new(key, model)
+            .with_languages(languages)
+            .with_prompts(prompts)
+            .with_cloud_rerun_on_mismatch(cloud_rerun)
+            .with_preview_cadence(cadence_opt),
+    ))
+}
+
+#[cfg(all(feature = "streaming", not(feature = "openai")))]
+fn build_openai_streaming(
+    _cfg: &Stt,
+    _secrets: &Secrets,
+    _languages: Vec<String>,
+    _prompts: std::collections::HashMap<String, String>,
+    _cloud_rerun: bool,
+    _cadence: fono_core::config::PreviewCadence,
+) -> Result<Arc<dyn crate::streaming::StreamingStt>> {
+    Err(anyhow!(
+        "OpenAI streaming STT requested but this binary was built without \
+         the `openai` feature on `fono-stt`"
     ))
 }
 

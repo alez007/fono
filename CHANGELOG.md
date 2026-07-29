@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Live dictation is no longer garbled, and the pauses in your speech are
+  respected.** Dictating with the live transcript view could come back stuttering
+  — words repeated, sentences that did not agree with themselves, capital letters
+  restarting mid-phrase. Two causes, both on Fono's side. First, Fono was cutting
+  every pause out of the recording before sending it, so what the service heard
+  was words glued together with no breathing room; pauses inside a sentence are
+  now sent as they happened, while the quiet before you start and after you stop
+  is still left out. Second, Fono was telling the service your sentence had
+  finished every time you paused for half a second, and each of those pieces was
+  transcribed on its own with no knowledge of the ones before it. Fono now treats
+  everything you say between pressing and releasing the key as one continuous
+  piece of speech. Text still appears as you talk.
+
 ### Added
+
+- **Live dictation now works with OpenAI, showing your words as you say them.**
+  Choosing the Transcript waveform style previously fell back to waiting for the
+  whole recording before showing anything, because OpenAI had no live lane. Fono
+  now holds a connection open for the duration of your recording and paints the
+  text into the overlay as it arrives, using OpenAI's dedicated live
+  transcription model. Fono still decides when your sentence has ended, so the
+  behaviour of push-to-talk and auto-stop is unchanged. How quickly text appears
+  follows the same cadence setting you already had: ask for snappier updates and
+  words show up sooner, ask for slower ones and the transcript comes out more
+  accurate. Live audio costs more per minute than sending a finished recording,
+  so this only happens while you have the live transcript view switched on;
+  ordinary dictation is unaffected. Your list of languages is passed on, so the
+  transcript stays in the languages you actually speak. One caveat from OpenAI's
+  side: the live model does not say which language it heard, so Fono does not
+  claim to know either rather than making a guess that could steer the
+  assistant's reply to the wrong language.
 
 - **Fono now remembers your conversations with the assistant, and a restart no
   longer loses your train of thought.** Until now a chat lived only in memory:
@@ -84,6 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Speak Romanian to the assistant and it answers in Romanian again.** When
+  you list more than one language, Fono used to tell OpenAI which languages to
+  expect. That turned out to make OpenAI report the wrong one: with English
+  first in your language list it claimed every recording was English — Romanian,
+  French, even Chinese — even though the transcript it returned was perfectly
+  correct. Fono believed the label, picked an English voice and told the
+  assistant to reply in English. Fono now lets OpenAI work out the language on
+  its own, which it does correctly, and your language list is applied afterwards
+  as a sanity check on the answer. This covers both ordinary dictation and the
+  live transcript view. Nothing to change in your settings.
 - **Your history retention setting is now actually applied.** Fono offered a
   "keep transcripts for N days" setting but never acted on it, so history grew
   without limit no matter what you chose. Old transcripts are now cleared on

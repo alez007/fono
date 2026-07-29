@@ -30,6 +30,8 @@ pub mod groq;
 pub mod groq_streaming;
 #[cfg(feature = "openai")]
 pub mod openai;
+#[cfg(all(feature = "openai", feature = "streaming"))]
+pub mod openai_streaming;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
 #[cfg(feature = "speechmatics")]
@@ -59,3 +61,6 @@ pub use groq_streaming::{GroqRequestFn, GroqRequestFuture, GroqStreaming};
 
 #[cfg(feature = "groq")]
 pub use groq::GroqResponse;
+
+#[cfg(all(feature = "openai", feature = "streaming"))]
+pub use openai_streaming::OpenAiStreaming;

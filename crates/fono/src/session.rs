@@ -3609,6 +3609,10 @@ impl SessionOrchestrator {
     /// Backs the tray "Forget conversation" entry — a one-step
     /// "fresh start" without changing config.
     pub async fn on_assistant_forget(&self) {
+        // Cancel via the FSM, like `fono cancel`: stopping the turn
+        // alone leaves the FSM mid-reply, so the overlay never hides.
+        // Ignored when already Idle.
+        let _ = self.action_tx.send(HotkeyAction::CancelPressed);
         {
             let mut s = self.assistant_session.lock().await;
             s.stop_current_turn();

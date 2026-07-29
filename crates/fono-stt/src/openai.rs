@@ -5,17 +5,31 @@
 //! which differ enough on the wire that a capability table
 //! ([`caps_for`]) is cheaper than three backends:
 //!
-//! | model | `response_format` | language field | `keywords[]` | per-segment scores |
-//! |---|---|---|---|---|
-//! | `gpt-transcribe`, `gpt-live-transcribe` | omit | `languages[]` (plural) | yes | no |
-//! | `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | omit | `language` | no | no |
-//! | `whisper-1` | `verbose_json` | `language` | no | yes |
+//! | model | `response_format` | `keywords[]` | per-segment scores |
+//! |---|---|---|---|
+//! | `gpt-transcribe`, `gpt-live-transcribe` | omit | yes | no |
+//! | `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | omit | no | no |
+//! | `whisper-1` | `verbose_json` | no | yes |
 //!
-//! The plural `languages[]` field is why this backend no longer needs a
-//! rerun / rerank lane: the model accepts the whole allow-list up front
-//! and code-switches inside a single utterance, so a Romanian/English
-//! speaker cannot be mis-tagged by a first-pass guess. Sending both
-//! `language` and `languages` is a hard API error, hence the table.
+//! **Fono never sends a language on this endpoint** — not the singular
+//! `language`, not the plural `languages[]`, no matter how many
+//! languages the user configured. Telling OpenAI which languages to
+//! expect corrupts the language it reports back: measured over 45 calls
+//! on the Romanian fixtures (plus French, Chinese and English
+//! cross-checks), whenever `en` was the first entry of `languages[]` the
+//! response claimed `en` for *every* clip — Romanian, French, even
+//! Chinese audio — while the transcript itself was always correct. With
+//! the field omitted, detection was correct on every clip, three runs
+//! each. The field does not constrain the model either (sending only
+//! `ro` still reported `fr` on French audio), so omitting it costs
+//! nothing and buys back a trustworthy language verdict. The configured
+//! allow-list is applied afterwards, in [`resolve_language`], as a
+//! post-validation filter.
+//!
+//! This matters well beyond a label: the reported language selects the
+//! TTS voice and injects "Reply in X." into the assistant's system
+//! block, so one bogus `en` made the assistant answer a Romanian
+//! question in English.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,11 +67,6 @@ struct ModelCaps {
     /// per-segment scores; every `gpt-*-transcribe` model **rejects**
     /// `verbose_json` outright.
     response_format: Option<&'static str>,
-    /// `true` → plural `languages[]`, which lets the model code-switch
-    /// between every configured language. `false` → a single
-    /// `language` field, so an allow-list of two or more degrades to
-    /// unconstrained auto-detect.
-    plural_languages: bool,
     /// `true` → the model accepts a `keywords[]` list of literal terms
     /// (names, device labels, shell fragments). On models without it,
     /// keywords are folded into `prompt` instead.
@@ -65,18 +74,16 @@ struct ModelCaps {
 }
 
 const CAPS_WHISPER: ModelCaps =
-    ModelCaps { response_format: Some("verbose_json"), plural_languages: false, keywords: false };
-const CAPS_GPT_4O: ModelCaps =
-    ModelCaps { response_format: None, plural_languages: false, keywords: false };
-const CAPS_GPT: ModelCaps =
-    ModelCaps { response_format: None, plural_languages: true, keywords: true };
+    ModelCaps { response_format: Some("verbose_json"), keywords: false };
+const CAPS_GPT_4O: ModelCaps = ModelCaps { response_format: None, keywords: false };
+const CAPS_GPT: ModelCaps = ModelCaps { response_format: None, keywords: true };
 
 /// Resolve the wire capabilities for a model name.
 ///
 /// Unknown names fall through to [`CAPS_GPT`] on the assumption that
 /// future OpenAI transcription models follow the current generation.
 /// `whisper*` and `*4o*` are pinned explicitly because both predate
-/// `languages[]`.
+/// `keywords[]` and need `verbose_json` / the plain `json` shape.
 fn caps_for(model: &str) -> ModelCaps {
     let m = model.trim().to_ascii_lowercase();
     if m.starts_with("whisper") {
@@ -132,8 +139,8 @@ impl OpenAiStt {
 
     /// Accepted for builder parity with the other cloud backends and
     /// ignored. `general.cloud_rerun_on_language_mismatch` described a
-    /// rerun lane this backend no longer has: `gpt-transcribe` takes
-    /// the whole allow-list natively via `languages[]`.
+    /// rerun lane this backend no longer has: the language OpenAI
+    /// reports is either believed or dropped, never re-run.
     #[must_use]
     pub const fn with_cloud_rerun_on_mismatch(self, _on: bool) -> Self {
         self
@@ -169,7 +176,6 @@ impl OpenAiStt {
         &self,
         wav: &[u8],
         caps: ModelCaps,
-        selection: &LanguageSelection,
         prompt: Option<&str>,
         keywords: &[String],
     ) -> Result<Resp> {
@@ -179,18 +185,9 @@ impl OpenAiStt {
         if let Some(rf) = caps.response_format {
             form = form.text("response_format", rf);
         }
-        let codes = selection.codes();
-        if caps.plural_languages {
-            // Plural lane: hand the model every configured language at
-            // once. Empty (auto) sends nothing.
-            for code in codes {
-                form = form.text("languages[]", code.clone());
-            }
-        } else if let [only] = codes {
-            // Singular lane: one code is expressible, an allow-list is
-            // not — fall through to unconstrained auto-detect.
-            form = form.text("language", only.clone());
-        }
+        // No `language` / `languages[]` field, ever. See the module
+        // docstring: naming the expected languages makes the endpoint
+        // report the wrong one.
         if let Some(p) = prompt {
             form = form.text("prompt", p.to_string());
         }
@@ -225,13 +222,13 @@ impl OpenAiStt {
         let caps = caps_for(&self.model);
 
         // A per-language prompt is only meaningful once a single
-        // language is pinned; sending one during auto-detect biases
-        // the language classifier.
-        let forced = match &selection {
+        // language is pinned; sending one while the model auto-detects
+        // biases the language classifier.
+        let pinned = match &selection {
             LanguageSelection::Forced(c) => Some(c.clone()),
             LanguageSelection::Auto | LanguageSelection::AllowList(_) => None,
         };
-        let lang_prompt = self.prompt_for(forced.as_deref()).map(str::to_string);
+        let lang_prompt = self.prompt_for(pinned.as_deref()).map(str::to_string);
 
         // Keywords ride their own field on the current generation and
         // fold into `prompt` on the older ones (which is where this
@@ -244,35 +241,13 @@ impl OpenAiStt {
         };
         let prompt = crate::groq::merge_prompt(lang_prompt.as_deref(), hint.as_deref());
 
-        if !caps.plural_languages && matches!(selection, LanguageSelection::AllowList(_)) {
-            self.warn_no_plural_support();
-        }
+        let parsed = self.post(&wav, caps, prompt.as_deref(), wire_keywords).await?;
 
-        let parsed = self.post(&wav, caps, &selection, prompt.as_deref(), wire_keywords).await?;
-
-        let language = resolve_language(&parsed, forced.as_deref(), &selection);
+        let language = resolve_language(&parsed, &selection);
         if let Some(code) = language.as_deref() {
             self.lang_cache.record(BACKEND_KEY, code);
         }
         Ok(Transcription { text: parsed.text, language, duration_ms: None })
-    }
-
-    /// One-shot nudge for users on a pre-`languages[]` model with two
-    /// or more configured languages — the exact configuration where
-    /// mid-sentence language switches get mis-tagged.
-    fn warn_no_plural_support(&self) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if WARNED.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        tracing::warn!(
-            "openai model {:?} predates the `languages[]` field, so the allow-list {:?} \
-             degrades to unconstrained auto-detect; set `[stt.cloud].model = \
-             \"gpt-transcribe\"` for reliable multi-language input",
-            self.model,
-            self.languages,
-        );
     }
 }
 
@@ -322,18 +297,26 @@ impl Resp {
 /// written to the language cache. Guessing instead — which is what the
 /// old `fallback_hint()` tail did — is how a single mis-detection used
 /// to pin a whole conversation to the wrong language.
-fn resolve_language(
-    resp: &Resp,
-    forced: Option<&str>,
-    selection: &LanguageSelection,
-) -> Option<String> {
-    // We pinned the language ourselves, so there is nothing to detect.
-    if let Some(code) = forced {
-        return Some(code.to_ascii_lowercase());
-    }
+///
+/// The configured selection is a *filter*, never a source: we no longer
+/// tell the endpoint what to expect (see the module docstring), so the
+/// only language worth reporting is one the model actually detected and
+/// the user actually allows.
+fn resolve_language(resp: &Resp, selection: &LanguageSelection) -> Option<String> {
     if let Some(list) = resp.languages.as_deref() {
         return match list {
-            [one] => Some(crate::lang::whisper_lang_to_code(&one.code)),
+            [one] => {
+                let detected = crate::lang::whisper_lang_to_code(&one.code);
+                if selection.contains(&detected) {
+                    Some(detected)
+                } else {
+                    tracing::info!(
+                        "openai detected {detected:?} outside the configured allow-list; \
+                         leaving the language unset rather than guessing a peer"
+                    );
+                    None
+                }
+            }
             [] => {
                 tracing::debug!("openai reported no reliable language; leaving it unset");
                 None
@@ -449,12 +432,10 @@ mod tests {
         assert_eq!(caps_for("gpt-transcribe").response_format, None);
         assert_eq!(caps_for("gpt-4o-transcribe").response_format, None);
         assert_eq!(caps_for("gpt-4o-mini-transcribe").response_format, None);
-        // Only the current generation takes plural languages + keywords.
-        assert!(caps_for("gpt-transcribe").plural_languages);
-        assert!(caps_for("gpt-live-transcribe").plural_languages);
-        assert!(!caps_for("gpt-4o-transcribe").plural_languages);
-        assert!(!caps_for("whisper-1").plural_languages);
+        // Only the current generation takes `keywords[]`.
         assert!(caps_for("gpt-transcribe").keywords);
+        assert!(caps_for("gpt-live-transcribe").keywords);
+        assert!(!caps_for("gpt-4o-transcribe").keywords);
         assert!(!caps_for("whisper-1").keywords);
         // Case and whitespace are not a trap.
         assert_eq!(caps_for(" WHISPER-1 "), CAPS_WHISPER);
@@ -481,9 +462,9 @@ mod tests {
     #[test]
     fn single_detected_language_is_trusted() {
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
-        assert_eq!(resolve_language(&detected(&["ro"]), None, &sel), Some("ro".to_string()));
+        assert_eq!(resolve_language(&detected(&["ro"]), &sel), Some("ro".to_string()));
         // Full names and alpha-3 normalise on the way out.
-        assert_eq!(resolve_language(&detected(&["ron"]), None, &sel), Some("ro".to_string()));
+        assert_eq!(resolve_language(&detected(&["ron"]), &sel), Some("ro".to_string()));
     }
 
     #[test]
@@ -491,7 +472,7 @@ mod tests {
         // The documented "I could not make a reliable prediction"
         // signal. The old code guessed the first allow-list entry here.
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
-        assert_eq!(resolve_language(&detected(&[]), None, &sel), None);
+        assert_eq!(resolve_language(&detected(&[]), &sel), None);
     }
 
     #[test]
@@ -499,22 +480,26 @@ mod tests {
         // Both labels are correct, so neither is usable as *the*
         // language; the text carries the mixture already.
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
-        assert_eq!(resolve_language(&detected(&["ro", "en"]), None, &sel), None);
+        assert_eq!(resolve_language(&detected(&["ro", "en"]), &sel), None);
     }
 
     #[test]
-    fn forced_language_is_reported_verbatim() {
-        // Nothing was detected — we pinned it — so confidence gating
-        // must not second-guess the caller.
+    fn a_single_configured_language_does_not_override_the_detection() {
+        // One configured language is an allow-list of one, not a wire
+        // force: we send no language at all, so the model's own verdict
+        // is the only thing worth reporting. A user with `["ro"]` who
+        // speaks English gets no language rather than a bogus "ro".
         let sel = LanguageSelection::Forced("ro".into());
-        assert_eq!(resolve_language(&Resp::default(), Some("RO"), &sel), Some("ro".to_string()));
+        assert_eq!(resolve_language(&detected(&["ro"]), &sel), Some("ro".to_string()));
+        assert_eq!(resolve_language(&detected(&["en"]), &sel), None);
+        assert_eq!(resolve_language(&Resp::default(), &sel), None);
     }
 
     #[test]
     fn whisper_echo_survives_confident_scores() {
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
         let resp = whisper_resp("romanian", &[-0.2, -0.3]);
-        assert_eq!(resolve_language(&resp, None, &sel), Some("ro".to_string()));
+        assert_eq!(resolve_language(&resp, &sel), Some("ro".to_string()));
     }
 
     #[test]
@@ -523,7 +508,7 @@ mod tests {
         // the text, so don't let it pick a TTS voice.
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
         let resp = whisper_resp("romanian", &[-1.6, -1.4]);
-        assert_eq!(resolve_language(&resp, None, &sel), None);
+        assert_eq!(resolve_language(&resp, &sel), None);
     }
 
     #[test]
@@ -531,7 +516,7 @@ mod tests {
         // Conservative: no signal is not the same as a bad signal.
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
         let resp = whisper_resp("english", &[]);
-        assert_eq!(resolve_language(&resp, None, &sel), Some("en".to_string()));
+        assert_eq!(resolve_language(&resp, &sel), Some("en".to_string()));
     }
 
     #[test]
@@ -540,12 +525,12 @@ mod tests {
         // decline to report a language we don't believe.
         let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
         let resp = whisper_resp("bulgarian", &[-0.3]);
-        assert_eq!(resolve_language(&resp, None, &sel), None);
+        assert_eq!(resolve_language(&resp, &sel), None);
     }
 
     #[test]
     fn auto_selection_accepts_any_detection() {
         let resp = whisper_resp("bulgarian", &[-0.3]);
-        assert_eq!(resolve_language(&resp, None, &LanguageSelection::Auto), Some("bg".to_string()));
+        assert_eq!(resolve_language(&resp, &LanguageSelection::Auto), Some("bg".to_string()));
     }
 }

@@ -1716,6 +1716,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "fono-audio",
  "fono-core",
  "fono-http",
  "fono-net-codec",

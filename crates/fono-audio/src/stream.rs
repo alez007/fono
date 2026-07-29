@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Voiced-frame stream: a `tokio::sync::broadcast` channel fed from cpal's
-//! capture callback, gated by [`crate::vad::Vad`], that emits both raw
+//! Frame stream: a `tokio::sync::broadcast` channel fed from cpal's
+//! capture callback, classified by [`crate::vad::Vad`], that emits raw
 //! audio frames and segment-boundary events.
+//!
+//! Frames are labelled rather than filtered: voiced frames arrive as
+//! [`FrameEvent::Voiced`], and silence *inside* a segment arrives as
+//! [`FrameEvent::Silent`] so a consumer streaming audio to a recogniser
+//! can send an unbroken timeline. Consumers that genuinely want speech
+//! only — the speaker-verification accumulator, the prosody tail — just
+//! ignore the `Silent` arm.
 //!
 //! Plan R2. Compiled only with the `streaming` cargo feature.
 //!
@@ -29,6 +36,15 @@ pub const DEFAULT_CAPACITY: usize = 64;
 pub enum FrameEvent {
     /// A voiced PCM frame (post-VAD-gating). 16 kHz mono f32.
     Voiced { pcm: Vec<f32>, elapsed: Duration },
+    /// A silent PCM frame that falls *inside* a segment — i.e. speech has
+    /// already started and no boundary has fired yet. Emitted so a
+    /// consumer that ships audio to a recogniser can reproduce the
+    /// original timeline instead of a splice of voiced frames glued
+    /// together, which is what an inter-word pause sounds like once it
+    /// has been cut out. Silence before the first word of a segment, and
+    /// after a boundary, is still dropped — the same edge-trimming the
+    /// batch path gets from [`crate::trim_silence`].
+    Silent { pcm: Vec<f32>, elapsed: Duration },
     /// VAD detected a silence boundary that's long enough to mark the
     /// end of a logical segment. The streaming STT uses this as the
     /// trigger to run a finalize-lane pass.
@@ -121,6 +137,11 @@ impl AudioFrameStream {
                 }
                 VadDecision::Silence => {
                     self.silence_run += 1;
+                    if self.saw_voice_in_segment {
+                        // Inside a segment: keep the pause on the wire so
+                        // downstream recognisers hear real speech rhythm.
+                        let _ = self.tx.send(FrameEvent::Silent { pcm: frame, elapsed });
+                    }
                     if self.saw_voice_in_segment
                         && self.silence_run >= self.cfg.silence_frames_for_boundary
                     {
@@ -205,6 +226,38 @@ mod tests {
         assert!(evs
             .iter()
             .any(|e| matches!(e, FrameEvent::SegmentBoundary { segment_index: 0, .. })));
+    }
+
+    /// Silence before the first word of a segment is dropped, silence
+    /// between words is kept, and silence after a boundary is dropped
+    /// again — so a recogniser hears real speech rhythm without paying
+    /// for the dead air at either end.
+    #[test]
+    fn intra_segment_silence_is_kept_and_edge_silence_is_dropped() {
+        let mut stream = AudioFrameStream::new(StreamConfig {
+            frame_samples: 16,
+            silence_frames_for_boundary: 3,
+            channel_capacity: 64,
+        });
+        let mut rx = stream.subscribe();
+        let mut vad = WebRtcVadStub::default();
+        // Leading silence: no voice yet, so nothing goes on the wire.
+        stream.push(&[0.0_f32; 16 * 2], &mut vad);
+        assert!(drain(&mut rx).is_empty());
+
+        // A word, a one-frame pause, another word.
+        stream.push(&[0.5_f32; 16], &mut vad);
+        stream.push(&[0.0_f32; 16], &mut vad);
+        stream.push(&[0.5_f32; 16], &mut vad);
+        let evs = drain(&mut rx);
+        assert_eq!(evs.iter().filter(|e| matches!(e, FrameEvent::Voiced { .. })).count(), 2);
+        assert_eq!(evs.iter().filter(|e| matches!(e, FrameEvent::Silent { .. })).count(), 1);
+
+        // Boundary, then trailing silence: dropped again.
+        stream.push(&[0.0_f32; 16 * 3], &mut vad);
+        drain(&mut rx);
+        stream.push(&[0.0_f32; 16 * 5], &mut vad);
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]

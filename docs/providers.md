@@ -138,7 +138,7 @@ retries once automatically on a stall.
 |---------------|------------|----------------------------------------|-----------------------|-----------|
 | Whisper local | local      | ggml `tiny` · `tiny.en` · `small` · `small.en` · `large-v3-turbo` (per ADR 0027) | — | no |
 | Groq          | cloud HTTP | `whisper-large-v3`, `whisper-large-v3-turbo` | `GROQ_API_KEY`        | yes (pseudo-stream, opt-in) |
-| OpenAI        | cloud HTTP | `gpt-transcribe` (default), `gpt-4o-transcribe`, `whisper-1` | `OPENAI_API_KEY`      | no |
+| OpenAI        | cloud HTTP + WS | `gpt-transcribe` (default), `gpt-4o-transcribe`, `whisper-1`; live preview always uses `gpt-live-transcribe` | `OPENAI_API_KEY`      | yes (realtime session, opt-in) |
 | Deepgram      | cloud WS   | `nova-2`, `nova-3`                     | `DEEPGRAM_API_KEY`    | yes |
 | Cartesia      | cloud HTTP | `ink-whisper` (batch only; `ink-2` is realtime-only and arrives in a Phase 2 streaming slice) | `CARTESIA_API_KEY`    | no  |
 | AssemblyAI    | cloud HTTP | `best`, `nano`                         | `ASSEMBLYAI_API_KEY`  | yes |
@@ -258,6 +258,70 @@ Cost note: Deepgram bills by audio seconds processed, **not** per
 request. That makes the streaming path *cheaper* than Groq's
 pseudo-stream (which re-uploads the trailing window on every cadence
 tick) — opt in freely.
+
+### OpenAI live dictation (realtime WebSocket)
+
+The batch endpoint (`POST /v1/audio/transcriptions`) handles ordinary
+push-to-talk. With `[overlay].style = "transcript"` Fono instead opens a
+realtime **transcription session** on
+`wss://api.openai.com/v1/realtime` and runs `gpt-live-transcribe`, so
+transcript text paints into the overlay while you speak.
+
+```toml
+[overlay]
+style = "transcript"
+
+[stt]
+backend = "openai"
+
+[stt.cloud]
+provider = "openai"
+api_key_ref = "OPENAI_API_KEY"
+model = "gpt-transcribe"   # batch model; live preview picks its own
+```
+
+How it behaves:
+
+* **Audio.** Capture is resampled to the session's 24 kHz PCM and sent
+  base64-encoded as `input_audio_buffer.append` events. Pauses between
+  words travel with it: the VAD labels frames rather than filtering them,
+  so what the model hears is continuous speech rather than voiced frames
+  spliced end to end. Silence before the first word and after a segment
+  ends is still dropped, matching the batch path's edge trimming.
+* **One dictation, one turn.** Server-side turn detection is switched off,
+  and Fono sends a single `input_audio_buffer.commit` when you release the
+  hotkey — never on a mid-sentence pause. The model transcribes each turn
+  in isolation, so committing per pause would split one dictation into
+  unrelated fragments, with broken agreement, restarted capitalisation and
+  duplicated words at the seams. Partial text keeps arriving as deltas
+  without any commit, so the overlay loses nothing by waiting.
+* **Model.** Live preview always runs `gpt-live-transcribe`, whatever
+  `[stt.cloud].model` says. That is the only OpenAI model that emits text
+  while you are still speaking — `gpt-transcribe` starts transcribing
+  once a turn is committed, and `whisper-1` / `gpt-4o-transcribe` have no
+  realtime endpoint at all. Your batch dictation keeps the model you
+  chose.
+* **Latency knob.** `interactive.streaming_interval` maps onto the
+  model's `delay` setting (`minimal` / `low` / `medium` / `high`). A
+  tighter cadence shows text sooner; a looser one gives the model more
+  audio context and a better word error rate.
+* **Expected languages.** `general.languages` is sent as the session's
+  `languages` list, in your configured order. OpenAI recommends this
+  whenever the audio may contain more than one language, and without it
+  the model drifts into scripts you never speak — a Romanian dictation
+  can come back peppered with Arabic and CJK. Naming the languages here
+  is safe in a way it is not on the batch path (see
+  [Multilingual STT](#multilingual-stt-and-language-stickiness)), because
+  `gpt-live-transcribe` reports no detected language at all, so there is
+  no verdict for the hint to bias.
+* **No detected language.** `gpt-live-transcribe` returns no language,
+  no timestamps and no confidence scores. Fono therefore reports no
+  language for live turns rather than guessing one — nothing pins the
+  assistant reply or the TTS voice to a language the recogniser never
+  confirmed.
+* **Cost.** Realtime audio is billed at roughly 4× the batch per-minute
+  price, which is why this lane only opens when you ask for live
+  preview.
 
 ### Speechmatics STT (realtime WebSocket)
 
@@ -500,6 +564,21 @@ Design rationale:
 [ADR 0017](decisions/0017-cloud-stt-language-stickiness.md); the
 user-facing recipe lives in
 [troubleshooting.md](troubleshooting.md#cloud-stt-keeps-detecting-the-wrong-language).
+
+**OpenAI: Fono never sends a language.** The `/v1/audio/transcriptions`
+endpoint accepts `language` / `languages[]` hints, and both are actively
+harmful: measured over 45 calls on Fono's Romanian fixtures plus French,
+Chinese and English cross-checks, whenever `en` was the first configured
+language the response claimed the audio was English — every single time,
+for every clip, including Chinese — while the transcript itself came
+back perfectly correct. That bogus label then picks the TTS voice and
+tells the assistant to "reply in English", which is how a Romanian
+question earned an English answer. With the hint omitted, detection was
+correct on all eight fixtures, three runs each. The hint does not even
+constrain the model (asking for Romanian only, French audio still came
+back tagged French), so dropping it costs nothing. Your
+`general.languages` list is still honoured — as a filter on what comes
+back, not as an instruction going out.
 
 ## Default picks (rationale)
 

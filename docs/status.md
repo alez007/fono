@@ -1,6 +1,165 @@
 # Fono — Project Status
 Last updated: 2026-07-29
 
+## 2026-07-29 — Two live-dictation defects: a teardown deadlock, and a transcript wandering into scripts the user never speaks
+
+**Defect 1: the overlay never cleared.** Reported as "the overlay is stuck after it
+finishes pondering, both with assistant and transcription", with a screenshot showing
+`PONDERING` over the accumulated preview text. Not a provider problem — a deadlock in
+`crates/fono-stt/src/openai_streaming.rs`. The writer task, after the final commit,
+awaited the reader before closing the socket; the reader looped on `ws_read.next()`,
+which only ends when the socket ends. A realtime transcription session never closes
+itself. So the reader waited for the server, the writer waited for the reader, `tx` was
+never dropped, the update stream never ended, and `run_join.await`
+(`crates/fono/src/session.rs:4532`, and the assistant twin) never returned — leaving
+`pipeline_in_flight` set, the overlay on its last frame, and nothing injected.
+
+Fixed with a commit-count handshake: the writer counts each
+`input_audio_buffer.commit` and sends the total over a oneshot at EOF; the reader
+loops until `completed >= expected`, counting the *turn* rather than the text so an
+empty transcript still settles its commit. Once the count is known, reads are bounded
+by `FINAL_TRANSCRIPT_GRACE` (5 s) so a rejected commit or dropped turn releases the
+overlay instead of hanging. While audio is still flowing there is no deadline, so a
+long mid-sentence pause cannot cut the user off.
+
+**Defect 2: script wandering.** A Romanian live dictation came back with Arabic and
+CJK fragments, plus a Portuguese clause, interleaved with correct Romanian. The user's
+diagnosis was right: constrain the model to the configured languages.
+`session.update` now carries `general.languages` as the session's plural `languages`
+list, in the user's configured order.
+
+This looks like a reversal of the entry below, so the distinction matters: that
+measurement was on **`gpt-transcribe` (batch)**, where `languages[]` corrupted the
+*reported label* (`en` first ⇒ `en` reported, 15/15, regardless of audio) while not
+measurably constraining decoding. This is **`gpt-live-transcribe` (realtime)**, a
+different model on a different lane, where OpenAI's own guide lists `languages`
+under "Add transcription context" and recommends it precisely when the audio "contains
+… more than one expected language". Crucially it cannot reintroduce the label bug,
+because `gpt-live-transcribe` returns no detected language at all — there is no verdict
+for the hint to bias. The batch path still sends nothing.
+
+Not measured against real audio (that needs a live key and a listener), so if the
+wandering persists the next lever is `delay`: `delay_for` currently tops out at `high`,
+and the API also accepts `xhigh` for more audio context.
+
+**Also confirmed against the guide, unchanged:** `turn_detection: null` with manual
+commits, `item_id` keying for out-of-order finals, 24 kHz `audio/pcm`. The one
+knowing divergence from the demo remains server-side VAD: Fono owns push-to-talk and
+auto-stop, so turns close on Fono's `SegmentBoundary` rather than the server's, which
+makes finals land later than in OpenAI's demo. Deltas still paint mid-sentence.
+
+## 2026-07-29 — The language hint we sent OpenAI was the thing lying about the language
+
+Reported symptom: a Romanian question, transcribed correctly into Romanian, answered
+by the assistant in English. Turn summary line: `5150ms | en | stt 805ms …`. Same
+complaint on the Google path.
+
+**Measured before touching code.** 45 calls to `gpt-transcribe` over the five
+Romanian fixtures in `tests/fixtures/equivalence/`, three repetitions × three
+conditions:
+
+| condition | reported language |
+|---|---|
+| `languages[]=en,ro` (what Fono sent) | `en`, 15/15 |
+| no language field | `ro`, 15/15 |
+| `languages[]=ro,en` | `ro`, 15/15 |
+
+Cross-checks on French, Chinese and English isolated the rule: **when `en` is the
+first `languages[]` entry, the endpoint reports `en` regardless of the audio** —
+Chinese audio came back tagged `en` with `languages[]=en,ro` and correctly `zh`
+with `languages[]=fr,ro`. The transcript text was correct in all 45 calls; only the
+label lied. The field does not constrain decoding either (`languages[]=ro` on
+French audio still reported `fr`), so it was buying nothing.
+
+So the yesterday-shaped fix — "where the provider accepts a plural language set,
+use it" (ADR 0017, first amendment) — was itself the bug. A wrong label is
+amplified downstream: it injects "Reply in X." into the system block and picks the
+TTS voice, so one bogus `en` steered the whole turn.
+
+**Fix (user's call: drop the field unconditionally).** `crates/fono-stt/src/openai.rs`
+and `crates/fono-stt/src/openai_streaming.rs` now send no `language` and no
+`languages[]` — any allow-list size, including a single configured language.
+`ModelCaps.plural_languages` and the "your model predates `languages[]`" warning
+are gone with it. `resolve_language` lost its forced short-circuit and gained the
+allow-list check on the detected-languages branch, so the configured list is now
+purely a filter on what comes back: an out-of-list detection reports `None`
+("let the text speak for itself") rather than a guessed peer. A single configured
+language no longer forces anything on the wire, so it no longer claims a language
+the model didn't hear.
+
+**Not the same bug on Gemini.** `crates/fono-stt/src/gemini.rs` already reports
+`None` for an allow-list, so nothing there pins English from STT — the Google-side
+complaint is a separate thread (likely the assistant model ignoring "Match the
+user's language") and is not addressed here.
+
+ADR 0017 gains a second amendment; `docs/providers.md` documents the measurement
+under Multilingual STT. Gate: fmt / clippy / 212 fono-stt tests green.
+
+## 2026-07-29 — OpenAI live dictation over a realtime transcription session
+
+Live transcript preview (`[overlay].style = "transcript"`) previously supported
+`local`, `groq` and `deepgram`; with `[stt].backend = "openai"` the daemon logged
+"streaming STT not yet supported" and fell back to batch, so the overlay showed
+nothing until the recording ended. New `crates/fono-stt/src/openai_streaming.rs`
+closes that gap against `gpt-live-transcribe`.
+
+**Shape.** One WebSocket to `wss://api.openai.com/v1/realtime`, one
+`session.update` declaring `type: "transcription"`, 24 kHz `audio/pcm`, the model,
+the language allow-list as plural `languages` (never both `language` and
+`languages` — that is a hard API error), the `delay` knob, and
+`turn_detection: null`. Fono's own VAD stays authoritative: EOF sends one
+`input_audio_buffer.commit`, so nothing cuts turns underneath the existing
+auto-stop behaviour. Audio rides as base64 s16le in
+`input_audio_buffer.append`, resampled from the 16 kHz capture rate through the
+`fono-audio` resampler. `.delta` events paint the Preview lane, `.completed`
+commits the Finalize lane.
+
+**Continuous audio for every streaming backend.** `AudioFrameStream` used to
+*filter* on the VAD verdict: silent frames were dropped outright, so every
+streaming backend received a splice of voiced 30 ms frames with all inter-word
+pauses excised — phonemes glued together, no speech rhythm left. It now *labels*
+instead, adding `FrameEvent::Silent` for silence that falls inside a segment;
+`crates/fono/src/live.rs` forwards it as `StreamFrame::Pcm` and charges it to the
+budget, while keeping it out of the prosody tail and the speaker-verification
+accumulator. Silence before the first voiced frame of a segment, and after a
+boundary, is still dropped — the same edge trimming `trim_silence` gives the batch
+path. Groq and Deepgram streaming benefit for free.
+
+**Four deliberate calls.**
+
+1. *`LIVE_MODEL` unconditionally, not the configured model.* Live preview always
+   runs `gpt-live-transcribe`, whatever `[stt.cloud].model` says. `gpt-transcribe`
+   does open a realtime socket, but it only transcribes once a turn is committed —
+   which defeats the whole point of the preview — and it rejects the `delay` knob
+   with `invalid_value`, taking the entire `session.update` (prompt included) down
+   with it. `whisper-1` and the `4o` models have no realtime endpoint at all.
+   Since `gpt-transcribe` is now the batch default, honouring the configured model
+   here meant nobody got word-by-word text. Batch dictation keeps its own model.
+2. *No language, on purpose.* `gpt-live-transcribe` returns no detected language,
+   no timestamps and no confidence. Every live update therefore reports
+   `language: None`, which is the same "let the text speak for itself" contract
+   the batch backend now uses — no "Reply in X.", no language-pinned voice.
+   `ServerEvent::reported_language` stays as a cheap forward guard should the
+   endpoint ever start emitting `languages[]`.
+3. *Two handshake URLs.* A transcription session names its model inside
+   `session.update`, and both `?intent=transcription` and `?model=` appear in
+   OpenAI's material. Rather than bet the live path on one spelling, `connect()`
+   tries them in order.
+4. *One dictation is one turn.* A mid-utterance `SegmentBoundary` does **not**
+   commit; only EOF does. Committing per VAD pause was the first shipped shape
+   and it produced visibly garbled output, because the model transcribes each
+   turn in isolation: a sentence became 4–6 unrelated fragments with broken
+   agreement, restarted capitalisation, duplicated words at the seams and the
+   language re-guessed per fragment. `.delta` keeps arriving without any commit,
+   so nothing is lost by holding the turn open.
+
+**Cost.** Realtime audio is ~4× the batch per-minute price, which is why this lane
+only opens behind live preview and ordinary dictation is untouched.
+
+**Deps.** `tokio-tungstenite` + `base64` join the `openai` feature and
+`fono-audio` joins `streaming`; all three are already in the shipped graph, so the
+edges are net-zero. Size gate: 22.34 MiB of 25.00 MiB.
+
 ## 2026-07-29 — Romanian and English, and the language guard with a hole exactly where the user lives
 
 Reported symptom: with `languages = ["en", "ro"]`, speaking English to the
