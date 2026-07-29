@@ -78,6 +78,9 @@ pub fn build(cfg: &Config, paths: &Paths) -> Option<Arc<ActionTools>> {
 
     let mut descriptors = Vec::with_capacity(rows.len());
     let mut runnable = std::collections::HashMap::new();
+    // The rows that survived the endpoint check, kept so the rails describe
+    // exactly the tools the model is being offered — no more, no fewer.
+    let mut offered = Vec::with_capacity(rows.len());
     for r in rows {
         let Some(endpoint) = endpoints.get(&r.source).cloned() else { continue };
         descriptors.push(serde_json::json!({
@@ -93,10 +96,11 @@ pub fn build(cfg: &Config, paths: &Paths) -> Option<Arc<ActionTools>> {
             Runnable {
                 endpoint,
                 verify: r.verify_class,
-                readback: r.readback_tool,
-                schema: r.schema,
+                readback: r.readback_tool.clone(),
+                schema: r.schema.clone(),
             },
         );
+        offered.push(r);
     }
     if descriptors.is_empty() {
         return None;
@@ -109,7 +113,64 @@ pub fn build(cfg: &Config, paths: &Paths) -> Option<Arc<ActionTools>> {
         Box::pin(async move { run_one(&runnable, call).await })
     });
     let hint = cfg.assistant.tools.place_names.then(|| room_hint(&store)).flatten();
-    Some(Arc::new(ActionTools { descriptors, execute, hint }))
+    let grammar = cfg.assistant.tools.grammar.then(|| rails(&store, &offered)).flatten();
+    Some(Arc::new(ActionTools { descriptors, execute, hint, grammar }))
+}
+
+/// The rails a local model is held to while it writes a command.
+///
+/// Everything here comes from two places, and neither is a list somebody has to
+/// keep up to date: each tool's own published schema, and what the house said
+/// about itself when it was connected. The only vendor knowledge involved is
+/// three field names, and it is asked for rather than assumed — a server whose
+/// catalogue is not recognised supplies none, and gets constraints from its
+/// schemas alone.
+///
+/// `None` whenever nothing usable could be derived, which leaves the model
+/// exactly as free as it is today.
+fn rails(store: &ToolCatalogStore, rows: &[fono_core::tool_catalog::ToolRow]) -> Option<String> {
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let fields = vendor::for_catalogue(&names).slot_fields();
+
+    let mut slots = fono_core::tool_grammar::SlotValues::new();
+    let mut described = Vec::new();
+    if let Some(field) = fields.place {
+        if let Ok(places) = store.place_names() {
+            described.push(format!("{} rooms", places.len()));
+            slots.set(field, places);
+        }
+    }
+    if let Some(field) = fields.device {
+        if let Ok(devices) = store.device_names() {
+            described.push(format!("{} devices", devices.len()));
+            slots.set(field, devices);
+        }
+    }
+    if let Some(field) = fields.kind {
+        if let Ok(mut kinds) = store.device_domains() {
+            // Only the kinds this house actually contains, so a command cannot
+            // ask for a kind of thing that is not here. `__all__` is the way to
+            // still say "everything in this room" — without it a required kind
+            // would cost the user that sentence entirely.
+            described.push(format!("{} kinds of device", kinds.len()));
+            kinds.push(fono_core::tool_grammar::ANY_KIND.to_string());
+            slots.set(field, kinds);
+        }
+    }
+
+    let g = fono_core::tool_grammar::build(rows, &slots);
+    if let Some(text) = &g {
+        info!(
+            "actions: while writing a command the model is held to what this home reported{}{} \
+             ({} bytes of rules)",
+            if described.is_empty() { "" } else { " — " },
+            described.join(", "),
+            text.len()
+        );
+    } else {
+        debug!("actions: nothing to hold the model to; commands stay unconstrained");
+    }
+    g
 }
 
 /// What the user's tools amount to once the chosen backend is taken into
@@ -288,6 +349,46 @@ fn drop_empty_arguments(args: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Take back the one value Fono offered that no server accepts.
+///
+/// The rails make a field compulsory to stop it being forgotten, and offer
+/// [`fono_core::tool_grammar::ANY_KIND`] as the way to still say "everything in
+/// this room". Nothing outside Fono has ever heard of it, so it is removed here
+/// and the field goes back to being absent — which is exactly what "everything"
+/// has always meant to a server.
+///
+/// The gain is in the record rather than the behaviour: a command that meant the
+/// whole room and one that forgot to say what it meant used to be the same
+/// payload, and both open the blinds. Now they are told apart before this point,
+/// and only the deliberate one gets here.
+///
+/// Left blank by [`drop_empty_arguments`] rather than deleted outright, so the
+/// two rules compose and neither has to know about the other. Runs before the
+/// schema check, because the value would fail it.
+fn drop_any_kind(args: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    fn strip(v: Value) -> Value {
+        match v {
+            Value::String(s) if s == fono_core::tool_grammar::ANY_KIND => Value::Null,
+            // The kind is usually a list, so "everything" arrives as a
+            // one-element array and the whole array has to go: a list with the
+            // placeholder taken out would ask for nothing at all.
+            Value::Array(a) => {
+                let cleaned: Vec<Value> = a
+                    .into_iter()
+                    .filter(|e| e.as_str() != Some(fono_core::tool_grammar::ANY_KIND))
+                    .collect();
+                Value::Array(cleaned)
+            }
+            other => other,
+        }
+    }
+    match args {
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, strip(v))).collect()),
+        other => other,
+    }
+}
+
 /// Check the arguments against what the server said it accepts.
 ///
 /// Returns the server's own vocabulary for what is wrong, or `None` when
@@ -410,7 +511,7 @@ async fn run_one(
     };
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-    let args = drop_empty_arguments(args);
+    let args = drop_empty_arguments(drop_any_kind(args));
 
     // Never sent, so nothing moved and a correction is free. The complaint is
     // phrased against the schema the model was shown, which is a more useful
@@ -676,6 +777,37 @@ mod tests {
         assert_eq!(drop_empty_arguments(args.clone()), args);
     }
 
+    /// The rails make the kind of device compulsory so it cannot be forgotten,
+    /// and hand the model one word for "everything in this room". No server has
+    /// heard of that word, so it must be taken back out before the call leaves —
+    /// and taking it out has to mean the field is absent, which is what a server
+    /// has always read as "everything".
+    #[test]
+    fn the_word_for_everything_never_reaches_the_server() {
+        let args = serde_json::json!({
+            "area": "Kitchen",
+            "domain": [fono_core::tool_grammar::ANY_KIND],
+        });
+        // Both rules run together on the real path, in this order.
+        assert_eq!(
+            drop_empty_arguments(drop_any_kind(args)),
+            serde_json::json!({ "area": "Kitchen" }),
+            "the whole field goes, not just the word — a list with it removed asks for nothing"
+        );
+
+        // A bare string form is handled too, since a schema may not use a list.
+        let args = serde_json::json!({ "domain": fono_core::tool_grammar::ANY_KIND });
+        assert_eq!(drop_empty_arguments(drop_any_kind(args)), serde_json::json!({}));
+    }
+
+    /// A real kind of device must survive untouched, or asking for the lights
+    /// only would silently become asking for everything in the room.
+    #[test]
+    fn a_real_kind_of_device_is_left_alone() {
+        let args = serde_json::json!({ "area": "Kitchen", "domain": ["light"] });
+        assert_eq!(drop_any_kind(args.clone()), args);
+    }
+
     /// Verbatim from two traces, one in Romanian and one in English: asked to
     /// turn the bedroom lights on, the model reached for the brightness-and-
     /// colour tool and invented both values. `#FFFFFF` is not a colour that
@@ -814,9 +946,12 @@ mod tests {
         let store = ToolCatalogStore::open_in_memory().expect("store");
         store.set_place_names("home", &["Yard".to_string()]).expect("rooms");
         store
-            .set_device_names(
+            .set_devices(
                 "home",
-                &["Office outdoor light".to_string(), "Hall lamp".to_string()],
+                &[
+                    fono_core::tool_catalog::Device::new("Office outdoor light", "light"),
+                    fono_core::tool_catalog::Device::new("Hall lamp", "light"),
+                ],
             )
             .expect("devices");
         let hint = room_hint(&store).expect("hint");
@@ -830,9 +965,10 @@ mod tests {
     fn too_many_devices_are_left_out_rather_than_cut_short() {
         let store = ToolCatalogStore::open_in_memory().expect("store");
         store.set_place_names("home", &["Yard".to_string()]).expect("rooms");
-        let many: Vec<String> =
-            (0..=MAX_LISTED_DEVICES).map(|i| format!("Device number {i}")).collect();
-        store.set_device_names("home", &many).expect("devices");
+        let many: Vec<fono_core::tool_catalog::Device> = (0..=MAX_LISTED_DEVICES)
+            .map(|i| fono_core::tool_catalog::Device::new(format!("Device number {i}"), "light"))
+            .collect();
+        store.set_devices("home", &many).expect("devices");
         let hint = room_hint(&store).expect("rooms still give a hint");
         assert!(hint.contains("Yard"), "the room half must survive: {hint}");
         assert!(!hint.contains("Device number"), "a partial list must not be stated: {hint}");
@@ -844,6 +980,86 @@ mod tests {
     fn no_rooms_means_no_hint() {
         let store = ToolCatalogStore::open_in_memory().expect("store");
         assert!(room_hint(&store).is_none());
+    }
+
+    /// A store standing in for a small Home Assistant: two rooms, two kinds of
+    /// device, and the one tool the traces keep failing on.
+    fn a_small_home() -> (ToolCatalogStore, Vec<fono_core::tool_catalog::ToolRow>) {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        store
+            .set_place_names("home", &["Office".to_string(), "Master bedroom".to_string()])
+            .expect("rooms");
+        store
+            .set_devices(
+                "home",
+                &[
+                    fono_core::tool_catalog::Device::new("Office outdoor light", "light"),
+                    fono_core::tool_catalog::Device::new("Bedroom blind", "cover"),
+                ],
+            )
+            .expect("devices");
+        let rows = vec![fono_core::tool_catalog::ToolRow {
+            source: "home".into(),
+            name: "HassTurnOn".into(),
+            description: String::new(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "area": {"type": "string"},
+                    "name": {"type": "string"},
+                    "domain": {"type": "array", "items": {"type": "string"}},
+                },
+            }),
+            schema_hash: String::new(),
+            capability: fono_core::tool_catalog::Capability::Safe,
+            verify_class: fono_core::tool_catalog::VerifyClass::None,
+            readback_tool: None,
+            available: true,
+            enabled: true,
+            user_touched: false,
+        }];
+        (store, rows)
+    }
+
+    /// The rails are built from what the house reported and nothing else, so
+    /// every room and device name it gave must appear, and the word for
+    /// "everything in this room" must be offered alongside the real kinds.
+    #[test]
+    fn the_rails_are_built_from_what_the_home_reported() {
+        let (store, rows) = a_small_home();
+        let g = rails(&store, &rows).expect("a home with rooms and devices gives rails");
+        assert!(g.contains("Office"), "{g}");
+        assert!(g.contains("Master bedroom"), "{g}");
+        assert!(g.contains("Office outdoor light"), "{g}");
+        assert!(g.contains("light"), "{g}");
+        assert!(g.contains("cover"), "{g}");
+        assert!(
+            g.contains(fono_core::tool_grammar::ANY_KIND),
+            "the escape hatch must be there: {g}"
+        );
+        assert!(g.contains("HassTurnOn"), "the tool name must be pinned too: {g}");
+    }
+
+    /// The switch is the whole point of shipping this off by default: it has to
+    /// be possible to run the same home with and without the rails and compare.
+    /// A setting that is read but ignored would make that comparison a lie.
+    #[test]
+    fn the_switch_decides_whether_the_rails_exist_at_all() {
+        let (store, rows) = a_small_home();
+        // This mirrors the one line in `build` that consults the setting.
+        let with = true.then(|| rails(&store, &rows)).flatten();
+        let without = false.then(|| rails(&store, &rows)).flatten();
+        assert!(with.is_some(), "on means rails");
+        assert!(without.is_none(), "off means the model is exactly as free as before");
+    }
+
+    /// A house that said nothing about itself gives nothing to hold the model
+    /// to, and must leave it unconstrained rather than fail or invent a menu.
+    #[test]
+    fn a_silent_home_leaves_the_model_free() {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        let rows: Vec<fono_core::tool_catalog::ToolRow> = Vec::new();
+        assert!(rails(&store, &rows).is_none());
     }
 
     /// Long server output is trimmed, but visibly, and with enough room
@@ -914,6 +1130,7 @@ mod tests {
             descriptors: vec![serde_json::json!({"type": "function"})],
             execute: Arc::new(|_| Box::pin(async { ToolOutcome::worked(String::new()) })),
             hint: Some("Rooms: Kitchen".into()),
+            grammar: None,
         });
 
         let (kept, note) = for_backend(Some(tools.clone()), true, "openai");
@@ -959,7 +1176,7 @@ mod tests {
             let found = fono_assistant::mcp_client::discover(&ep).await.expect("discover");
             let store = ToolCatalogStore::open(&paths.tool_catalog_db()).expect("store");
             store.set_place_names(&s.name, &found.places).expect("store rooms");
-            store.set_device_names(&s.name, &found.devices).expect("store devices");
+            store.set_devices(&s.name, &found.devices).expect("store devices");
             println!(
                 "{} is {}, {} rooms, {} devices",
                 s.name,

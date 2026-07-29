@@ -89,6 +89,130 @@ pub fn generation_sampler() -> LlamaSampler {
     ])
 }
 
+/// The same sampler with a grammar link in front of greedy, holding the model
+/// to `grammar` from the moment any of `triggers` matches what it has written.
+///
+/// Before a trigger matches, nothing is constrained at all — ordinary talking
+/// is untouched, which is the whole point of the lazy form. After one matches,
+/// only text the grammar allows can be sampled.
+///
+/// The second half of the return says whether the grammar actually went in.
+/// Callers are expected to report it rather than report what they asked for:
+/// a rejected grammar samples exactly like the setting being off, and a trace
+/// that says `on` either way hides the only failure this code has.
+///
+/// The reply is never at risk: a grammar llama.cpp will not take costs the
+/// constraint and nothing else.
+///
+/// # Why this reaches past the safe wrapper
+///
+/// `llama_cpp_2::LlamaSampler::grammar_lazy_patterns` is gated behind that
+/// crate's `common` feature, which links `libcommon.a` — around 14 MB into a
+/// binary with a 25 MiB budget. The grammar implementation itself is in
+/// `libllama`, which is always linked; only the safe wrapper is out of reach.
+/// So the raw entry point is called directly and the result is wrapped, with
+/// the layout asserts below turning any upstream change into a compile error.
+#[must_use]
+pub fn generation_sampler_with_grammar(
+    model: &LlamaModel,
+    grammar: &str,
+    triggers: &[String],
+) -> (LlamaSampler, bool) {
+    let Some(g) = grammar_sampler(model, grammar, triggers) else {
+        warn!(
+            "the tool-call grammar was rejected by llama.cpp and is not being applied; \
+             commands are being written unconstrained, exactly as with the setting off"
+        );
+        return (generation_sampler(), false);
+    };
+    let chain = LlamaSampler::chain_simple([
+        LlamaSampler::penalties(PENALTY_LAST_N, PENALTY_REPEAT, 0.0, 0.0),
+        g,
+        LlamaSampler::greedy(),
+    ]);
+    (chain, true)
+}
+
+/// Compile-time proof that the two `llama-cpp-2` handle types really are bare
+/// pointers, which is what makes the raw-pointer route in [`grammar_sampler`]
+/// sound. Both hold their pointer in a private field with no accessor, so
+/// reaching it means a layout-checked copy; if a future release adds a field,
+/// these asserts fail the build instead of letting a crash ship.
+const LAYOUT_MODEL: () = {
+    assert!(
+        std::mem::size_of::<LlamaModel>()
+            == std::mem::size_of::<*const llama_cpp_sys_2::llama_model>()
+    );
+    assert!(
+        std::mem::align_of::<LlamaModel>()
+            == std::mem::align_of::<*const llama_cpp_sys_2::llama_model>()
+    );
+};
+const LAYOUT_SAMPLER: () = {
+    assert!(
+        std::mem::size_of::<LlamaSampler>()
+            == std::mem::size_of::<*mut llama_cpp_sys_2::llama_sampler>()
+    );
+    assert!(
+        std::mem::align_of::<LlamaSampler>()
+            == std::mem::align_of::<*mut llama_cpp_sys_2::llama_sampler>()
+    );
+};
+
+/// Build the lazy grammar link, or `None` if llama.cpp will not take it.
+fn grammar_sampler(model: &LlamaModel, grammar: &str, triggers: &[String]) -> Option<LlamaSampler> {
+    use std::ffi::CString;
+
+    // Force the layout proofs above to be evaluated for this code path.
+    let () = LAYOUT_MODEL;
+    let () = LAYOUT_SAMPLER;
+
+    if triggers.is_empty() {
+        return None;
+    }
+    // Interior NULs cannot cross into C. Neither can occur in a grammar built
+    // from a tool catalogue, but the check is free and the alternative is
+    // undefined behaviour.
+    let grammar_c = CString::new(grammar).ok()?;
+    let root_c = CString::new("root").ok()?;
+    let triggers_c: Vec<CString> =
+        triggers.iter().map(|t| CString::new(t.as_str())).collect::<Result<_, _>>().ok()?;
+    let mut patterns: Vec<*const std::ffi::c_char> =
+        triggers_c.iter().map(|t| t.as_ptr()).collect();
+
+    // SAFETY: `LlamaModel` is a single-field newtype over `NonNull<llama_model>`
+    // with no public accessor, so the pointer is read through a copy whose
+    // layout equality is asserted at compile time (see `LAYOUT_MODEL` above).
+    // The read borrows `model`, so the pointer is valid for this call. Same
+    // pattern, and same reasoning, as `BrainTap::install`.
+    let model_ptr: *const llama_cpp_sys_2::llama_model = unsafe { std::mem::transmute_copy(model) };
+
+    // SAFETY: `model_ptr` came from a live `&LlamaModel`. The grammar, root and
+    // pattern pointers all outlive the call, which copies what it needs.
+    let raw = unsafe {
+        let vocab = llama_cpp_sys_2::llama_model_get_vocab(model_ptr);
+        llama_cpp_sys_2::llama_sampler_init_grammar_lazy_patterns(
+            vocab,
+            grammar_c.as_ptr(),
+            root_c.as_ptr(),
+            patterns.as_mut_ptr(),
+            patterns.len(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+
+    // SAFETY: `LlamaSampler` is likewise a single-field newtype over the raw
+    // pointer and cannot be constructed from outside its crate; its layout
+    // equality is asserted at compile time (see `LAYOUT_SAMPLER` above), so an
+    // upstream change is a build failure rather than a crash. `raw` is a live
+    // sampler this call now owns — the wrapper frees it, or the chain it joins.
+    Some(unsafe { std::mem::transmute::<*mut llama_cpp_sys_2::llama_sampler, LlamaSampler>(raw) })
+}
+
 /// Model-agnostic stop predicate: `true` for any token the vocabulary
 /// tags as a control token (turn markers, BOS/EOS, end-of-generation),
 /// however it is spelled. See the module docs for the `gemma-4-e2b`
@@ -263,6 +387,120 @@ pub fn warn_on_template_vocab_mismatch(model: &LlamaModel, model_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real vocabulary, loaded weights-free, for the tests that have to cross
+    /// into llama.cpp.
+    ///
+    /// `vocab_only` is what makes this affordable: compiling a grammar needs the
+    /// token table and nothing else, so there is no tensor data to read and no
+    /// gigabyte of resident weights. Any GGUF will do, including the tiny
+    /// vocab-only files llama.cpp keeps for its own tests.
+    fn vocab_model() -> LlamaModel {
+        let path = std::env::var("FONO_TEST_VOCAB_GGUF").expect("FONO_TEST_VOCAB_GGUF");
+        let params = llama_cpp_2::model::params::LlamaModelParams::default().with_vocab_only(true);
+        LlamaModel::load_from_file(crate::llama_backend::backend(), &path, &params)
+            .expect("loading the vocabulary")
+    }
+
+    /// The one thing no other test can prove: llama.cpp accepts a grammar Fono
+    /// generated, through a raw entry point reached past a feature gate.
+    ///
+    /// Every step of that route is invisible to the type system. The symbol
+    /// might not be linked, the grammar text might be rejected, and the
+    /// returned pointer might be wrapped wrongly — which would not show up
+    /// until it is freed. This walks all three, ending with the drop.
+    ///
+    /// Needs a vocabulary, so it is skipped unless one is named:
+    ///
+    /// ```text
+    /// FONO_TEST_VOCAB_GGUF=/path/to/any.gguf \
+    ///   nice -n 10 cargo test -p fono-core --features llama-local \
+    ///   --lib llama_gen -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
+    fn llama_cpp_accepts_a_grammar_we_generated() {
+        let model = vocab_model();
+        let tools = [crate::tool_catalog::ToolRow {
+            source: "ha".into(),
+            name: "HassTurnOn".into(),
+            description: String::new(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "area": {"type": "string"},
+                    "name": {"type": "string"},
+                    "domain": {"type": "array", "items": {"type": "string"}},
+                },
+            }),
+            schema_hash: String::new(),
+            capability: crate::tool_catalog::Capability::Safe,
+            verify_class: crate::tool_catalog::VerifyClass::None,
+            readback_tool: None,
+            available: true,
+            enabled: true,
+            user_touched: false,
+        }];
+        let mut slots = crate::tool_grammar::SlotValues::new();
+        slots.set("area", vec!["Kitchen".into(), "Master bedroom".into()]);
+        slots.set("name", vec![r#"Nick's "big" lamp"#.into()]);
+        slots.set("domain", vec!["light".into(), crate::tool_grammar::ANY_KIND.into()]);
+        slots.require("domain");
+        let grammar = crate::tool_grammar::build(&tools, &slots).expect("a grammar");
+
+        let sampler = grammar_sampler(&model, &grammar, &crate::tool_grammar::trigger_patterns());
+        assert!(
+            sampler.is_some(),
+            "llama.cpp rejected a grammar built from a real catalogue:\n{grammar}"
+        );
+        // Freeing it is where a wrongly-wrapped pointer would abort.
+        drop(sampler);
+    }
+
+    /// Text llama.cpp cannot parse has to come back as `None`, not as a null
+    /// pointer dressed up as a sampler. That is the difference between losing
+    /// the constraint and losing the process.
+    #[test]
+    #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
+    fn a_grammar_llama_cpp_cannot_parse_is_refused_not_wrapped() {
+        let model = vocab_model();
+        assert!(grammar_sampler(&model, "root ::= (((", &["x".to_string()]).is_none());
+    }
+
+    /// A rejected grammar has to leave sampling exactly as it is with the
+    /// setting off, so a mistake in the constraint can never cost the user
+    /// their reply — and it has to SAY it was rejected, because a trace that
+    /// cannot tell `on` from `nothing happened` is how the rails managed to
+    /// look enabled for a whole evening while a house filled up with invented
+    /// room names.
+    #[test]
+    #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
+    fn a_rejected_grammar_still_returns_a_working_sampler() {
+        let model = vocab_model();
+        let (sampler, armed) =
+            generation_sampler_with_grammar(&model, "root ::= (((", &["x".to_string()]);
+        assert!(!armed, "a grammar llama.cpp refused must not be reported as applied");
+        // Building it and freeing it is the whole test: a wrongly-built chain
+        // aborts on drop rather than returning.
+        drop(sampler);
+    }
+
+    /// Every opener the reply parser will honour has to arm the rails.
+    ///
+    /// This is the test the original grammar work was missing, and the gap it
+    /// left was total: the rails covered the tagged form only, so a model that
+    /// answered with a fenced block or a bare object wrote its command in a
+    /// place nothing was watching — while the trace still said `on`.
+    #[test]
+    #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
+    fn every_accepted_opener_arms_the_rails() {
+        let model = vocab_model();
+        let patterns = crate::tool_grammar::trigger_patterns();
+        assert!(
+            grammar_sampler(&model, "root ::= \"{\" \"}\"", &patterns).is_some(),
+            "llama.cpp must accept every trigger pattern: {patterns:?}"
+        );
+    }
 
     #[test]
     fn first_stop_marker_finds_earliest() {

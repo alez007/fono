@@ -21,6 +21,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use fono_core::tool_catalog::Device;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
@@ -51,9 +52,9 @@ pub struct Discovery {
     /// The rooms this server knows about, when it can say. Empty otherwise.
     pub places: Vec<String>,
     /// The names of things that can actually be operated — lights, switches,
-    /// blinds and so on. Sensors are left out: they cannot be commanded, and
-    /// they are the bulk of a typical home.
-    pub devices: Vec<String>,
+    /// blinds and so on, each with the kind of thing it is. Sensors are left
+    /// out: they cannot be commanded, and they are the bulk of a typical home.
+    pub devices: Vec<Device>,
 }
 
 /// Everything needed to reach one MCP server.
@@ -287,11 +288,11 @@ const ACTIONABLE: &[&str] = &[
     "todo",
 ];
 
-/// Pull the names of actionable devices out of a live-context dump.
+/// Pull the actionable devices out of a live-context dump, each with the kind
+/// of thing it is.
 ///
-/// Same scrape as [`parse_places`], but it has to track the domain that
-/// follows each name, so it walks entity blocks rather than filtering lines.
-/// A block looks like:
+/// Same scrape as [`parse_places`], but it walks entity blocks rather than
+/// filtering lines because the kind follows the name. A block looks like:
 ///
 /// ```text
 /// - names: Office outdoor light
@@ -299,9 +300,12 @@ const ACTIONABLE: &[&str] = &[
 ///   state: 'on'
 ///   areas: Yard
 /// ```
-fn parse_devices(text: &str) -> Vec<String> {
+///
+/// The kind is kept rather than discarded because it is what lets Fono offer
+/// the model the kinds this home actually contains.
+fn parse_devices(text: &str) -> Vec<Device> {
     let inner = inner_dump(text);
-    let mut names = Vec::new();
+    let mut found = Vec::new();
     let mut pending: Option<String> = None;
     for line in inner.lines() {
         let t = line.trim();
@@ -312,14 +316,14 @@ fn parse_devices(text: &str) -> Vec<String> {
             let d = d.trim().trim_matches(['\'', '"']).trim();
             if let Some(n) = pending.take() {
                 if ACTIONABLE.contains(&d) && !n.is_empty() && n.len() < 64 {
-                    names.push(n);
+                    found.push(Device::new(n, d));
                 }
             }
         }
     }
-    names.sort_unstable();
-    names.dedup();
-    names
+    found.sort_unstable();
+    found.dedup();
+    found
 }
 
 /// Run one tool and return what the server said.
@@ -545,9 +549,11 @@ mod tests {
                     domain: lock\n  areas: Hallway\n- names: Back door open\n  \
                     domain: binary_sensor\n  areas: Hallway\n";
         let text = serde_json::to_string(&json!({"result": dump})).unwrap();
-        assert_eq!(parse_devices(&text), vec!["Front door", "Office outdoor light"]);
+        let want =
+            vec![Device::new("Front door", "lock"), Device::new("Office outdoor light", "light")];
+        assert_eq!(parse_devices(&text), want);
         // A bare dump works too, for a server that does not wrap it.
-        assert_eq!(parse_devices(dump), vec!["Front door", "Office outdoor light"]);
+        assert_eq!(parse_devices(dump), want);
     }
 
     /// The exact shape that failed against a real house: the lamp is named
@@ -557,7 +563,19 @@ mod tests {
     #[test]
     fn keeps_a_device_name_that_disagrees_with_its_room() {
         let dump = "- names: Office outdoor light\n  domain: light\n  areas: Yard\n";
-        assert_eq!(parse_devices(dump), vec!["Office outdoor light"]);
+        assert_eq!(parse_devices(dump), vec![Device::new("Office outdoor light", "light")]);
+    }
+
+    /// The kind of each device is carried through discovery, because it is what
+    /// lets Fono offer the model only the kinds this home actually has.
+    #[test]
+    fn keeps_the_kind_of_each_device() {
+        let dump = "- names: Kitchen lights\n  domain: light\n- names: Living room blind\n  \
+                    domain: cover\n- names: Kitchen speaker\n  domain: media_player\n";
+        let found = parse_devices(dump);
+        let kinds: Vec<&str> = found.iter().map(|d| d.domain.as_str()).collect();
+        // Sorted by name, so: Kitchen lights, Kitchen speaker, Living room blind.
+        assert_eq!(kinds, vec!["light", "media_player", "cover"]);
     }
 
     /// A block with no domain line is dropped rather than guessed at, and an

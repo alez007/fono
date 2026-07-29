@@ -1845,6 +1845,17 @@ function toolsHtml() {
       : '')
     + '<span class="hint">Save &amp; connect checks the address before saving anything.</span></div>';
 
+  // Above the tool list, and above every early return below it, because the
+  // switch has to be reachable even when the list cannot be shown — a server
+  // that is failing to answer is exactly when someone wants to change this.
+  out += row('Hold commands to what your home reported',
+    'While the assistant is writing a command it can only pick rooms, devices and kinds of device '
+    + 'your home actually has \u2014 so it cannot invent a room that is not there, or leave out '
+    + 'something the server needs. Talking, stories and explanations are untouched. '
+    + 'Off by default, so you can turn it on and compare. '
+    + 'Only affects a model running on this machine; a cloud service already does this itself.',
+    toggle('assistant.tools.grammar', false));
+
   if (toolsErr) return out + '<p class="privacy-note">Could not load tools: ' + esc(toolsErr) + '</p>';
   if (!toolsData) return out + '<p class="hint">Loading\u2026</p>';
   const tools = toolsData.tools || [];

@@ -1355,11 +1355,31 @@ pub struct AssistantTools {
     /// for a room in another language, and watch it fail.
     #[serde(default = "default_true")]
     pub place_names: bool,
+    /// Hold a model on rails while it writes a command.
+    ///
+    /// A model running on your own machine writes the command out as text,
+    /// and a small one gets it wrong in ways nothing can recover from: a
+    /// colour no device accepts, a room that does not exist, a field the
+    /// server insists on left out. Asking it more clearly in the prompt was
+    /// tried three times and failed three times.
+    ///
+    /// With this on, the moment the model starts writing a command it can
+    /// only write one the server said it would accept — right name, no
+    /// missing fields, no invented values. Ordinary conversation is
+    /// untouched: the rails only exist while a command is being written, so
+    /// stories, jokes and explanations are as free as before. It costs
+    /// nothing to read the prompt again and cannot make Fono slower.
+    ///
+    /// Off until it has been measured to help, and only ever applies to a
+    /// model running on this machine — a cloud service enforces the same
+    /// thing itself.
+    #[serde(default)]
+    pub grammar: bool,
 }
 
 impl Default for AssistantTools {
     fn default() -> Self {
-        Self { enabled: false, mcp: Vec::new(), place_names: true }
+        Self { enabled: false, mcp: Vec::new(), place_names: true, grammar: false }
     }
 }
 

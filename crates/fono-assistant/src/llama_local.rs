@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use fono_core::brain_tap::{decode_token_with_tap, BrainTap};
 use fono_core::llama_backend::{backend, shared_model, streaming_model_params};
 use fono_core::llama_gen::{
-    first_stop_marker, generation_sampler, is_control_token, safe_stream_end, turn_markers,
-    warn_on_template_vocab_mismatch, TurnMarkers,
+    first_stop_marker, generation_sampler, generation_sampler_with_grammar, is_control_token,
+    safe_stream_end, turn_markers, warn_on_template_vocab_mismatch, TurnMarkers,
 };
+use fono_core::tool_grammar::trigger_patterns;
 use fono_core::turn_trace::{
     current_instant, current_span, generation_span_args, record_cache_mutation, CACHE_LANE,
 };
@@ -49,7 +50,10 @@ const MIN_CTX: u32 = 512;
 /// Per-request generation knobs threaded into the prefix-cache decode path.
 /// Bundled so the cache fns stay under clippy's argument limit and the two
 /// flags travel together.
-#[derive(Clone, Copy)]
+///
+/// `Clone` rather than `Copy` since the rails are a shared string: the wording
+/// pass after a tool call reuses the same knobs with one field changed.
+#[derive(Clone)]
 struct GenParams {
     /// Cap on generated tokens (already clamped to [`MAX_NEW_TOKENS`]).
     max_new_tokens: i32,
@@ -70,6 +74,14 @@ struct GenParams {
     /// overlay. Opens the backend's `capture_gate` for the duration of the
     /// turn.
     allow_capture: bool,
+    /// The rails the model is held to once it starts writing a command, from
+    /// [`ActionTools::grammar`]. `None` leaves sampling exactly as it is
+    /// without the setting, which is what makes the two comparable.
+    ///
+    /// Carried per request rather than per backend because it describes the
+    /// tools offered *this turn* — and because it must be absent on the turns
+    /// where no tools are offered at all.
+    grammar: Option<Arc<str>>,
 }
 
 /// RAII guard that closes the backend's brain-capture gate when a
@@ -642,6 +654,7 @@ impl LlamaLocalAssistant {
             None,
             params.max_new_tokens,
             self.tap().map(Arc::as_ref),
+            params.grammar.as_deref(),
             on_delta,
         )?;
         // Option C: checkpoint the POST-generation state so the next turn can
@@ -823,7 +836,7 @@ impl LlamaLocalAssistant {
     {
         let guard = self.state.lock().map_err(|_| anyhow!("llama-local mutex poisoned"))?;
         let model = guard.as_ref().ok_or_else(|| anyhow!("llama-local model not loaded"))?;
-        self.run_inference_with_model(model, prompt, MAX_NEW_TOKENS, on_delta)
+        self.run_inference_with_model(model, prompt, MAX_NEW_TOKENS, None, on_delta)
     }
 
     /// Reply generation with the Task 8 prefix cache. Only attempts the cached
@@ -855,7 +868,7 @@ impl LlamaLocalAssistant {
                 prefix,
                 suffix,
                 layer,
-                params,
+                params.clone(),
                 &mut on_delta,
             )? {
                 return Ok(text);
@@ -863,7 +876,15 @@ impl LlamaLocalAssistant {
         } else {
             cold_prefill(layer.as_str(), "prompt_split_mismatch");
         }
-        self.run_inference_with_model(model, prompt, params.max_new_tokens, on_delta)
+        // The rails follow the fallback: a cache miss must not quietly disarm
+        // them, or an A/B run would be measuring cache luck instead of rails.
+        self.run_inference_with_model(
+            model,
+            prompt,
+            params.max_new_tokens,
+            params.grammar.as_deref(),
+            on_delta,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -872,6 +893,7 @@ impl LlamaLocalAssistant {
         model: &LlamaModel,
         prompt: &str,
         max_new_tokens: i32,
+        grammar: Option<&str>,
         on_delta: F,
     ) -> Result<String>
     where
@@ -949,6 +971,7 @@ impl LlamaLocalAssistant {
             None,
             max_new_tokens,
             self.tap().map(Arc::as_ref),
+            grammar,
             on_delta,
         )?;
         Ok(generation.text.trim().to_string())
@@ -1169,10 +1192,13 @@ impl LlamaLocalAssistant {
                 }
 
                 let uncached_started = Instant::now();
-                let uncached_output =
-                    self.run_inference_with_model(model, &full_prompt, MAX_NEW_TOKENS, |_| {
-                        Ok(true)
-                    })?;
+                let uncached_output = self.run_inference_with_model(
+                    model,
+                    &full_prompt,
+                    MAX_NEW_TOKENS,
+                    None,
+                    |_| Ok(true),
+                )?;
                 let uncached_latency_ms = uncached_started.elapsed().as_millis() as u64;
 
                 let restore_started = Instant::now();
@@ -1216,6 +1242,9 @@ impl LlamaLocalAssistant {
                     None,
                     MAX_NEW_TOKENS,
                     self.tap().map(Arc::as_ref),
+                    // Cache-benchmark path: never railed, so the two arms of the
+                    // cached/uncached comparison stay identical in sampling.
+                    None,
                     |delta| {
                         if first_token_ms.is_none() {
                             first_token_ms = Some(cached_started.elapsed().as_millis() as u64);
@@ -1584,6 +1613,9 @@ impl LlamaLocalAssistant {
                 Some(first_token),
                 MAX_NEW_TOKENS,
                 self.tap().map(Arc::as_ref),
+                // Diagnostic replay of a rendered prompt: no tools are offered,
+                // so there is nothing to constrain.
+                None,
                 |delta| {
                     if first_token_ms.is_none() {
                         first_token_ms = Some(started.elapsed().as_millis() as u64);
@@ -1762,10 +1794,11 @@ struct GenerationResult {
     tokens: Vec<llama_cpp_2::token::LlamaToken>,
 }
 
-// 8 args: the extra `tap` observer is strictly optional plumbing for the
-// Glass Cortex visualization; bundling the generation bounds into a struct
-// would churn four call sites for no clarity gain.
-#[allow(clippy::too_many_arguments)]
+// 9 args: the `tap` observer is optional plumbing for the Glass Cortex
+// visualization and `grammar` is the optional tool-call constraint; bundling
+// the generation bounds into a struct would churn five call sites for no
+// clarity gain.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn generate_from_prefilled_context<F>(
     model: &LlamaModel,
     ctx: &mut LlamaContext<'_>,
@@ -1774,6 +1807,7 @@ fn generate_from_prefilled_context<F>(
     first_token_override: Option<llama_cpp_2::token::LlamaToken>,
     max_new_tokens: i32,
     tap: Option<&BrainTap>,
+    grammar: Option<&str>,
     mut on_delta: F,
 ) -> Result<GenerationResult>
 where
@@ -1782,7 +1816,15 @@ where
     // Shared generation policy: repetition penalty over generated tokens
     // only, feeding greedy. Deterministic; breaks the verbatim-repetition
     // attractor (see `fono_core::llama_gen` for the evidence).
-    let mut sampler = generation_sampler();
+    //
+    // With rails supplied, one extra link goes in front of greedy. It is inert
+    // until the model starts writing a command, so ordinary talking samples
+    // exactly as it does without them — which is what makes the two runs of an
+    // A/B comparable.
+    let (mut sampler, rails_armed) = grammar.map_or_else(
+        || (generation_sampler(), false),
+        |g| generation_sampler_with_grammar(model, g, &trigger_patterns()),
+    );
     let eos = model.token_eos();
     let mut out = String::new();
     let mut emitted_len = 0_usize;
@@ -1893,7 +1935,10 @@ where
         (start_pos.max(0) as u32).saturating_add(generated_tokens),
         ctx.n_ctx(),
     );
-    gen_span.finish(generation_span_args(
+    // Task 16d: stamp whether the rails were armed for this generation, so an
+    // A/B pair of traces is self-describing — you can tell from the artefact
+    // alone which arm produced it instead of trusting the run log.
+    let mut gen_args = generation_span_args(
         generated_tokens,
         out.chars().count(),
         deltas,
@@ -1901,7 +1946,20 @@ where
         elapsed_ms,
         start_pos,
         stop_reason,
-    ));
+    );
+    if let Some(obj) = gen_args.as_object_mut() {
+        // Three states, not two. `rejected` is the one that used to hide: a
+        // grammar llama.cpp refuses leaves sampling exactly as it is with the
+        // setting off, and reporting the request rather than the outcome meant
+        // a trace could say `on` while nothing was being held to anything.
+        let state = match (grammar.is_some(), rails_armed) {
+            (true, true) => "on",
+            (true, false) => "rejected",
+            _ => "off",
+        };
+        obj.insert("grammar".into(), state.into());
+    }
+    gen_span.finish(gen_args);
     Ok(GenerationResult { text: out, elapsed_ms, tokens: decoded_tokens })
 }
 
@@ -2192,6 +2250,10 @@ impl Assistant for LlamaLocalAssistant {
             max_new_tokens,
             pin_prefix: ctx.history.is_empty() && ctx.turn_notes().is_none(),
             allow_capture: ctx.allow_brain_capture,
+            // Rails only when tools are offered this turn AND the setting is on.
+            // `ActionTools::grammar` is already `None` when the switch is off,
+            // so there is nothing to check here beyond "are there tools at all".
+            grammar: actions.as_ref().and_then(|a| a.grammar.as_deref().map(Arc::from)),
         };
         let started = Instant::now();
         let model_name_owned = model_name.to_string();
@@ -2212,7 +2274,7 @@ impl Assistant for LlamaLocalAssistant {
                     &cache_prefix,
                     &cache_suffix,
                     PromptStateCacheLayer::F8ChatPrefix,
-                    gen_params,
+                    gen_params.clone(),
                     |delta| {
                         let delta = delta.trim_start_matches('\u{feff}').to_string();
                         if delta.is_empty() {
@@ -2285,7 +2347,7 @@ impl Assistant for LlamaLocalAssistant {
                             // turn's own words, so pinning it would evict the
                             // static head pin — the one entry every later
                             // conversation depends on.
-                            GenParams { pin_prefix: false, ..gen_params },
+                            GenParams { pin_prefix: false, ..gen_params.clone() },
                             |delta| {
                                 buf.push_str(delta.trim_start_matches('\u{feff}'));
                                 if !header_done {
@@ -3005,6 +3067,7 @@ mod tests {
                 }
             })],
             hint: Some("Rooms in this home: Kitchen, Office.".into()),
+            grammar: None,
             execute: Arc::new(move |call: ToolCall| {
                 let recorder = Arc::clone(&recorder);
                 Box::pin(async move {

@@ -4631,10 +4631,12 @@ async fn refresh_all_servers(
                 warn!("tool discovery: cannot store room names for {}: {e}", server.name);
             }
         }
-        // And the device names. The home only matches a name exactly,
-        // so a lamp called "Office outdoor light" cannot be found by
-        // asking for "outdoor light" or "outdoor office light".
-        match store.set_device_names(&server.name, &found.devices) {
+        // And the devices, each with the kind of thing it is. The home only
+        // matches a name exactly, so a lamp called "Office outdoor light"
+        // cannot be found by asking for "outdoor light" or "outdoor office
+        // light". The kind is what lets Fono later offer the model only the
+        // kinds this home actually contains.
+        match store.set_devices(&server.name, &found.devices) {
             Ok(changed) => report.prompt_dirty |= changed,
             Err(e) => {
                 warn!("tool discovery: cannot store device names for {}: {e}", server.name);

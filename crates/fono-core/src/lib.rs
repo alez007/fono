@@ -23,6 +23,7 @@ pub mod screen_capture;
 pub mod secrets;
 pub mod speakers;
 pub mod tool_catalog;
+pub mod tool_grammar;
 pub mod turn_trace;
 pub mod voice_discovery;
 pub mod voice_palette;

@@ -118,6 +118,26 @@ pub struct DiscoveredTool {
     pub readback_tool: Option<String>,
 }
 
+/// One thing in the home that a command can operate.
+///
+/// The kind is what the server calls the sort of thing this is — `light`,
+/// `cover`, `media_player`. Fono only ever repeats it back: it is used to
+/// work out which kinds are present in this home, never interpreted. A
+/// server that does not report one leaves it empty, and Fono falls back to
+/// treating the device as being of no particular kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Device {
+    pub name: String,
+    pub domain: String,
+}
+
+impl Device {
+    /// Convenience for tests and for callers that only have a name.
+    pub fn new(name: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self { name: name.into(), domain: domain.into() }
+    }
+}
+
 /// A stored tool, as the rest of Fono sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolRow {
@@ -245,6 +265,14 @@ impl ToolCatalogStore {
         let _ = self
             .conn
             .execute("ALTER TABLE tool ADD COLUMN description TEXT NOT NULL DEFAULT ''", []);
+        // The kind of thing each device is — a light, a blind, a speaker.
+        // Added after `device_name` shipped, same ignore-the-error reason as
+        // above. Empty for a row written before this column existed, and for
+        // any server that does not say; readers treat empty as "unknown" and
+        // simply fall back to the full device list.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE device_name ADD COLUMN domain TEXT NOT NULL DEFAULT ''", []);
         Ok(())
     }
 
@@ -459,8 +487,53 @@ impl ToolCatalogStore {
     /// lamp renamed in the home stays wrong in Fono's copy until something
     /// rediscovers, and the assistant then tells the user, at length, that a
     /// device they are looking at does not exist.
-    pub fn set_device_names(&self, source: &str, names: &[String]) -> Result<bool> {
-        self.replace_names("device_name", source, names)
+    ///
+    /// Each device carries the kind of thing it is, which is what lets Fono
+    /// offer the model the list of kinds actually present in this home rather
+    /// than every kind that could exist. A server that does not say leaves it
+    /// empty, and everything still works — see [`Device`].
+    pub fn set_devices(&self, source: &str, devices: &[Device]) -> Result<bool> {
+        let id = self.source_id(source, "sse")?;
+        let mut stmt =
+            self.conn.prepare("SELECT name, domain FROM device_name WHERE source_id = ?1")?;
+        let before: std::collections::BTreeSet<(String, String)> = stmt
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let after: std::collections::BTreeSet<(String, String)> = devices
+            .iter()
+            .map(|d| (d.name.trim().to_owned(), d.domain.trim().to_owned()))
+            .filter(|(n, _)| !n.is_empty())
+            .collect();
+
+        // Same reading as `replace_names`: a home that answers but lists
+        // nothing has not finished waking up, so keep what we knew.
+        if after.is_empty() && !before.is_empty() {
+            return Ok(false);
+        }
+
+        self.conn.execute("DELETE FROM device_name WHERE source_id = ?1", params![id])?;
+        for (name, domain) in &after {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO device_name(source_id, name, domain) VALUES (?1, ?2, ?3)",
+                params![id, name, domain],
+            )?;
+        }
+        Ok(before != after)
+    }
+
+    /// The kinds of device this home actually contains — `light`, `cover`,
+    /// `media_player` and so on — sorted and de-duplicated.
+    ///
+    /// Devices whose kind was never recorded contribute nothing, so an older
+    /// catalogue simply reports an empty list instead of a wrong one.
+    pub fn device_domains(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT domain FROM device_name WHERE domain <> '' ORDER BY domain",
+        )?;
+        let names = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(names)
     }
 
     /// Swap one source's rows in a name table, reporting whether anything moved.
@@ -786,6 +859,12 @@ mod tests {
         tool("HassTurnOff", serde_json::json!({ "properties": { "area": { "type": "string" } } }))
     }
 
+    /// Devices with no particular kind — for the tests that only care about
+    /// names. Kind-aware tests build [`Device`] values directly.
+    fn devs(v: &[&str]) -> Vec<Device> {
+        v.iter().map(|n| Device::new(*n, "")).collect()
+    }
+
     /// Removing a server is not the same event as a server going quiet, even
     /// though both end with tools that are not there. A blip must leave the
     /// user's choices intact; a removal must leave nothing behind at all.
@@ -848,18 +927,17 @@ mod tests {
     fn device_names_are_replaced_on_refresh_and_forgotten_with_the_server() {
         let db = ToolCatalogStore::open_in_memory().unwrap();
         db.reconcile("ha", "sse", &[light_on()]).unwrap();
-        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
-        db.set_device_names("ha", &names(&["Office outdoor light", "Kitchen lights"])).unwrap();
+        db.set_devices("ha", &devs(&["Office outdoor light", "Kitchen lights"])).unwrap();
         assert_eq!(db.device_names().unwrap(), vec!["Kitchen lights", "Office outdoor light"]);
 
         // A lamp that was renamed or unexposed must drop out, or we would keep
         // offering the model a name that no longer resolves.
-        db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap();
+        db.set_devices("ha", &devs(&["Kitchen lights"])).unwrap();
         assert_eq!(db.device_names().unwrap(), vec!["Kitchen lights"]);
 
         db.reconcile("cabin", "sse", &[light_on()]).unwrap();
-        db.set_device_names("cabin", &names(&["Attic lamp"])).unwrap();
+        db.set_devices("cabin", &devs(&["Attic lamp"])).unwrap();
         assert_eq!(db.device_names().unwrap(), vec!["Attic lamp", "Kitchen lights"]);
 
         db.forget_sources_except(&["cabin".to_string()]).unwrap();
@@ -878,24 +956,24 @@ mod tests {
         let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
         // First sight of a house is a change — there was nothing before.
-        assert!(db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap());
+        assert!(db.set_devices("ha", &devs(&["Kitchen lights"])).unwrap());
         assert!(db.set_place_names("ha", &names(&["Kitchen"])).unwrap());
 
         // Finding the same house again is not.
-        assert!(!db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap());
+        assert!(!db.set_devices("ha", &devs(&["Kitchen lights"])).unwrap());
         assert!(!db.set_place_names("ha", &names(&["Kitchen"])).unwrap());
 
         // Order and stray spacing are not changes: the names are sorted and
         // trimmed before they ever reach the model, so the prompt is identical.
-        assert!(!db.set_device_names("ha", &names(&["  Kitchen lights  ", ""])).unwrap());
+        assert!(!db.set_devices("ha", &devs(&["  Kitchen lights  ", ""])).unwrap());
 
         // A rename is the case that matters — this is the one that used to
         // leave fono insisting a lamp the user is looking at does not exist.
-        assert!(db.set_device_names("ha", &names(&["Lampa de sare"])).unwrap());
+        assert!(db.set_devices("ha", &devs(&["Lampa de sare"])).unwrap());
         assert_eq!(db.device_names().unwrap(), vec!["Lampa de sare"]);
 
         // And an addition.
-        assert!(db.set_device_names("ha", &names(&["Lampa de sare", "Hallway AC"])).unwrap());
+        assert!(db.set_devices("ha", &devs(&["Lampa de sare", "Hallway AC"])).unwrap());
     }
 
     /// A home that is still waking up answers with an empty list. Startup is
@@ -907,10 +985,10 @@ mod tests {
         db.reconcile("ha", "sse", &[light_on()]).unwrap();
         let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
-        db.set_device_names("ha", &names(&["Kitchen lights"])).unwrap();
+        db.set_devices("ha", &devs(&["Kitchen lights"])).unwrap();
         db.set_place_names("ha", &names(&["Kitchen"])).unwrap();
 
-        assert!(!db.set_device_names("ha", &[]).unwrap());
+        assert!(!db.set_devices("ha", &[]).unwrap());
         assert!(!db.set_place_names("ha", &[]).unwrap());
         assert_eq!(db.device_names().unwrap(), vec!["Kitchen lights"]);
         assert_eq!(db.place_names().unwrap(), vec!["Kitchen"]);
@@ -919,6 +997,47 @@ mod tests {
         // `forget_sources_except`, and it is not weakened by the guard above.
         db.forget_sources_except(&[]).unwrap();
         assert!(db.device_names().unwrap().is_empty());
+    }
+
+    /// The kind of each device is what lets Fono offer the model only the
+    /// kinds this home actually has. It has to survive a refresh, disappear
+    /// with its server, and stay absent rather than wrong when the server
+    /// never said what kind a thing was.
+    #[test]
+    fn device_kinds_are_learned_and_forgotten_with_their_server() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+
+        db.set_devices(
+            "ha",
+            &[
+                Device::new("Kitchen lights", "light"),
+                Device::new("Office outdoor light", "light"),
+                Device::new("Living room blind", "cover"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.device_domains().unwrap(), vec!["cover", "light"]);
+
+        // Losing the only blind loses the kind too, so the model is never
+        // offered a kind the home no longer contains.
+        db.set_devices("ha", &[Device::new("Kitchen lights", "light")]).unwrap();
+        assert_eq!(db.device_domains().unwrap(), vec!["light"]);
+
+        // A server that does not say leaves the kind unknown. That must read
+        // as "no kinds" rather than inventing one.
+        db.set_devices("ha", &devs(&["Mystery gadget"])).unwrap();
+        assert!(db.device_domains().unwrap().is_empty());
+        assert_eq!(db.device_names().unwrap(), vec!["Mystery gadget"]);
+
+        // Changing only the kind of a device is still a change: it moves what
+        // the model is allowed to say, so a warm prompt built on the old list
+        // is stale.
+        assert!(db.set_devices("ha", &[Device::new("Mystery gadget", "fan")]).unwrap());
+        assert!(!db.set_devices("ha", &[Device::new("Mystery gadget", "fan")]).unwrap());
+
+        db.forget_sources_except(&[]).unwrap();
+        assert!(db.device_domains().unwrap().is_empty());
     }
 
     #[test]

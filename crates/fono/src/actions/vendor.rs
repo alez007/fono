@@ -106,6 +106,46 @@ pub trait Vendor: Send + Sync {
     fn confirms(&self, _call: &ToolCall, _result: &str, _readback: &str) -> Option<Verdict> {
         None
     }
+
+    /// Which argument of a tool holds a room, which holds a device, and which
+    /// holds a kind of device.
+    ///
+    /// This is the only vendor knowledge the rails need, and it is deliberately
+    /// three *field names* rather than a list of tools. A table of tool names
+    /// would have to be corrected every time the server gained or renamed one —
+    /// maintenance nobody signed up for — while a field name is part of the
+    /// server's published interface and cannot move without breaking every
+    /// other client too. A tool that has none of these fields is unaffected,
+    /// which is why an unfamiliar server keeps exactly today's freedom.
+    ///
+    /// The default is empty, so a vendor that says nothing gets constraints
+    /// derived from published schemas alone.
+    fn slot_fields(&self) -> SlotFields {
+        SlotFields::default()
+    }
+
+    /// Is this catalogue of tool names one of ours?
+    ///
+    /// Needed because the rails are built before any tool has run, so there is
+    /// no result payload to recognise. Same one-sided rule as
+    /// [`Self::recognises`]: it may be wrong only by saying no.
+    fn recognises_catalogue(&self, _tools: &[&str]) -> bool {
+        false
+    }
+}
+
+/// The argument names a server uses for the three things a house is made of.
+///
+/// `None` means "this server has no such field", and nothing is constrained
+/// for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotFields {
+    /// Holds a room name.
+    pub place: Option<&'static str>,
+    /// Holds a device name.
+    pub device: Option<&'static str>,
+    /// Holds a kind of device.
+    pub kind: Option<&'static str>,
 }
 
 /// Pick the implementation for whichever software produced a result.
@@ -124,6 +164,22 @@ pub fn for_result(result: &str) -> &'static dyn Vendor {
     let parsed = serde_json::from_str::<serde_json::Value>(result).ok();
     for v in KNOWN {
         if parsed.as_ref().is_some_and(|p| v.recognises(p)) {
+            return *v;
+        }
+    }
+    &Unknown
+}
+
+/// Pick the implementation for a server we only know by the tools it offers.
+///
+/// The rails have to be built before anything has run, so there is no result
+/// payload to go on — only the catalogue. Falls back to [`Unknown`], which
+/// claims no field names, so an unrecognised catalogue is constrained by its
+/// own published schemas and nothing else.
+pub fn for_catalogue(tools: &[&str]) -> &'static dyn Vendor {
+    const KNOWN: &[&dyn Vendor] = &[&HomeAssistant];
+    for v in KNOWN {
+        if v.recognises_catalogue(tools) {
             return *v;
         }
     }
@@ -229,6 +285,26 @@ impl Vendor for HomeAssistant {
         } else {
             Verdict::Contradicted
         })
+    }
+
+    /// The three words Home Assistant uses across its whole intent interface.
+    ///
+    /// They are part of its public API — every voice integration in existence
+    /// sends these names — so they cannot change without breaking far more than
+    /// Fono. That is the entire reason this is three field names and not a list
+    /// of the couple of dozen tools a house currently exposes: a new release can
+    /// add and rename tools freely and this stays correct, whereas a tool table
+    /// would rot silently at every upgrade.
+    fn slot_fields(&self) -> SlotFields {
+        SlotFields { place: Some("area"), device: Some("name"), kind: Some("domain") }
+    }
+
+    /// Recognised by the intent-name prefix every one of its tools carries.
+    ///
+    /// One match is enough, and the prefix is specific enough that no other
+    /// server would collide with it.
+    fn recognises_catalogue(&self, tools: &[&str]) -> bool {
+        tools.iter().any(|t| t.starts_with("Hass"))
     }
 }
 

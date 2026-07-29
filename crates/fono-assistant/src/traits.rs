@@ -270,6 +270,19 @@ pub struct ActionTools {
     /// model picks one instead of translating and inventing. `None` when
     /// nothing is known or the user switched it off.
     pub hint: Option<String>,
+    /// Rails for a model writing a command on this machine: the only text it
+    /// is allowed to sample once it starts one.
+    ///
+    /// Built from the tools offered this turn and the rooms and devices the
+    /// house reported, so it can only ever describe things that exist. `None`
+    /// when the user has not switched it on, when nothing could be derived, or
+    /// on any backend that is not running the model here — a service enforces
+    /// its own schema and needs no help.
+    ///
+    /// A hint asks; this decides. Both are kept because they answer different
+    /// halves of the same failure: the hint tells the model which room to pick,
+    /// the rails stop it writing one that does not exist.
+    pub grammar: Option<String>,
 }
 
 impl std::fmt::Debug for ActionTools {

@@ -556,6 +556,7 @@ with the player's own `playback.play` span and only *partly* overlapped it
 track — Perfetto was dropping the slice with
 `slice_spill_overlapping_complete_event`. Drain moved to its own `playback-wait`
 lane.
+
 ## 2026-07-27 — One LLM backend vocabulary: none / local / network / provider
 
 `[polish]` and `[assistant]` now share a single `LlmBackend` enum with four
