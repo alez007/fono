@@ -126,6 +126,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent to the recogniser — that is often a cloud service you chose for audio
   alone, and an inventory of your home is not audio. Those names go to the
   assistant model, which is the part that needs them.
+- **A command you dictate into a terminal is typed as a command again.** Speech
+  recognisers write prose, so "cargo build --workspace" arrived as "Cargo build
+  --workspace." — capitalised, with a full stop, and the shell would not run it.
+  Fono now drops the invented full stop and the capital when what you said looks
+  like a command, whether or not you have cleanup switched on. Prose dictated
+  into a terminal, and messages to a coding agent running in one, are untouched.
 
 ### Changed (models)
 

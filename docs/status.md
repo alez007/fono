@@ -68,6 +68,17 @@ somebody's home has no business riding on a request to a cloud service they chos
 for audio. `docs/privacy.md` states this, and the absence of the field is what
 keeps it true. The user dictionary still goes, since that is the user's own list.
 
+**Also fixed, same session.** A dictated `cargo build --workspace` arrived as
+`Cargo build --workspace.` — the recogniser writes prose, and the shell will not
+run that. `TERMINAL_SHELL_SUFFIX` already instructs the cleanup model to lowercase
+and drop prose punctuation, but cleanup is optional and off by default, so nothing
+was applying it. New `tidy_shell_command` does the two mechanical edits in Rust,
+behind `tidy_if_shell` which reuses the existing `looks_like_shell_command` gate
+(terminal, no coding agent, command-like transcript). Shared by the batch and live
+dictation paths, idempotent, provider-independent, and conservative: `cd ..` and
+`./Deploy.sh` survive, and the first word is lowercased only when it is a program
+from `SHELL_COMMANDS` (extracted from inside `starts_with_shell_command`).
+
 **Deferred.** `gpt-live-transcribe` for the streaming path: net-new WebSocket
 work, 24 kHz PCM, four times the batch price, and it returns no language and no
 confidence. Separate plan.

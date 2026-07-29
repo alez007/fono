@@ -4558,6 +4558,16 @@ impl SessionOrchestrator {
         let vocabulary = self.load_vocabulary();
         let raw = transcript.committed.trim().to_string();
         let raw = if vocabulary.is_empty() { raw } else { vocabulary.apply(&raw) };
+        // H.1: use the focus snapshot captured at press time. Re-probing later
+        // would pick up whatever stole focus since the overlay was mapped.
+        let live_focus = session.focus_info.clone();
+        let live_ctx_profile = ContextClassifier::classify(
+            live_focus.window_class.as_deref(),
+            live_focus.window_title.as_deref(),
+        );
+        // Same shell tidy as the batch path: a prompt wants `cargo build`, not
+        // `Cargo build.`. The live STT path does not surface a language yet.
+        let raw = tidy_if_shell(raw, live_ctx_profile.as_ref(), None);
         if raw.is_empty() {
             warn!("live-dictation: empty transcript after {capture_ms} ms");
             // Empty-transcript microphone recovery hook (live path).
@@ -4608,14 +4618,8 @@ impl SessionOrchestrator {
                     o.set_state(fono_overlay::OverlayState::Processing);
                     o.update_text(raw.clone());
                 }
-                // H.1: use the focus snapshot captured at press time.
-                // Re-probing here would pick up whatever stole focus
-                // since the overlay was mapped.
-                let focus_info = session.focus_info.clone();
-                let live_ctx_profile = ContextClassifier::classify(
-                    focus_info.window_class.as_deref(),
-                    focus_info.window_title.as_deref(),
-                );
+                // H.1: the focus snapshot captured at press time.
+                let focus_info = live_focus.clone();
                 let builtin_suffix = gated_builtin_suffix(live_ctx_profile.as_ref(), &raw, None);
                 let app_class = focus_info.window_class.clone();
                 let app_title = focus_info.window_title.clone();
@@ -5004,6 +5008,11 @@ async fn run_pipeline(
     // all see the canonical spelling.
     let raw_pre_vocab = raw.clone();
     let raw = if vocabulary.is_empty() { raw } else { vocabulary.apply(&raw) };
+    // Prose conventions a recogniser applies by default — a capitalised first
+    // word, a full stop nobody said — are wrong at a shell prompt. Same gate
+    // the cleanup suffix uses, so a Romanian sentence typed into a terminal is
+    // left alone; unlike cleanup this runs even when cleanup is switched off.
+    let raw = tidy_if_shell(raw, ctx_profile.as_ref(), trans.language.as_deref());
     metrics.raw_chars = raw.chars().count();
     if raw.is_empty() {
         if raw_pre_strip.is_empty() {
@@ -5749,65 +5758,6 @@ fn has_shell_syntax(s: &str) -> bool {
 }
 
 fn starts_with_shell_command(s: &str) -> bool {
-    const COMMANDS: &[&str] = &[
-        "alias",
-        "awk",
-        "bash",
-        "bat",
-        "bun",
-        "cargo",
-        "cat",
-        "cd",
-        "chmod",
-        "chown",
-        "clear",
-        "cp",
-        "curl",
-        "deno",
-        "df",
-        "docker",
-        "du",
-        "exit",
-        "find",
-        "gh",
-        "git",
-        "grep",
-        "helm",
-        "journalctl",
-        "kill",
-        "kubectl",
-        "less",
-        "ln",
-        "ls",
-        "mkdir",
-        "mv",
-        "nano",
-        "nix",
-        "npm",
-        "npx",
-        "pacman",
-        "ping",
-        "pnpm",
-        "ps",
-        "pwd",
-        "python",
-        "python3",
-        "rm",
-        "rsync",
-        "scp",
-        "ssh",
-        "sudo",
-        "systemctl",
-        "tar",
-        "touch",
-        "uv",
-        "vim",
-        "wget",
-        "yarn",
-        "zig",
-        "zsh",
-    ];
-
     let mut tokens = s.split_whitespace().map(trim_shell_token).filter(|token| !token.is_empty());
     let Some(first) = tokens.next() else { return false };
     let candidate =
@@ -5817,7 +5767,119 @@ fn starts_with_shell_command(s: &str) -> bool {
         || candidate.starts_with("../")
         || candidate.starts_with("~/")
         || candidate.starts_with('/')
-        || COMMANDS.contains(&candidate)
+        || SHELL_COMMANDS.contains(&candidate)
+}
+
+/// Programs common enough at a shell prompt that seeing one as the first word
+/// is good evidence the user dictated a command rather than a sentence.
+const SHELL_COMMANDS: &[&str] = &[
+    "alias",
+    "awk",
+    "bash",
+    "bat",
+    "bun",
+    "cargo",
+    "cat",
+    "cd",
+    "chmod",
+    "chown",
+    "clear",
+    "cp",
+    "curl",
+    "deno",
+    "df",
+    "docker",
+    "du",
+    "exit",
+    "find",
+    "gh",
+    "git",
+    "grep",
+    "helm",
+    "journalctl",
+    "kill",
+    "kubectl",
+    "less",
+    "ln",
+    "ls",
+    "mkdir",
+    "mv",
+    "nano",
+    "nix",
+    "npm",
+    "npx",
+    "pacman",
+    "ping",
+    "pnpm",
+    "ps",
+    "pwd",
+    "python",
+    "python3",
+    "rm",
+    "rsync",
+    "scp",
+    "ssh",
+    "sudo",
+    "systemctl",
+    "tar",
+    "touch",
+    "uv",
+    "vim",
+    "wget",
+    "yarn",
+    "zig",
+    "zsh",
+];
+
+/// The mechanical half of shell cleanup, applied to a transcript that is about
+/// to be typed at a shell prompt.
+///
+/// A recogniser hands back prose: a capitalised first word and a full stop the
+/// user never said. At a prompt both are wrong — `Cargo build --workspace.` is
+/// not a command. The cleanup LLM is told to fix this (see
+/// `TERMINAL_SHELL_SUFFIX`), but cleanup is optional and off by default, and
+/// these two edits need no model. Idempotent, so running it before cleanup as
+/// well costs nothing.
+///
+/// Deliberately conservative: the full stop goes only when a letter or digit
+/// precedes it (so `cd ..` survives), and the first word is lowercased only
+/// when it is a program from [`SHELL_COMMANDS`] (so `./Deploy.sh` and
+/// `Rscript` survive).
+fn tidy_shell_command(raw: &str) -> String {
+    let mut s = raw.trim_end();
+    if let Some(stripped) = s.strip_suffix('.') {
+        if stripped.ends_with(|c: char| c.is_alphanumeric()) {
+            s = stripped.trim_end();
+        }
+    }
+    let mut out = s.to_string();
+    let first = out.split_whitespace().next().unwrap_or("");
+    if first.starts_with(char::is_uppercase)
+        && SHELL_COMMANDS.contains(&first.to_ascii_lowercase().as_str())
+    {
+        let (i, c) = out.char_indices().next().expect("non-empty: first token exists");
+        out.replace_range(i..i + c.len_utf8(), &c.to_lowercase().to_string());
+    }
+    out
+}
+
+/// [`tidy_shell_command`] behind the same gate the cleanup suffix uses: a
+/// terminal, no coding agent in the foreground, and a transcript that looks
+/// command-like. Shared by the batch and live dictation paths.
+fn tidy_if_shell(
+    raw: String,
+    profile: Option<&fono_inject::ContextProfile>,
+    language: Option<&str>,
+) -> String {
+    let Some(p) = profile else { return raw };
+    if !p.is_terminal || p.detected_agent.is_some() || !looks_like_shell_command(&raw, language) {
+        return raw;
+    }
+    let tidied = tidy_shell_command(&raw);
+    if tidied != raw {
+        debug!(target: "fono::context", "shell tidy: {raw:?} → {tidied:?}");
+    }
+    tidied
 }
 
 fn trim_shell_token(token: &str) -> &str {
@@ -6158,6 +6220,26 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    #[test]
+    fn a_dictated_command_is_typed_as_a_command_not_as_a_sentence() {
+        // The complaint: "cargo build --workspace" arrived as
+        // "Cargo build --workspace." and the shell would not run it.
+        assert_eq!(tidy_shell_command("Cargo build --workspace."), "cargo build --workspace");
+        assert_eq!(tidy_shell_command("Git commit."), "git commit");
+        // Idempotent — safe to run ahead of the cleanup model as well.
+        assert_eq!(tidy_shell_command("cargo build --workspace"), "cargo build --workspace");
+
+        // A relative path is not a word we get to lowercase, and a trailing
+        // dot that is part of the command must survive.
+        assert_eq!(tidy_shell_command("./Deploy.sh"), "./Deploy.sh");
+        assert_eq!(tidy_shell_command("cd .."), "cd ..");
+        assert_eq!(tidy_shell_command("cp file.txt ."), "cp file.txt .");
+
+        // Prose in a terminal never reaches the tidy: the gate rejects it.
+        assert!(!looks_like_shell_command("Am terminat de scris textul.", Some("ro")));
+        assert!(looks_like_shell_command("Cargo build --workspace.", Some("en")));
+    }
 
     #[test]
     fn lang_auto_returns_none() {
