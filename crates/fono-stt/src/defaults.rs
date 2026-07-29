@@ -32,7 +32,7 @@ mod tests {
     #[test]
     fn known_providers_resolve_via_catalogue() {
         assert_eq!(default_cloud_model("groq"), "whisper-large-v3-turbo");
-        assert_eq!(default_cloud_model("openai"), "whisper-1");
+        assert_eq!(default_cloud_model("openai"), "gpt-transcribe");
         assert_eq!(default_cloud_model("deepgram"), "nova-3");
         assert_eq!(default_cloud_model("openrouter"), "openai/whisper-large-v3-turbo");
     }

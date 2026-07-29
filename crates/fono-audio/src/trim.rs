@@ -82,6 +82,38 @@ fn rms(frame: &[f32]) -> f32 {
     (sum_sq / frame.len() as f32).sqrt()
 }
 
+/// Trim leading/trailing silence and hand back a buffer ready for STT,
+/// borrowing when there was nothing to remove.
+///
+/// The one place every speech path goes through, so silence handling is
+/// decided once. Dictation trimmed and the voice assistant did not,
+/// which cost the assistant twice over: whisper spends its language
+/// decision on the first 30 s of mel frames, so room noise and a
+/// three-second silent tail dilute the verdict, and a silent tail is
+/// exactly where whisper invents a sign-off it never heard.
+///
+/// `enabled` mirrors the `[audio].trim_silence` setting; when false the
+/// buffer passes through untouched. Returns the trimmed audio and the
+/// time the scan took, for the caller's metrics.
+#[must_use]
+pub fn trim_for_stt(
+    pcm: &[f32],
+    sample_rate: u32,
+    enabled: bool,
+) -> (std::borrow::Cow<'_, [f32]>, std::time::Duration) {
+    if !enabled {
+        return (std::borrow::Cow::Borrowed(pcm), std::time::Duration::ZERO);
+    }
+    let started = std::time::Instant::now();
+    let (s, e) = trim_silence(pcm, TrimConfig { sample_rate, ..Default::default() });
+    let took = started.elapsed();
+    if s == 0 && e == pcm.len() {
+        (std::borrow::Cow::Borrowed(pcm), took)
+    } else {
+        (std::borrow::Cow::Owned(pcm[s..e].to_vec()), took)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +150,37 @@ mod tests {
     fn empty_returns_zero() {
         let (s, e) = trim_silence(&[], TrimConfig::default());
         assert_eq!((s, e), (0, 0));
+    }
+
+    #[test]
+    fn trim_for_stt_disabled_passes_the_buffer_through() {
+        // `[audio].trim_silence = false` must be a true no-op — no copy,
+        // no scan, no time charged to the caller's metrics.
+        let pcm = pulse(16_000, 8_000, 16_000);
+        let (out, took) = trim_for_stt(&pcm, 16_000, false);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.len(), pcm.len());
+        assert_eq!(took, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn trim_for_stt_removes_the_silent_tail() {
+        // The assistant's own failure case: three seconds of quiet after
+        // the question, which is where a recogniser invents a sign-off.
+        let pcm = pulse(16_000, 8_000, 48_000);
+        let (out, _) = trim_for_stt(&pcm, 16_000, true);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert!(out.len() < pcm.len(), "expected a shorter buffer, got {}", out.len());
+        assert!(out.len() >= 8_000, "the speech itself must survive, got {}", out.len());
+    }
+
+    #[test]
+    fn trim_for_stt_borrows_when_there_is_nothing_to_remove() {
+        // An all-quiet buffer is returned whole rather than emptied, so a
+        // failed capture still reaches STT as itself.
+        let pcm = vec![0.0_f32; 16_000];
+        let (out, _) = trim_for_stt(&pcm, 16_000, true);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.len(), pcm.len());
     }
 }

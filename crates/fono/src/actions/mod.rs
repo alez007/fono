@@ -114,6 +114,9 @@ pub fn build(cfg: &Config, paths: &Paths) -> Option<Arc<ActionTools>> {
     });
     let hint = cfg.assistant.tools.place_names.then(|| room_hint(&store)).flatten();
     let grammar = cfg.assistant.tools.grammar.then(|| rails(&store, &offered)).flatten();
+    // These names go to the assistant model and nowhere else — never to the
+    // speech recogniser, which is frequently a cloud service chosen for audio
+    // alone. See `docs/privacy.md`.
     Some(Arc::new(ActionTools { descriptors, execute, hint, grammar }))
 }
 

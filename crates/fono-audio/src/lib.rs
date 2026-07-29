@@ -50,7 +50,7 @@ pub use speaker::{
     EnrolledSpeaker, Fbank, FbankConfig, LatencyStats, SpeakerDecision, SpeakerModel,
     SpeechAccumulator, DEFAULT_TARGET_FAR, DEFAULT_UNCALIBRATED_THRESHOLD, GENUINE_MARGIN_STDS,
 };
-pub use trim::{trim_silence, TrimConfig};
+pub use trim::{trim_for_stt, trim_silence, TrimConfig};
 pub use vad::{Vad, VadDecision, WebRtcVadStub};
 pub use wake_registry::{ResolvedWakeModel, WakeLicense, WakeModelClass, WakeModelEntry};
 pub use wakeword::{EnergyWakeStub, HopBuffer, WakeDecision, WakeWord, HOP_SAMPLES};

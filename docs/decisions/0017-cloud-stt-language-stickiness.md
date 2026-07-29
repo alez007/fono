@@ -1,7 +1,8 @@
 # ADR 0017 — Cloud STT language stickiness (in-memory rerun-target cache)
 
 Date: 2026-04-28
-Status: Accepted
+Status: Accepted — partially superseded for OpenAI models that accept a
+plural `languages[]` field (see the amendment at the bottom)
 Supersedes: relevant portions of [ADR 0016](0016-language-allow-list.md)
 
 ## Context
@@ -132,3 +133,33 @@ connection setup). All other call sites consult the cache instead.
 - One-off Turbo misdetections self-heal after the first
   correctly-detected utterance per session (or immediately on
   cold-start when the OS locale ∈ allow-list).
+
+## Amendment — 2026-07-29
+
+This ADR solved the *out-of-allow-list* misdetection. It never covered
+confusion **between** two configured languages, and by design it could
+not: an in-allow-list detection is recorded as a success and returned
+verbatim, so a Romanian/English speaker whose English is tagged `ro` gets
+no rerun and no arbitration. That was the live bug reported this session.
+
+Two changes, neither of which invalidates the rules above for the
+providers they still apply to:
+
+1. **Where the provider accepts a plural language set, use it.** OpenAI's
+   `gpt-transcribe` generation takes `languages[]` and code-switches
+   inside a single utterance, so the whole allow-list goes out on the
+   first (and only) call. No first-pass guess to defend against, hence no
+   rerun lane and no cache consultation on that path. Rules 1–5 continue
+   to govern every single-`language` backend (Groq, `whisper-1`,
+   `gpt-4o-transcribe`, and the streaming transports).
+2. **A language verdict is now optional.** Every backend reports
+   `language: None` when its own confidence signal says it is unsure —
+   empty `languages[]`, ElevenLabs' `language_probability`, or mean
+   `avg_logprob` below `-1.0`. Consumers must treat `None` as "do not
+   act on language": the assistant then omits its reply-language
+   instruction and uses the default voice rather than committing to a
+   guess. Rule 2 gains the corresponding condition — only a `Some`
+   verdict is recorded in the cache.
+
+`cloud_rerun_on_language_mismatch` remains as documented, but is now a
+legacy knob: it has no effect on plural-`languages[]` models.

@@ -172,6 +172,56 @@ pub struct GroqResponse {
     pub text: String,
     #[serde(default)]
     pub language: Option<String>,
+    /// Per-segment scores. `groq_post_wav` already asks for
+    /// `verbose_json`, so these arrive on every batch response — they
+    /// used to be parsed away and discarded. [`resolve_language`] uses
+    /// them to decide whether the `language` echo is worth believing.
+    #[serde(default)]
+    pub segments: Vec<GroqSegment>,
+}
+
+/// Mean per-segment `avg_logprob` below which we stop believing the
+/// `language` echo and report `None` instead.
+///
+/// A wrong language tag is worse than no tag: downstream it selects the
+/// TTS voice and injects "Reply in X." into the assistant's system
+/// block, so one bad guess steers a whole conversation. Threshold
+/// matches `whisper_local.rs`'s `set_logprob_thold(-1.0)` and
+/// [`is_hallucinated_segment`].
+const LANG_LOGPROB_FLOOR: f32 = -1.0;
+
+/// Resolve the language to report, returning `None` whenever the
+/// verdict is not trustworthy: a silence-shaped decode, or a detection
+/// outside the configured allow-list that the rerun lane could not fix.
+///
+/// `None` is a first-class answer meaning "let the text speak for
+/// itself" — no reply-language instruction, no language-specific voice,
+/// no language-cache entry.
+fn resolve_language(resp: &GroqResponse, selection: &LanguageSelection) -> Option<String> {
+    let raw = resp.language.as_deref()?;
+    // verbose_json echoes the full English name ("romanian"); the rest
+    // of Fono (TTS voice routing, language-stickiness cache) expects
+    // alpha-2. Normalise before handing it back.
+    let detected = crate::lang::whisper_lang_to_code(raw);
+    let scored: Vec<f32> = resp.segments.iter().filter_map(|s| s.avg_logprob).collect();
+    if !scored.is_empty() {
+        let mean = scored.iter().sum::<f32>() / scored.len() as f32;
+        if mean < LANG_LOGPROB_FLOOR {
+            tracing::debug!(
+                "groq language {detected:?} came back with mean avg_logprob {mean:.2} \
+                 (< {LANG_LOGPROB_FLOOR}); treating it as undecided"
+            );
+            return None;
+        }
+    }
+    if !selection.contains(&detected) {
+        tracing::debug!(
+            "groq detected {raw:?} (normalised {detected:?}) outside the configured \
+             allow-list; leaving the language unset rather than guessing a peer"
+        );
+        return None;
+    }
+    Some(detected)
 }
 
 /// `response_format=verbose_json` shape. Used by:
@@ -407,52 +457,7 @@ impl SpeechToText for GroqStt {
         };
 
         let parsed = self.do_request(&wav, first_pass_lang.as_deref()).await?;
-
-        // Post-validate against the allow-list. v3.1: confidence-aware
-        // rerun. On in-list detection, record. On banned detection
-        // **and** rerun enabled, issue one verbose_json request per
-        // peer and pick the one with the highest mean per-segment
-        // `avg_logprob` (the standard Whisper "this is the language
-        // I'm most confident about" signal). This handles cold-start
-        // (cache empty) and warm-but-wrong-cache cases uniformly:
-        // confidence picks the right peer even when the cache holds
-        // the wrong code from a previous topic.
-        if let LanguageSelection::AllowList(peers) = &selection {
-            if let Some(detected_raw) = parsed.language.as_deref() {
-                // verbose_json echoes the full English name ("english",
-                // "bulgarian"); the allow-list is alpha-2. Normalise.
-                let detected = crate::lang::whisper_lang_to_code(detected_raw);
-                if selection.contains(&detected) {
-                    self.lang_cache.record(BACKEND_KEY, &detected);
-                } else if self.cloud_rerun_on_mismatch {
-                    tracing::info!(
-                        "groq returned banned language {detected_raw:?} (normalised \
-                         {detected:?}, allow-list {:?}); reranking by per-peer avg_logprob",
-                        self.languages
-                    );
-                    if let Some((picked, resp)) = self.pick_best_peer(&wav, peers).await {
-                        self.lang_cache.record(BACKEND_KEY, &picked);
-                        return Ok(Transcription {
-                            text: resp.text,
-                            language: Some(picked),
-                            duration_ms: None,
-                        });
-                    }
-                    tracing::warn!(
-                        "groq rerun: every peer attempt failed; \
-                         falling back to unforced response"
-                    );
-                } else {
-                    tracing::info!("groq detected banned language {detected_raw:?} (normalised {detected:?}); rerun disabled");
-                }
-            }
-        }
-
-        // verbose_json echoes the full English name ("romanian"); the
-        // rest of Fono (TTS voice routing, language-stickiness cache)
-        // expects alpha-2. Normalise before handing it back.
-        let language = parsed.language.as_deref().map(crate::lang::whisper_lang_to_code);
-        Ok(Transcription { text: parsed.text, language, duration_ms: None })
+        self.finish(&wav, parsed, &selection).await
     }
 
     /// Context-aware override: merges `opts.context_hint` with the
@@ -474,8 +479,10 @@ impl SpeechToText for GroqStt {
         };
 
         // Merge language prompt with context hint (truncated to 200 chars).
+        // Groq has no `keywords[]` field, so literal terms ride the prompt.
         let lang_prompt = self.resolve_prompt(first_pass_lang.as_deref()).map(str::to_string);
-        let merged_prompt = merge_prompt(lang_prompt.as_deref(), opts.context_hint.as_deref());
+        let hint = opts.folded_hint();
+        let merged_prompt = merge_prompt(lang_prompt.as_deref(), hint.as_deref());
 
         let parsed = groq_post_wav(
             &self.client,
@@ -487,40 +494,7 @@ impl SpeechToText for GroqStt {
         )
         .await?;
 
-        if let LanguageSelection::AllowList(peers) = &selection {
-            if let Some(detected_raw) = parsed.language.as_deref() {
-                let detected = crate::lang::whisper_lang_to_code(detected_raw);
-                if selection.contains(&detected) {
-                    self.lang_cache.record(BACKEND_KEY, &detected);
-                } else if self.cloud_rerun_on_mismatch {
-                    tracing::info!(
-                        "groq returned banned language {detected_raw:?} (normalised \
-                         {detected:?}, allow-list {:?}); reranking by per-peer avg_logprob",
-                        self.languages
-                    );
-                    if let Some((picked, resp)) = self.pick_best_peer(&wav, peers).await {
-                        self.lang_cache.record(BACKEND_KEY, &picked);
-                        return Ok(Transcription {
-                            text: resp.text,
-                            language: Some(picked),
-                            duration_ms: None,
-                        });
-                    }
-                    tracing::warn!(
-                        "groq rerun: every peer attempt failed; \
-                         falling back to unforced response"
-                    );
-                } else {
-                    tracing::info!("groq detected banned language {detected_raw:?} (normalised {detected:?}); rerun disabled");
-                }
-            }
-        }
-
-        // verbose_json echoes the full English name ("romanian"); the
-        // rest of Fono (TTS voice routing, language-stickiness cache)
-        // expects alpha-2. Normalise before handing it back.
-        let language = parsed.language.as_deref().map(crate::lang::whisper_lang_to_code);
-        Ok(Transcription { text: parsed.text, language, duration_ms: None })
+        self.finish(&wav, parsed, &selection).await
     }
 
     fn name(&self) -> &'static str {
@@ -587,6 +561,55 @@ impl GroqStt {
             }
         }
         best.map(|(_, code, resp)| (code, resp))
+    }
+
+    /// Shared tail for both `transcribe` entry points: post-validate the
+    /// detected language against the allow-list, rerun across peers when
+    /// the detection is banned, and grade the final verdict.
+    ///
+    /// Both entry points used to carry a copy of this block, and the
+    /// copies had already drifted. One body, one behaviour.
+    async fn finish(
+        &self,
+        wav: &[u8],
+        parsed: GroqResponse,
+        selection: &LanguageSelection,
+    ) -> Result<Transcription> {
+        // On a banned detection with rerun enabled, issue one
+        // verbose_json request per peer and keep the one with the
+        // highest mean per-segment `avg_logprob` (Whisper's own "this
+        // is the language I'm most confident about" signal). This
+        // handles cold-start and warm-but-wrong-cache uniformly.
+        if let LanguageSelection::AllowList(peers) = selection {
+            if let Some(raw) = parsed.language.as_deref() {
+                let detected = crate::lang::whisper_lang_to_code(raw);
+                if !selection.contains(&detected) && self.cloud_rerun_on_mismatch {
+                    tracing::info!(
+                        "groq returned banned language {raw:?} (normalised {detected:?}, \
+                         allow-list {:?}); reranking by per-peer avg_logprob",
+                        self.languages
+                    );
+                    if let Some((picked, resp)) = self.pick_best_peer(wav, peers).await {
+                        self.lang_cache.record(BACKEND_KEY, &picked);
+                        return Ok(Transcription {
+                            text: filter_hallucinated_segments(&resp),
+                            language: Some(picked),
+                            duration_ms: None,
+                        });
+                    }
+                    tracing::warn!(
+                        "groq rerun: every peer attempt failed; \
+                         falling back to unforced response"
+                    );
+                }
+            }
+        }
+
+        let language = resolve_language(&parsed, selection);
+        if let Some(ref code) = language {
+            self.lang_cache.record(BACKEND_KEY, code);
+        }
+        Ok(Transcription { text: parsed.text, language, duration_ms: None })
     }
 }
 
@@ -702,5 +725,62 @@ mod tests {
         let fr = vresp("Merci.", vec![seg(" Merci.", Some(0.06), Some(-0.28))]);
         assert_eq!(filter_hallucinated_segments(&ro), "Mulțumesc.");
         assert_eq!(filter_hallucinated_segments(&fr), "Merci.");
+    }
+
+    fn resp(language: Option<&str>, segments: Vec<GroqSegment>) -> GroqResponse {
+        GroqResponse { text: "whatever".into(), language: language.map(str::to_string), segments }
+    }
+
+    fn allow(codes: &[&str]) -> LanguageSelection {
+        LanguageSelection::from_config(&codes.iter().map(|c| (*c).to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn language_normalised_to_alpha2() {
+        // verbose_json echoes the English name; callers want alpha-2.
+        let r = resp(Some("romanian"), vec![seg(" salut", Some(0.05), Some(-0.3))]);
+        assert_eq!(resolve_language(&r, &allow(&["en", "ro"])).as_deref(), Some("ro"));
+    }
+
+    #[test]
+    fn language_unset_when_decode_is_silence_shaped() {
+        // The reported bug: a confident-sounding Romanian tag on a
+        // buffer the model barely understood. No tag beats a wrong tag.
+        let r = resp(Some("romanian"), vec![seg(" gibberish", Some(0.9), Some(-1.8))]);
+        assert!(resolve_language(&r, &allow(&["en", "ro"])).is_none());
+    }
+
+    #[test]
+    fn language_unset_when_outside_allow_list() {
+        let r = resp(Some("bulgarian"), vec![seg(" nesto", Some(0.05), Some(-0.3))]);
+        assert!(resolve_language(&r, &allow(&["en", "ro"])).is_none());
+    }
+
+    #[test]
+    fn language_kept_when_scores_absent() {
+        // Conservative: no scores means no evidence against the tag.
+        let r = resp(Some("english"), vec![seg(" hello", None, None)]);
+        assert_eq!(resolve_language(&r, &allow(&["en", "ro"])).as_deref(), Some("en"));
+        let bare = resp(Some("english"), Vec::new());
+        assert_eq!(resolve_language(&bare, &allow(&["en", "ro"])).as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn language_absent_stays_absent() {
+        let r = resp(None, vec![seg(" hello", Some(0.05), Some(-0.3))]);
+        assert!(resolve_language(&r, &allow(&["en", "ro"])).is_none());
+    }
+
+    #[test]
+    fn mean_of_segment_scores_decides_not_the_worst_one() {
+        // One weak tail segment must not discard an otherwise good decode.
+        let r = resp(
+            Some("english"),
+            vec![
+                seg(" a long confident sentence", Some(0.05), Some(-0.2)),
+                seg(" uh", Some(0.7), Some(-1.4)),
+            ],
+        );
+        assert_eq!(resolve_language(&r, &allow(&["en", "ro"])).as_deref(), Some("en"));
     }
 }

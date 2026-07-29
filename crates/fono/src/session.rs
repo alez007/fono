@@ -3453,6 +3453,8 @@ impl SessionOrchestrator {
             screen_capture_fn,
             actions,
             active_window_context,
+            trim_silence: cfg.audio.trim_silence,
+            vocabulary: self.load_vocabulary(),
         };
         let state_for_task = self.assistant_session.clone();
         let notify_for_task = notify.clone();
@@ -4871,28 +4873,20 @@ async fn run_pipeline(
     let mut metrics = PipelineMetrics { capture_ms, samples: pcm.len(), ..Default::default() };
 
     // ---- Trim leading/trailing silence (latency plan L11+L12) -------
-    let pcm_for_stt: std::borrow::Cow<'_, [f32]> = if config.audio.trim_silence {
-        let trim_started = Instant::now();
-        let trim_cfg = fono_audio::TrimConfig { sample_rate, ..Default::default() };
-        let (s, e) = fono_audio::trim_silence(&pcm, trim_cfg);
-        metrics.trim_ms = trim_started.elapsed().as_millis() as u64;
-        if s == 0 && e == pcm.len() {
-            metrics.trimmed_samples = pcm.len();
-            std::borrow::Cow::Borrowed(&pcm[..])
-        } else {
-            metrics.trimmed_samples = e - s;
-            debug!(
-                "trim: {} → {} samples in {} ms",
-                pcm.len(),
-                metrics.trimmed_samples,
-                metrics.trim_ms
-            );
-            std::borrow::Cow::Owned(pcm[s..e].to_vec())
-        }
-    } else {
-        metrics.trimmed_samples = pcm.len();
-        std::borrow::Cow::Borrowed(&pcm[..])
-    };
+    // Shared with the voice-assistant path via `fono_audio::trim_for_stt`
+    // so both get the same treatment.
+    let (pcm_for_stt, trim_took) =
+        fono_audio::trim_for_stt(&pcm, sample_rate, config.audio.trim_silence);
+    metrics.trim_ms = trim_took.as_millis() as u64;
+    metrics.trimmed_samples = pcm_for_stt.len();
+    if metrics.trimmed_samples != pcm.len() {
+        debug!(
+            "trim: {} → {} samples in {} ms",
+            pcm.len(),
+            metrics.trimmed_samples,
+            metrics.trim_ms
+        );
+    }
 
     // ---- Context classification (snapshot at pipeline-start time) ------
     // H.1: `focus_info` is computed at the very start of processing
@@ -4924,6 +4918,9 @@ async fn run_pipeline(
             .as_ref()
             .and_then(|p| p.whisper_hint.as_deref())
             .map(str::to_string),
+        // The words the user had to teach us. Given to the recogniser
+        // up front, there is less left for the vocabulary pass to fix.
+        keywords: vocabulary.terms(),
     };
     // Speaker verification (when enabled) runs *concurrently* with the STT
     // call over the same 16 kHz buffer, so its tens-of-ms embed hides behind

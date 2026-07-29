@@ -676,7 +676,7 @@ mod tests {
                     drop(g);
                     t
                 };
-                Ok(GroqResponse { text, language: Some("en".into()) })
+                Ok(GroqResponse { text, language: Some("en".into()), segments: Vec::new() })
             }) as GroqRequestFuture
         });
         (f, counter)
@@ -749,7 +749,7 @@ mod tests {
             Box::pin(async move {
                 let _g = s.lock().await;
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                Ok(GroqResponse { text: "slow".into(), language: None })
+                Ok(GroqResponse { text: "slow".into(), language: None, segments: Vec::new() })
             }) as GroqRequestFuture
         });
         let backend = GroqStreaming::with_request_fn(f);
@@ -793,7 +793,11 @@ mod tests {
 
         let preview_fn: GroqRequestFn = Arc::new(|_wav, _lang| {
             Box::pin(async {
-                Ok(GroqResponse { text: "send him the report".into(), language: Some("en".into()) })
+                Ok(GroqResponse {
+                    text: "send him the report".into(),
+                    language: Some("en".into()),
+                    segments: Vec::new(),
+                })
             }) as GroqRequestFuture
         });
 

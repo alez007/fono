@@ -25,6 +25,45 @@ pub struct TranscribeOptions {
     /// Short vocabulary hint for Whisper's `initial_prompt` (or the cloud
     /// equivalent). Backends that don't support it silently ignore this field.
     pub context_hint: Option<String>,
+    /// Literal terms the speaker is likely to say — proper nouns, room and
+    /// device names, product names, shell fragments. Recognisers bias
+    /// towards these spellings without being required to emit them.
+    ///
+    /// Backends with a dedicated field on the wire (OpenAI's `keywords[]`)
+    /// send them there; the rest fold them into the prompt, which is where
+    /// this kind of hint lived before a dedicated field existed. Backends
+    /// with neither ignore the list.
+    pub keywords: Vec<String>,
+}
+
+impl TranscribeOptions {
+    /// Free-text prompt payload for backends with **no** dedicated
+    /// keyword field on the wire: the context hint with the literal
+    /// terms appended, comma-joined.
+    ///
+    /// Whisper's `prompt` / `initial_prompt` is exactly a spelling-bias
+    /// channel, so a comma-joined term list is the idiomatic payload —
+    /// it is what the window classifier has always put there. Backends
+    /// that do have a keyword field (OpenAI `gpt-transcribe`) send
+    /// [`Self::context_hint`] alone and pass the terms separately.
+    ///
+    /// Returns `None` only when there is no hint and no keywords.
+    #[must_use]
+    pub fn folded_hint(&self) -> Option<String> {
+        let joined = self
+            .keywords
+            .iter()
+            .map(|k| k.trim())
+            .filter(|k| !k.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        match (self.context_hint.as_deref(), joined.is_empty()) {
+            (Some(h), true) => Some(h.to_string()),
+            (Some(h), false) => Some(format!("{h} {joined}")),
+            (None, true) => None,
+            (None, false) => Some(joined),
+        }
+    }
 }
 
 #[async_trait]
@@ -81,5 +120,54 @@ pub trait SpeechToText: Send + Sync {
     /// flash.
     fn is_local(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(hint: Option<&str>, keywords: &[&str]) -> TranscribeOptions {
+        TranscribeOptions {
+            lang_override: None,
+            context_hint: hint.map(str::to_string),
+            keywords: keywords.iter().map(|k| (*k).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn folded_hint_covers_every_combination() {
+        assert_eq!(opts(None, &[]).folded_hint(), None);
+        assert_eq!(
+            opts(Some("git commit, ls -la"), &[]).folded_hint().as_deref(),
+            Some("git commit, ls -la")
+        );
+        assert_eq!(
+            opts(None, &["Kitchen", "Hallway"]).folded_hint().as_deref(),
+            Some("Kitchen, Hallway")
+        );
+        assert_eq!(
+            opts(Some("Shell commands:"), &["Kitchen", "Hallway"]).folded_hint().as_deref(),
+            Some("Shell commands: Kitchen, Hallway")
+        );
+    }
+
+    #[test]
+    fn folded_hint_ignores_blank_keywords() {
+        // A list that is entirely whitespace must not turn an absent
+        // hint into an empty prompt field on the wire.
+        assert_eq!(opts(None, &["  ", ""]).folded_hint(), None);
+        assert_eq!(opts(None, &[" Kitchen ", " "]).folded_hint().as_deref(), Some("Kitchen"));
+    }
+
+    #[test]
+    fn default_options_are_inert() {
+        // Backends receiving a default `TranscribeOptions` must send no
+        // language, no prompt, and no keywords.
+        let d = TranscribeOptions::default();
+        assert!(d.lang_override.is_none());
+        assert!(d.context_hint.is_none());
+        assert!(d.keywords.is_empty());
+        assert_eq!(d.folded_hint(), None);
     }
 }

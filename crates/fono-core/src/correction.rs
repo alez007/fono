@@ -168,6 +168,29 @@ impl VocabularyTable {
         self.rules.len()
     }
 
+    /// The canonical spellings this table produces — the replacement
+    /// side of every rule, deduplicated.
+    ///
+    /// These are exactly the words a user had to teach Fono because a
+    /// recogniser kept mangling them, which makes them the best
+    /// keyword hints available. Handing them to the recogniser up front
+    /// means fewer corrections left to make afterwards.
+    ///
+    /// Order follows the table's internal rule order, which is not the
+    /// order they were written in the file; callers must not depend on
+    /// it.
+    #[must_use]
+    pub fn terms(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(self.rules.len());
+        for rule in &self.rules {
+            let term = rule.to.trim();
+            if !term.is_empty() && !out.iter().any(|t| t == term) {
+                out.push(term.to_string());
+            }
+        }
+        out
+    }
+
     /// Apply the vocabulary to `text`. Pure, single-pass, idempotent.
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
@@ -292,6 +315,25 @@ mod tests {
     #[test]
     fn basic_replacement() {
         assert_eq!(phono().apply("I use phono every day"), "I use Fono every day");
+    }
+
+    #[test]
+    fn terms_are_the_canonical_spellings_deduplicated() {
+        // What we hand the recogniser as keyword hints: the words the
+        // user wants to see, never the mishearings they are correcting.
+        let t = table(&[
+            (&["phono", "phone oh"], "Fono"),
+            (&["nimblex", "nimble ex"], "NimbleX"),
+            (&["fonoo", "foh no"], "Fono"),
+        ]);
+        let mut terms = t.terms();
+        terms.sort();
+        assert_eq!(terms, vec!["Fono".to_string(), "NimbleX".to_string()]);
+    }
+
+    #[test]
+    fn terms_is_empty_for_an_empty_table() {
+        assert!(table(&[]).terms().is_empty());
     }
 
     #[test]

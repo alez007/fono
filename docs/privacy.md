@@ -24,6 +24,15 @@ when you have explicitly chosen a cloud provider.
   test (`pipeline_speaker_verification_never_leaks_audio_or_embedding_to_stt`)
   asserting the STT payload is byte-for-byte unchanged with verification
   enabled.
+* Your smart-home inventory, on a speech-to-text request. When Fono is
+  connected to a home automation server it learns the names of your
+  rooms and devices, and the assistant model is told them so it can act
+  on "turn off the kitchen light". Those names are **never** attached to
+  a speech-to-text request, even though supplying them would make the
+  recogniser mishear them less often. Speech-to-text and the assistant
+  are separately configured stages: the recogniser is frequently a cloud
+  service you chose for *audio*, while the assistant may be running
+  on this machine, and a list of your rooms and appliances is not audio.
 * There isn't any telemetry at this point. Fono makes zero analytics calls.
 
 ## What leaves your machine (and when)
@@ -35,7 +44,7 @@ or LAN backend.
 | Scenario                               | Data sent                          | To                           |
 |----------------------------------------|------------------------------------|------------------------------|
 | `stt.backend` = local                  | nothing                            | —                            |
-| `stt.backend` = Groq / OpenAI / etc.   | recorded audio (WAV)               | configured STT endpoint      |
+| `stt.backend` = Groq / OpenAI / etc.   | recorded audio (WAV); the languages you configured; your spelling-correction terms; for dictation, a short list of words typical of the focused application | configured STT endpoint      |
 | `polish.backend` = local                  | nothing                            | —                            |
 | `polish.backend` = Cerebras / OpenAI / … | raw transcript text + prompt      | configured LLM endpoint      |
 | `assistant.backend` = local            | nothing                            | —                            |

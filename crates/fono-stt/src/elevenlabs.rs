@@ -115,6 +115,45 @@ pub struct ScribeResponse {
     pub language_probability: Option<f64>,
 }
 
+/// Below this reported probability we stop believing Scribe's language
+/// verdict and report `None` instead.
+///
+/// A language tag is not decoration: downstream it selects the TTS
+/// voice and injects "Reply in X." into the assistant's system block,
+/// so a wrong tag steers a whole conversation. `0.5` means "the model
+/// itself thinks a coin flip is as good" — anything below that is not
+/// worth acting on. Well-formed speech reports ≥ 0.9 in practice.
+const LANG_PROBABILITY_FLOOR: f64 = 0.5;
+
+/// Resolve the language to report from a Scribe response, returning
+/// `None` whenever the verdict is not trustworthy: low reported
+/// probability, or a detection outside the configured allow-list.
+///
+/// `None` is a first-class answer meaning "let the text speak for
+/// itself" — no reply-language instruction, no language-specific
+/// voice.
+fn resolve_language(resp: &ScribeResponse, selection: &LanguageSelection) -> Option<String> {
+    let raw = resp.language_code.as_deref()?;
+    let detected = crate::lang::whisper_lang_to_code(raw);
+    if let Some(p) = resp.language_probability {
+        if p < LANG_PROBABILITY_FLOOR {
+            tracing::debug!(
+                "elevenlabs reported language {detected:?} with probability {p:.2} \
+                 (< {LANG_PROBABILITY_FLOOR}); treating it as undecided"
+            );
+            return None;
+        }
+    }
+    if !selection.contains(&detected) {
+        tracing::debug!(
+            "elevenlabs detected {raw:?} (normalised {detected:?}) outside the configured \
+             allow-list; leaving the language unset rather than guessing a peer"
+        );
+        return None;
+    }
+    Some(detected)
+}
+
 /// Single batch POST to `https://api.elevenlabs.io/v1/speech-to-text`.
 /// Multipart body carries `model_id` + `file`; a forced `language_code`
 /// (ISO 639-1/3) is sent as an extra form field when present.
@@ -206,8 +245,13 @@ impl SpeechToText for ElevenLabsStt {
         // Normalise to alpha-2 so downstream consumers (TTS language
         // hint, assistant summary, history) see `en`/`ro`, matching the
         // user's configured allow-list and every other backend.
-        let normalised_lang =
-            parsed.language_code.as_deref().map(crate::lang::whisper_lang_to_code);
+        //
+        // Scribe also reports how sure it is. Below the floor we return
+        // `None` rather than a code we don't believe: downstream, the
+        // language picks the TTS voice and pins the assistant's reply
+        // language, so a confident-looking wrong answer is worse than
+        // no answer. See [`LANG_PROBABILITY_FLOOR`].
+        let normalised_lang = resolve_language(&parsed, &selection);
 
         Ok(Transcription { text: parsed.text, language: normalised_lang, duration_ms: None })
     }
@@ -284,5 +328,53 @@ mod tests {
     fn name_is_stable_label() {
         let stt = ElevenLabsStt::new("sk_test");
         assert_eq!(stt.name(), "elevenlabs");
+    }
+
+    fn scribe(code: Option<&str>, probability: Option<f64>) -> ScribeResponse {
+        ScribeResponse {
+            text: "salut".to_string(),
+            language_code: code.map(str::to_string),
+            language_probability: probability,
+        }
+    }
+
+    #[test]
+    fn confident_language_is_normalised_and_reported() {
+        // The `language_probability` field was parsed but never read
+        // before this gate landed; a confident value must pass through.
+        let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
+        assert_eq!(resolve_language(&scribe(Some("ron"), Some(0.99)), &sel), Some("ro".into()));
+    }
+
+    #[test]
+    fn low_probability_language_is_dropped() {
+        // Scribe is guessing; a guess must not pick the TTS voice or
+        // pin the assistant's reply language.
+        let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
+        assert_eq!(resolve_language(&scribe(Some("ron"), Some(0.31)), &sel), None);
+    }
+
+    #[test]
+    fn missing_probability_keeps_the_detection() {
+        // Conservative: no signal is not the same as a bad signal.
+        let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
+        assert_eq!(resolve_language(&scribe(Some("eng"), None), &sel), Some("en".into()));
+    }
+
+    #[test]
+    fn out_of_allow_list_language_is_dropped() {
+        let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
+        assert_eq!(resolve_language(&scribe(Some("bul"), Some(0.98)), &sel), None);
+        // Auto imposes no constraint, so the same detection survives.
+        assert_eq!(
+            resolve_language(&scribe(Some("bul"), Some(0.98)), &LanguageSelection::Auto),
+            Some("bg".into())
+        );
+    }
+
+    #[test]
+    fn absent_language_code_yields_none() {
+        let sel = LanguageSelection::AllowList(vec!["en".into(), "ro".into()]);
+        assert_eq!(resolve_language(&scribe(None, Some(0.99)), &sel), None);
     }
 }

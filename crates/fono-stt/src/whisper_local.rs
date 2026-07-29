@@ -230,7 +230,7 @@ impl SpeechToText for WhisperLocal {
                 params.set_audio_ctx(frames);
             }
         }
-        if let Some(code) = resolved.as_deref() {
+        if let Some(code) = resolved.code.as_deref() {
             params.set_language(Some(code));
         }
         // Hallucination guards. `whisper-rs::FullParams::new()` leaves
@@ -242,7 +242,7 @@ impl SpeechToText for WhisperLocal {
         params.set_logprob_thold(-1.0);
         params.set_temperature_inc(0.2);
         // Resolve initial prompt by language for the active call.
-        let prompt = self.resolve_prompt(resolved.as_deref(), None);
+        let prompt = self.resolve_prompt(resolved.code.as_deref(), None);
         if let Some(p) = prompt.as_deref() {
             params.set_initial_prompt(p);
         }
@@ -263,8 +263,9 @@ impl SpeechToText for WhisperLocal {
         }
         // Surface the language whisper actually decoded against —
         // either our resolved pick or, for unconstrained auto, the
-        // post-hoc lang id from the state.
-        let detected = resolved.or_else(|| post_hoc_lang(&state));
+        // post-hoc lang id from the state. A pick we could not make
+        // confidently is reported as no language at all.
+        let detected = resolved.reported().or_else(|| post_hoc_lang(&state));
         Ok(Transcription { text: text.trim().to_string(), language: detected, duration_ms: None })
     }
 
@@ -302,14 +303,17 @@ impl SpeechToText for WhisperLocal {
                 params.set_audio_ctx(frames);
             }
         }
-        if let Some(code) = resolved.as_deref() {
+        if let Some(code) = resolved.code.as_deref() {
             params.set_language(Some(code));
         }
         params.set_no_speech_thold(0.6);
         params.set_logprob_thold(-1.0);
         params.set_temperature_inc(0.2);
-        // Resolve prompt with context_hint merged in.
-        let prompt = self.resolve_prompt(resolved.as_deref(), opts.context_hint.as_deref());
+        // Resolve prompt with context_hint + keyword terms merged in.
+        // Whisper has no keyword field; `initial_prompt` is the
+        // spelling-bias channel, so the terms ride there.
+        let hint = opts.folded_hint();
+        let prompt = self.resolve_prompt(resolved.code.as_deref(), hint.as_deref());
         if let Some(p) = prompt.as_deref() {
             params.set_initial_prompt(p);
         }
@@ -328,7 +332,7 @@ impl SpeechToText for WhisperLocal {
                 }
             }
         }
-        let detected = resolved.or_else(|| post_hoc_lang(&state));
+        let detected = resolved.reported().or_else(|| post_hoc_lang(&state));
         Ok(Transcription { text: text.trim().to_string(), language: detected, duration_ms: None })
     }
 
@@ -486,24 +490,60 @@ fn physical_cores_or_logical() -> usize {
 /// from re-running the encoder over audio the detector won't use.
 const LANG_DETECT_PREFIX_SAMPLES: usize = 16_000 * 30;
 
+/// The language we lock the decoder to for one pipeline call, plus
+/// whether the choice is solid enough to tell the rest of Fono about.
+///
+/// The two answers are deliberately separate. The decoder always needs
+/// *some* code when an allow-list is configured — that is the whole
+/// point of the feature — but downstream consumers use the reported
+/// language to pick a TTS voice and to tell the assistant which
+/// language to reply in. A coin-flip between the user's two languages
+/// must not steer a conversation, so in that case we decode with our
+/// best guess and report `None`.
+#[derive(Debug, Clone, Default)]
+struct LangPick {
+    /// Code to force on the decoder; `None` means "let whisper decide".
+    code: Option<String>,
+    /// Whether [`Self::code`] should be reported to callers.
+    trusted: bool,
+}
+
+impl LangPick {
+    /// The code to report upwards: the pick when trusted, else nothing.
+    fn reported(&self) -> Option<String> {
+        self.trusted.then(|| self.code.clone()).flatten()
+    }
+}
+
 /// Resolve the single language code we'll lock the decoder to for one
-/// pipeline call. Returns `Ok(None)` for [`LanguageSelection::Auto`],
+/// pipeline call. Returns an empty code for [`LanguageSelection::Auto`],
 /// which keeps today's "let whisper auto-detect freely" behaviour.
 fn resolve_language(
     ctx: &WhisperContext,
     selection: &LanguageSelection,
     pcm: &[f32],
     threads: i32,
-) -> Result<Option<String>> {
+) -> Result<LangPick> {
     match selection {
-        LanguageSelection::Auto => Ok(None),
-        LanguageSelection::Forced(c) => Ok(Some(c.clone())),
+        LanguageSelection::Auto => Ok(LangPick { code: None, trusted: true }),
+        LanguageSelection::Forced(c) => Ok(LangPick { code: Some(c.clone()), trusted: true }),
         LanguageSelection::AllowList(codes) => {
-            let pick = pick_from_allow_list(ctx, codes, pcm, threads)?;
-            Ok(Some(pick))
+            let (code, trusted) = pick_from_allow_list(ctx, codes, pcm, threads)?;
+            Ok(LangPick { code: Some(code), trusted })
         }
     }
 }
+
+/// Minimum detector probability for the winning allow-list entry. Below
+/// this the audio does not resemble any allowed language (noise, music,
+/// a third language), so the pick is a formality, not a finding.
+const LANG_PICK_MIN_PROB: f32 = 0.10;
+/// How far ahead of the runner-up the winner must be before we believe
+/// it. Scale-free, so it works whether the detector is confident
+/// overall or not: 0.60 vs 0.25 is a verdict, 0.31 vs 0.29 is a
+/// coin flip. This is the exact shape of the "I switched to English
+/// and it guessed Romanian" complaint.
+const LANG_PICK_MIN_RATIO: f32 = 2.0;
 
 /// Run `pcm_to_mel` + `lang_detect` on the first ~30 s of audio and
 /// argmax over the allow-list. Falls back to the first allow-list
@@ -515,7 +555,7 @@ fn pick_from_allow_list(
     codes: &[String],
     pcm: &[f32],
     threads: i32,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let prefix_len = pcm.len().min(LANG_DETECT_PREFIX_SAMPLES);
     let prefix = &pcm[..prefix_len];
 
@@ -527,6 +567,7 @@ fn pick_from_allow_list(
     // Translate each user-supplied BCP-47 code to whisper's internal
     // language id, then argmax. Unknown codes are dropped with a warn.
     let mut best: Option<(f32, &str)> = None;
+    let mut runner_up: f32 = 0.0;
     let mut considered = 0usize;
     for code in codes {
         let Some(id) = whisper_rs::get_lang_id(code) else {
@@ -537,28 +578,48 @@ fn pick_from_allow_list(
         let prob = probs.get(idx).copied().unwrap_or(0.0);
         considered += 1;
         if best.is_none_or(|(p, _)| prob > p) {
+            if let Some((p, _)) = best {
+                runner_up = runner_up.max(p);
+            }
             best = Some((prob, code.as_str()));
+        } else {
+            runner_up = runner_up.max(prob);
         }
     }
 
     if considered == 0 {
         // Every supplied code was unknown to whisper. Fall through to
-        // the first entry as a deterministic last resort.
+        // the first entry as a deterministic last resort — and never
+        // report a language we arrived at by shrugging.
         let fallback = codes.first().cloned().unwrap_or_default();
         tracing::warn!(
             "no language in allow-list {codes:?} is known to whisper; \
              falling back to {fallback:?} (transcript may be garbled)"
         );
-        return Ok(fallback);
+        return Ok((fallback, false));
     }
 
     let (best_prob, best_code) = best.expect("considered > 0 implies Some(best)");
-    tracing::debug!(
-        target: "fono_stt::lang",
-        "lang_detect picked {best_code} (p={best_prob:.3}) from allow-list of {} codes",
-        codes.len()
-    );
-    Ok(best_code.to_string())
+    // A single-entry allow-list has nothing to be unsure between — it
+    // behaves as a forced language, so trust it.
+    let decisive = considered == 1
+        || (best_prob >= LANG_PICK_MIN_PROB && best_prob >= runner_up * LANG_PICK_MIN_RATIO);
+    if decisive {
+        tracing::debug!(
+            target: "fono_stt::lang",
+            "lang_detect picked {best_code} (p={best_prob:.3}, runner-up {runner_up:.3}) \
+             from allow-list of {} codes",
+            codes.len()
+        );
+    } else {
+        tracing::info!(
+            target: "fono_stt::lang",
+            "lang_detect could not decide between the allowed languages \
+             (best {best_code} p={best_prob:.3}, runner-up p={runner_up:.3}); \
+             decoding as {best_code} but reporting no language"
+        );
+    }
+    Ok((best_code.to_string(), decisive))
 }
 
 /// Best-effort post-decode language id read-back. Used for the `Auto`
@@ -754,7 +815,11 @@ mod streaming_impl {
             return selection.fallback_hint().map(str::to_string);
         };
         match resolve_language(ctx, selection, pcm, stt.threads) {
-            Ok(opt) => opt,
+            // The streaming lane needs a code to decode with, trusted or
+            // not — a mid-stream chunk is short and the detector is
+            // often unsure. Trust grading happens on the batch path,
+            // which is what feeds the assistant's reply language.
+            Ok(pick) => pick.code.or_else(|| selection.fallback_hint().map(str::to_string)),
             Err(e) => {
                 tracing::warn!(
                     "lang_detect failed mid-stream ({e}); falling back to {:?}",

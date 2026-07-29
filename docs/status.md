@@ -1,5 +1,78 @@
 # Fono — Project Status
-Last updated: 2026-07-28
+Last updated: 2026-07-29
+
+## 2026-07-29 — Romanian and English, and the language guard with a hole exactly where the user lives
+
+Reported symptom: with `languages = ["en", "ro"]`, speaking English to the
+assistant frequently produced confident Romanian gibberish — and it happened far
+more with F8 (assistant) than with F9 (dictation).
+
+**Root cause.** With two or more configured languages the OpenAI backend sent the
+first pass *unforced* and then only reran when the detected language fell
+**outside** the allow-list. Romanian *is* in the allow-list, so the rerun lane was
+structurally incapable of catching the only confusion the user actually
+experiences. `pick_best_peer` implemented the right arbitration, wired to the
+wrong trigger.
+
+**Why the assistant was worse than dictation.** Four asymmetries, all ours, none
+in the API: dictation trimmed silence and the assistant did not; dictation sent a
+context hint full of English shell tokens (an accidental language anchor) and the
+assistant sent nothing; assistant turns are short, which is where Whisper's
+language ID is weakest; and a wrong tag was *amplified* — it injected "Reply in
+Romanian." into the system block, picked the Romanian voice, and then sat in a
+five-minute history window pulling every following turn the same way. During the
+session a `fono.listen` call on pure silence returned a Romanian YouTube outro,
+which demonstrated the failure class live.
+
+**What we did not build.** `plans/2026-05-15-stt-within-list-language-confidence-rerank-v1.md`
+is a complete 278-line plan for exactly this bug, unticked since May. It is now
+closed as obsolete: `gpt-transcribe` takes a plural `languages[]` field and
+code-switches inside one utterance, so the provider does the arbitration in one
+request and the rerun lane is dead weight. Deleted `pick_best_peer`,
+`do_request_verbose`, `VerboseResp`, and the mismatch branch.
+
+**The fix, in seven small steps.**
+
+1. A model capability table in `crates/fono-stt/src/openai.rs` — `response_format`
+   was hard-coded to `verbose_json`, which every `gpt-*-transcribe` model rejects.
+   Choosing one of them was a hard failure before this.
+2. Send `languages[]` for the allow-list case; delete the rerun machinery.
+3. **One rule across four backends: report `language: None` when unsure.** Empty
+   `languages[]` (OpenAI), `language_probability` below threshold (ElevenLabs —
+   a value parsed since forever and never once read), mean `avg_logprob` below
+   `-1.0` (Groq, whisper-local). No new struct, no new config, no extra requests.
+4. Trust the language only when `Some` — the reply-language instruction and the
+   TTS voice pick. This is what stops one bad guess owning five minutes.
+5. Trim silence on the assistant path and on the MCP listen path, via a new
+   `fono_audio::trim_for_stt` that the dictation path now shares.
+6. `keywords: Vec<String>` on `TranscribeOptions`; dictation moves its window word
+   list into it, the assistant sends the user dictionary, and the vocabulary table
+   is applied to the assistant transcript.
+7. Defaults: `gpt-transcribe` for OpenAI STT (cheaper than `whisper-1` as well),
+   `gpt-5.6-luna` for the OpenAI assistant.
+
+**Rejected mid-design, on review.** Changing the trait's `lang_override:
+Option<String>` to a plural `Vec` (every backend already holds the list —
+`self.languages` — so it would have merged two distinct ideas across thirteen
+call sites for no gain); inverting the trait so `transcribe_with_opts` is
+required (thirteen rewrites to fix duplication that exists in two files —
+instead the two files now share a private helper, which also kills the drift
+where one path returned `"romanian"` and the other `"ro"`); and sending a
+hand-written `prompt` for the assistant, which buys nothing measurable and risks
+an over-long-prompt rejection. The dictation phrase blacklist stays
+dictation-only and unchanged — "what about you?" is a normal thing to say to an
+assistant, and that list truncates it. And feeding the recogniser the room and
+device names the house reported: it would mishear a proper noun less often, but
+STT and the assistant are separately configured stages, and an inventory of
+somebody's home has no business riding on a request to a cloud service they chose
+for audio. `docs/privacy.md` states this, and the absence of the field is what
+keeps it true. The user dictionary still goes, since that is the user's own list.
+
+**Deferred.** `gpt-live-transcribe` for the streaming path: net-new WebSocket
+work, 24 kHz PCM, four times the batch price, and it returns no language and no
+confidence. Separate plan.
+
+Gate: fmt, clippy `-D warnings`, and 37 test binaries green.
 
 ## 2026-07-28 — The action benchmark was measuring nothing, and reporting a number for it
 

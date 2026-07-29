@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use fono_audio::{
-    AudioCapture, AudioPlayback, CaptureConfig, EnvelopeConfig, EnvelopeFollower, RecordingBuffer,
-    SilenceEvent, SilenceWatch, SilenceWatchConfig,
+    trim_for_stt, AudioCapture, AudioPlayback, CaptureConfig, EnvelopeConfig, EnvelopeFollower,
+    RecordingBuffer, SilenceEvent, SilenceWatch, SilenceWatchConfig,
 };
 use fono_core::{config::Config, Secrets};
 use fono_ipc::{McpPhase, Request, Response};
@@ -866,6 +866,10 @@ pub async fn listen_once(
         let transcript = if pcm.is_empty() {
             String::new()
         } else {
+            // Trim the outer silence before STT. The listen loop stops on a
+            // silence timeout, so the tail is always quiet — and quiet tails
+            // are exactly what makes Whisper invent a YouTube sign-off.
+            let (pcm, _) = trim_for_stt(&pcm, 16_000, cfg.audio.trim_silence);
             match stt.transcribe(&pcm, 16_000, None).await {
                 Ok(t) => t.text.trim().to_string(),
                 Err(e) => {

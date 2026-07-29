@@ -20,7 +20,7 @@ rationale.
 
 | Provider       | STT | polish | Assistant chat | Vision                       | Web search                      | TTS                       |
 |----------------|-----|-------------|----------------|------------------------------|----------------------------------|---------------------------|
-| **OpenAI**     | ✓   | ✓           | ✓              | ✓ (`gpt-5.4-mini`)          | ✓ `web_search_preview`           | ✓ `tts-1`                 |
+| **OpenAI**     | ✓   | ✓           | ✓              | ✓ (`gpt-5.6-luna`)          | ✓ `web_search_preview`           | ✓ `tts-1`                 |
 | **Groq**       | ✓   | ✓           | ✓              | —                            | —                                | ✓ Orpheus                 |
 | **Anthropic**  | —   | ✓           | ✓              | ✓ (Claude Haiku 4.5)         | ✓ `web_search_20250305`          | —                         |
 | **Cerebras**   | —   | ✓           | ✓              | —                            | —                                | —                         |
@@ -138,7 +138,7 @@ retries once automatically on a stall.
 |---------------|------------|----------------------------------------|-----------------------|-----------|
 | Whisper local | local      | ggml `tiny` · `tiny.en` · `small` · `small.en` · `large-v3-turbo` (per ADR 0027) | — | no |
 | Groq          | cloud HTTP | `whisper-large-v3`, `whisper-large-v3-turbo` | `GROQ_API_KEY`        | yes (pseudo-stream, opt-in) |
-| OpenAI        | cloud HTTP | `whisper-1`, `gpt-4o-transcribe`       | `OPENAI_API_KEY`      | no |
+| OpenAI        | cloud HTTP | `gpt-transcribe` (default), `gpt-4o-transcribe`, `whisper-1` | `OPENAI_API_KEY`      | no |
 | Deepgram      | cloud WS   | `nova-2`, `nova-3`                     | `DEEPGRAM_API_KEY`    | yes |
 | Cartesia      | cloud HTTP | `ink-whisper` (batch only; `ink-2` is realtime-only and arrives in a Phase 2 streaming slice) | `CARTESIA_API_KEY`    | no  |
 | AssemblyAI    | cloud HTTP | `best`, `nano`                         | `ASSEMBLYAI_API_KEY`  | yes |
@@ -808,7 +808,7 @@ full design.
 
 | Provider   | Vision (multimodal model)              | Web search (native tool)            |
 |------------|-----------------------------------------|--------------------------------------|
-| OpenAI     | `gpt-5.4-mini` (same as text default)   | `web_search_preview`                 |
+| OpenAI     | `gpt-5.6-luna` (same as text default)   | `web_search_preview`                 |
 | Anthropic  | `claude-haiku-4-5-20251001`             | `web_search_20250305`                |
 | Gemini     | `gemini-flash-lite-latest`              | `google_search` *(not yet wired)*    |
 | Groq       | —                                       | —                                    |

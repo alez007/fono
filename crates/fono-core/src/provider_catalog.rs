@@ -394,15 +394,15 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Bearer,
             extra_headers: &[],
         }),
-        stt: Some(SttDefaults { model: "whisper-1" }),
+        stt: Some(SttDefaults { model: "gpt-transcribe" }),
         polish: Some(PolishDefaults { model: "gpt-5.4-nano" }),
         // TODO: re-enable web search when fono-assistant migrates the
         // OpenAI client to the Responses API (POST /v1/responses). The
         // chat/completions API rejects unknown tool types.
         assistant: Some(AssistantDefaults {
-            text_model: "gpt-5.4-mini",
-            // GPT-5.4 family is multimodal; reuse the assistant default.
-            multimodal_model: Some("gpt-5.4-mini"),
+            text_model: "gpt-5.6-luna",
+            // GPT-5.6 Luna takes text and images; reuse it for both.
+            multimodal_model: Some("gpt-5.6-luna"),
             web_search: WebSearchSupport::None,
             realtime: None,
             badges: &[Badge::Stt, Badge::Polish, Badge::Assistant, Badge::Tts, Badge::Vision],
@@ -1298,7 +1298,7 @@ mod tests {
         let cases: &[(&str, Option<&str>, WebSearchSupport)] = &[
             (
                 "openai",
-                Some("gpt-5.4-mini"),
+                Some("gpt-5.6-luna"),
                 // Web search is intentionally None until the OpenAI
                 // client migrates to the Responses API; the
                 // chat/completions API rejects the

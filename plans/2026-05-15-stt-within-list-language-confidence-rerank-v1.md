@@ -1,5 +1,32 @@
 # Within-Allow-List Language Confidence Reranking
 
+> **STATUS: CLOSED — OBSOLETE (2026-07-29). Not implemented, and it should
+> not be.**
+>
+> This plan proposed a rerun/rerank lane: transcribe once, judge the
+> result's `avg_logprob`, then re-transcribe forced to each other
+> configured language and keep the best score. The provider now does that
+> job for us, so the whole lane is unnecessary complexity.
+>
+> - OpenAI's `gpt-transcribe` accepts a plural `languages[]` field and
+>   code-switches **inside a single utterance**. Sending the whole
+>   allow-list up front removes the first-pass guess that the bug depended
+>   on, at one request instead of N. It is also cheaper per minute than
+>   `whisper-1`.
+> - The remaining risk — a *confidently wrong* language tag steering the
+>   TTS voice and the assistant's "Reply in X." instruction — is now
+>   handled by a much smaller rule: **every backend reports
+>   `language: None` when it is not sure**, and the consumer trusts the
+>   value only when it is `Some`. No new struct, no new config, no extra
+>   requests. See `crates/fono-stt/src/openai.rs`,
+>   `crates/fono-stt/src/elevenlabs.rs` (which finally reads the
+>   `language_probability` it had been parsing and discarding),
+>   `crates/fono-stt/src/groq.rs`, and `crates/fono-stt/src/whisper_local.rs`.
+> - `cloud_rerun_on_language_mismatch` survives as a legacy knob for the
+>   older single-`language` models only.
+>
+> Kept in-tree for the analysis and the test-matrix ideas. Do not build it.
+
 ## Objective
 
 Stop cloud STT backends from silently accepting the wrong in-allow-list

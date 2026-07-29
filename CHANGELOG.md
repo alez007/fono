@@ -100,6 +100,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   you, that preparation was being discarded and redone from scratch, so those
   replies took noticeably longer to start than unidentified ones. The prepared
   work is now reused as intended, which helps most on large on-device models.
+- **Switching between your languages mid-sentence no longer produces gibberish.**
+  If you have more than one language configured and you speak to the assistant
+  in English, Fono would sometimes decide you were speaking your other language
+  and write down nonsense that merely sounded similar. It now tells OpenAI up
+  front which languages you actually use, so the recogniser expects both and can
+  switch between them inside a single sentence instead of guessing once and
+  committing to the wrong answer.
+- **One bad guess no longer derails the next five minutes of conversation.**
+  When Fono mistook which language you were speaking, it told the assistant to
+  reply in that language and picked a matching voice — and because the exchange
+  was kept as context, the following turns stayed stuck in the wrong language.
+  Fono now recognises when the speech recogniser is unsure, and in that case
+  says nothing about language at all, leaving the assistant to follow your
+  actual words.
+- **The assistant now listens to the same cleaned-up audio that dictation
+  does.** Silence at the start and end of what you said is trimmed away before
+  it is sent for recognition. Long silences are what make speech models invent
+  text out of nothing — most memorably a Romanian "don't forget to like and
+  subscribe" produced from a completely quiet recording. This also applies when
+  a coding agent asks Fono to listen on its behalf.
+- **The assistant now applies your spelling corrections, the way dictation
+  does.** Corrections you have configured are given to the speech recogniser and
+  applied to the result. The names of your rooms and devices are deliberately not
+  sent to the recogniser — that is often a cloud service you chose for audio
+  alone, and an inventory of your home is not audio. Those names go to the
+  assistant model, which is the part that needs them.
+
+### Changed (models)
+
+- **OpenAI speech-to-text now uses `gpt-transcribe` by default** instead of the
+  older `whisper-1`. It handles switching between languages properly, mishears
+  names less often, and costs less per minute. `whisper-1` still works if you
+  prefer it — set `model` under `[stt.cloud]`. As a side fix, choosing any of
+  the newer OpenAI transcription models used to fail outright; Fono now sends
+  the right request shape for whichever model you pick.
+- **The OpenAI assistant now uses `gpt-5.6-luna` by default.**
 
 ## [0.17.1] — 2026-07-22
 

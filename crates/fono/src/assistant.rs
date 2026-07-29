@@ -288,6 +288,20 @@ pub struct AssistantTurnInputs {
     /// Runtime-only active-window context captured at assistant hotkey press.
     /// Local backends can cache this independently from stable system prompts.
     pub active_window_context: Option<String>,
+    /// Whether to strip leading/trailing silence before STT, from
+    /// `[audio].trim_silence`.
+    ///
+    /// Dictation has always done this and the assistant never did, which
+    /// cost the assistant twice: a silent tail is where a recogniser
+    /// invents a sign-off it never heard, and the extra material dilutes
+    /// its language decision — the "I switched to English and it answered
+    /// in Romanian" complaint.
+    pub trim_silence: bool,
+    /// The user's spelling corrections, applied to the transcript so a
+    /// name the recogniser mangles reaches the model spelled correctly —
+    /// and, for backends that accept them, sent ahead as recognition
+    /// hints so there is less left to correct.
+    pub vocabulary: fono_core::correction::VocabularyTable,
 }
 
 /// Inputs for [`run_realtime_turn`] — the speech-to-speech (Gemini
@@ -374,6 +388,8 @@ pub async fn run_assistant_turn(
         screen_capture_fn,
         actions,
         active_window_context,
+        trim_silence,
+        vocabulary,
     } = inputs;
 
     // Turn-wide metrics. Populated as the pump progresses; emitted
@@ -432,6 +448,19 @@ pub async fn run_assistant_turn(
             return Ok(false);
         }
         let stt_started = std::time::Instant::now();
+        // Same silence trim dictation runs, through the same helper. Room
+        // noise and a silent tail are what a recogniser turns into an
+        // invented sign-off, and what dilutes its language decision.
+        let captured_samples = pcm.len();
+        let (pcm, trim_took) = fono_audio::trim_for_stt(&pcm, sample_rate, trim_silence);
+        if pcm.len() != captured_samples {
+            debug!(
+                target: "fono::assistant",
+                "trim: {captured_samples} → {} samples in {} ms",
+                pcm.len(),
+                trim_took.as_millis(),
+            );
+        }
         if let Some(t) = &trace {
             // Device-level capture (mic open, first frame) happens before this
             // turn's trace exists, so surface the *recorded input* bounds on the
@@ -449,6 +478,20 @@ pub async fn run_assistant_turn(
                 json!({ "samples": pcm.len(), "sample_rate": sample_rate, "duration_ms": duration_ms }),
             );
         }
+        // The user's own spelling corrections, and nothing else. The room and
+        // device names this home reported stay with the assistant model: the
+        // recogniser is often a cloud service picked for audio alone, and a
+        // home inventory is not audio (`docs/privacy.md`).
+        //
+        // No context prompt: the hint dictation derives from the focused
+        // window is a list of shell fragments for the app being typed
+        // into, and there is no target window when the user is talking
+        // *to* Fono.
+        let stt_opts = fono_stt::TranscribeOptions {
+            lang_override: language.clone(),
+            context_hint: None,
+            keywords: vocabulary.terms(),
+        };
         let transcription = tokio::select! {
             biased;
             () = notify.notified() => {
@@ -470,7 +513,7 @@ pub async fn run_assistant_turn(
                 }
                 return Ok(false);
             }
-            r = stt.transcribe(&pcm, sample_rate, language.as_deref()) => match r {
+            r = stt.transcribe_with_opts(&pcm, sample_rate, &stt_opts) => match r {
                 Ok(t) => t,
                 Err(e) => {
                     // STT backend failed before producing a transcript —
@@ -516,6 +559,9 @@ pub async fn run_assistant_turn(
             },
         };
         let trimmed = transcription.text.trim().to_string();
+        // The user's spelling corrections, same as dictation. A name that
+        // reaches the model misspelled is a tool call that finds nothing.
+        let trimmed = if vocabulary.is_empty() { trimmed } else { vocabulary.apply(&trimmed) };
         if trimmed.is_empty() {
             debug!(target: "fono::assistant", "skip: empty transcript");
             if let Some(t) = &trace {
