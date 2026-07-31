@@ -154,9 +154,12 @@ impl ConversationSink {
         self.append(TurnRole::ToolCall, &text, None, backend, None, false);
     }
 
-    /// Record what a tool handed back.
-    pub fn record_tool_result(&mut self, summary: &str, backend: Option<&str>) {
-        self.append(TurnRole::ToolResult, summary, None, backend, None, false);
+    /// Record what a tool handed back, along with the executor's verdict on
+    /// it. The verdict is stored rather than left to be read back out of the
+    /// text later, because it is not legible there: a Home Assistant call
+    /// that worked returns a payload ending in `"failed": []`.
+    pub fn record_tool_result(&mut self, summary: &str, failed: bool, backend: Option<&str>) {
+        self.append_result(summary, backend, Some(!failed));
     }
 
     fn append(
@@ -168,6 +171,24 @@ impl ConversationSink {
         latency_ms: Option<i64>,
         partial: bool,
     ) {
+        self.write(role, text, speaker, backend, latency_ms, partial, None);
+    }
+
+    fn append_result(&mut self, text: &str, backend: Option<&str>, ok: Option<bool>) {
+        self.write(TurnRole::ToolResult, text, None, backend, None, false, ok);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &mut self,
+        role: TurnRole,
+        text: &str,
+        speaker: Option<&str>,
+        backend: Option<&str>,
+        latency_ms: Option<i64>,
+        partial: bool,
+        ok: Option<bool>,
+    ) {
         if self.store.is_none() || text.trim().is_empty() {
             return;
         }
@@ -176,6 +197,7 @@ impl ConversationSink {
         turn.speaker = speaker.map(str::to_owned);
         turn.latency_ms = latency_ms;
         turn.partial = partial;
+        turn.ok = ok;
         if let Some(store) = &self.store {
             if let Err(e) = store.append_turn(&turn) {
                 warn!("could not save a conversation turn: {e:#}");
@@ -244,7 +266,7 @@ mod tests {
         let mut sink = ConversationSink::open(&path, cfg(true));
         sink.record_user("turn on the lights", Some("Alex"), Some("groq"));
         sink.record_tool_call("light.turn_on", "{}", Some("groq"));
-        sink.record_tool_result("ok", Some("groq"));
+        sink.record_tool_result("ok", false, Some("groq"));
         sink.record_assistant("Done.", false, Some(120), Some("groq"));
 
         let store = ConversationStore::open(&path).unwrap();

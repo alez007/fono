@@ -29,8 +29,8 @@ use async_trait::async_trait;
 use fono_core::brain_tap::{decode_token_with_tap, BrainTap};
 use fono_core::llama_backend::{backend, shared_model};
 use fono_core::llama_gen::{
-    first_stop_marker, generation_sampler, is_control_token, safe_stream_end, turn_markers,
-    warn_on_template_vocab_mismatch, TurnMarkers,
+    first_stop_marker, generation_sampler, is_control_token, safe_stream_end, sample_next,
+    turn_markers, warn_on_template_vocab_mismatch, TurnMarkers,
 };
 use fono_core::prompt_cache::{
     PromptStateCache, PromptStateCacheEntry, PromptStateCacheKey, PromptStateCacheLayer,
@@ -317,8 +317,10 @@ impl LlamaLocal {
         // (no-op unless the tap is installed AND a sink is listening).
         fono_core::brain_tap::publish_reply_begin(tap);
         for n_cur in (start_pos..).take(MAX_NEW_TOKENS as usize) {
-            let token = sampler.sample(ctx, sample_idx);
-            sampler.accept(token);
+            // Accepting is done inside the sample call; doing it again here
+            // fed the repetition penalty every token twice (see
+            // `fono_core::llama_gen::sample_next`).
+            let token = sample_next(&mut sampler, ctx, sample_idx);
             if is_control_token(model, token) {
                 stop_reason = "control_token";
                 break;

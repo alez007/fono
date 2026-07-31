@@ -107,6 +107,23 @@ pub trait Vendor: Send + Sync {
         None
     }
 
+    /// Which individual things in the home this call actually reached, and
+    /// whether each one landed.
+    ///
+    /// This is what lets Fono say "the office lamp has worked eleven times and
+    /// the bedroom blind has never once" — a per-device history rather than a
+    /// per-tool one. It has to be vendor knowledge and cannot be read off the
+    /// arguments: one command naming a room reaches six devices the arguments
+    /// never mention, and the reply is the only place their names appear.
+    ///
+    /// Empty by default, and empty is not "nothing worked" — it is "this server
+    /// does not say", which is the truth for every server Fono has no specific
+    /// knowledge of. Nothing is recorded in that case, rather than a row of
+    /// zeroes that would read as failure.
+    fn targets(&self, _result: &str) -> Vec<Target> {
+        Vec::new()
+    }
+
     /// Which argument of a tool holds a room, which holds a device, and which
     /// holds a kind of device.
     ///
@@ -132,6 +149,19 @@ pub trait Vendor: Send + Sync {
     fn recognises_catalogue(&self, _tools: &[&str]) -> bool {
         false
     }
+}
+
+/// One thing in the home a call reached, and whether it landed.
+///
+/// The name is whatever the server called it, passed through untouched. Fono
+/// matches it against the device list it already learned from the same server,
+/// so a name that does not match is dropped rather than invented as a new
+/// device — a reply is evidence about the home, not a source of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub name: String,
+    /// The server put this one under `success` rather than `failed`.
+    pub landed: bool,
 }
 
 /// The argument names a server uses for the three things a house is made of.
@@ -285,6 +315,28 @@ impl Vendor for HomeAssistant {
         } else {
             Verdict::Contradicted
         })
+    }
+
+    /// Read off the same two lists [`Self::admission`] judges, one entry at a
+    /// time instead of one verdict for the lot.
+    ///
+    /// Areas are skipped for the reason they are skipped everywhere else here: a
+    /// room is a grouping with no state of its own, so recording a run against
+    /// it would put a history on something that cannot have one.
+    fn targets(&self, result: &str) -> Vec<Target> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else { return Vec::new() };
+        let data = v.get("data").unwrap_or(&v);
+        let mut out = Vec::new();
+        for (field, landed) in [("success", true), ("failed", false)] {
+            let Some(list) = data.get(field).and_then(|f| f.as_array()) else { continue };
+            out.extend(
+                list.iter()
+                    .filter(|e| is_entity(e))
+                    .filter_map(name_of)
+                    .map(|name| Target { name, landed }),
+            );
+        }
+        out
     }
 
     /// The three words Home Assistant uses across its whole intent interface.
@@ -443,6 +495,28 @@ mod tests {
         // Nothing recognisable in it, so no verdict either way.
         assert_eq!(ha.admission("Done."), None);
         assert_eq!(ha.admission(r#"{"speech": {"plain": {"speech": "ok"}}}"#), None);
+    }
+
+    /// A per-device history needs the names out of the *reply*, not the
+    /// arguments: the half-done office command named a room, and both device
+    /// names it actually reached appear nowhere else. The room itself is not a
+    /// device and must not collect a history of its own.
+    #[test]
+    fn each_thing_the_house_touched_is_named_separately() {
+        let ha = HomeAssistant;
+        assert_eq!(
+            ha.targets(HALF_DONE_ROOM),
+            vec![
+                Target { name: "Office air conditioner".into(), landed: true },
+                Target { name: "Office TV Light".into(), landed: false },
+            ],
+            "the area is skipped, and the one that failed is kept with its verdict"
+        );
+        assert_eq!(ha.targets(TOUCHED_NOTHING), vec![], "nothing was reached");
+        // A server we do not know says nothing rather than guessing, so no
+        // device anywhere gets a run recorded against it.
+        assert_eq!(for_result(r#"{"ok":true}"#).targets(HALF_DONE_ROOM), vec![]);
+        assert_eq!(ha.targets("Done."), vec![]);
     }
 
     /// The office payload that started this: asked for the light, the house

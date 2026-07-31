@@ -22,7 +22,13 @@
 use serde_json::Value;
 
 /// The wrapper we ask for, and the one Qwen/Hermes-family models already emit.
-const OPEN: &str = "<tool_call>";
+///
+/// Public because a backend can write it *for* the model. On the one correction
+/// a failed command is allowed, ending the prompt with this leaves the model
+/// mid-command, so continuing the sentence means writing a command and there is
+/// no prose branch to take instead. Asking in words did not work: the invitation
+/// to correct itself was declined every time in favour of an apology.
+pub const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
 
 /// Openers a reply may legitimately begin with when it is a tool call.

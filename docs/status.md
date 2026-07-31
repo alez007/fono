@@ -1,5 +1,356 @@
 # Fono — Project Status
-Last updated: 2026-07-29
+Last updated: 2026-07-31
+
+## 2026-07-31 — Correction: the second attempt earned almost none of the gain credited to it
+
+The entry below credits three changes with taking the command benchmark from 5 right to 9.
+The run was then read call by call, and the credit is wrong. Recorded here rather than edited
+away, because the mistake is the interesting part: the number moved, all three changes were in
+the same run, and nobody checked which one moved it.
+
+**The second attempt recovered nothing.** Thirteen of twenty-two commands tried twice. Six of
+those wrote the *same command again*, character for character. Of the seven that wrote
+something different, one was accepted by the house — and the lights it was aimed at still
+ended up off. No command was rescued by trying again, which is also what the run's own
+`recovered: 0` says. A second attempt that re-reads the same failure has nothing new to go on,
+so it either repeats itself or guesses a different device; two of the seven guessed a
+different temperature, which is precisely the doubling a relative command must never do, and
+escaped only because both attempts were refused. The nine seconds of extra waiting is real
+and currently buys nothing.
+
+**Putting the kind right fired three times and was worth nothing three times.** All three were
+the same correction, `light` → `climate` for the air conditioner, and all three still failed —
+because the room named beside the device was a room the device is not in. The correction is
+right; it is simply the second-largest error in the command, and fixing it while the largest
+one stands changes no outcome.
+
+**Two of the four extra passes are the benchmark measuring honestly.** They are the whole of
+the must-not-act class going 0 of 4 to 2 of 4, which is the harness no longer failing a model
+for looking something up. The other two are one plain command and one tool choice, which is
+inside run-to-run noise on a twenty-two cell suite and should not be claimed until a repeat
+run shows them again.
+
+**What this settles about what comes next.** Dropping the guessed room moves to first, ahead
+of everything else: three corrections are already right and waiting on it. Refusing a repeat
+that is identical stops six pointless round trips, but the deeper problem is that the second
+attempt is told nothing it did not already know — it is handed the same raw refusal the first
+attempt got.
+
+## 2026-07-31 — Spoken commands now correct themselves instead of apologising, and stop asking the house things the house already told us
+
+Three changes, all of them the same idea: stop asking a small model for something that is
+already known or already decided. Measured on the command benchmark against the same house,
+same fixture, both languages — **9 of 22 commands right, up from 5**, and the share right on
+the first attempt goes from 23 % to 41 %. In English, every command now reaches for the right
+tool on the first try.
+
+**A failed command is corrected, not narrated.** After a refused call Fono hands the model
+the server's own objection and invites it to fix the request. Every failing command in the
+last run declined the invitation: Home Assistant said, in as many words, that no device by
+that name was there, and the model read the failure aloud and asked the user to try again.
+The correction is no longer an invitation. When a call failed and nothing in the house moved,
+the turn continues with the command already begun, so there is no explaining branch to take —
+once. If the second attempt fails too, that is a real answer and the user hears it.
+
+**The kind of thing a device is comes from the house, not from the model.** Asked to turn the
+air conditioner off, the model named the right device and then called it a light, which the
+house refuses outright — while Fono's own record of that house has said `climate` since the
+day it was connected. A command that names a device Fono knows now has the kind put right
+before it is sent, and the correction is written into the trace so a model that keeps needing
+it stays visible. No list of tool names anywhere: which field holds a device and which holds
+a kind is asked of the same place the safety rails ask, so a server Fono has never seen is
+left exactly as it was.
+
+**Two of the benchmark's own rules were wrong, in the same way.** Both asked what the model
+did to the house and then looked at the command instead of the house. Asked *is the balcony
+light on?*, the model looked it up and answered correctly, and the benchmark failed it for
+looking — reading the house to answer a question about the house is the right behaviour, and
+the rule is now that nothing in the house moved. And a command that must never be repeated
+was charged with being repeated when neither attempt had reached anything at all: asking
+twice for two degrees warmer is only four degrees if the first two landed.
+
+**A note for anyone tempted by the tidy version of this.** The protocol Fono speaks lets a
+server declare which of its tools only read, which are safe to repeat, and which are
+destructive. Asked directly, this house publishes none of it — all 26 tools carry a name, a
+description and a schema and nothing else. So none of the above is built on those hints, and
+none of it should be until something in front of Fono actually sets them.
+
+**What is left.** Eleven commands still miss, and the largest single cause has moved one
+field along: the house now refuses commands because the *room* named beside the device is a
+room that device is not in. Fono records what each device is but not where it is, so the fix
+is to learn the room at discovery and then treat it exactly as the kind is treated now. Also
+still open, and untouched by any of this: Romanian gets 1 of 11 where English gets 8, and
+most of those are the reply arriving in the wrong language.
+
+## 2026-07-31 — The safety rails on spoken commands were switched on for a year and never held the model to anything
+
+The plan's next item was a straight measurement: run the command benchmark twice, once with
+the tool-call rails on and once off, and see whether they earn their place. It took three
+runs, because the first two measured nothing at all.
+
+**Building a fair comparison first.** One binary now runs both arms on one house with
+`fono bench-actions --grammar on|off`, so nothing but the setting differs between them. Two
+harness repairs had to land before either arm could finish honestly. A device whose name
+also names a room — this house has both a `Yard` and `Balcony lights` in it — was being
+staged against whichever the name matched first, so the benchmark was checking the wrong
+thing and then failing the model for it. And a case the harness could not set up was scored
+as though the model had got it wrong, instead of being reported as a case that never ran.
+
+**Then the real finding: the rails had never applied.** With both arms running properly, the
+first comparison came back *byte for byte identical* — same replies, same commands, same
+mistakes — while every constrained run recorded `grammar: on`. One line in each decode loop
+was the cause. `llama.cpp` already tells the sampler about the token it just handed back,
+and Fono told it a second time, so the grammar saw the model's reply as
+`<<tooltool__callcall>>{"{"` — which contains no opening marker anything recognises — and
+sat waiting for a start that could never arrive. Every command Fono has ever written with a
+local model was written unconstrained. The same doubling fed the repetition penalty each
+token twice, so it saw half the history it was configured for. Fixed by routing every decode
+loop through one function that samples and leaves the accepting to `llama.cpp`, with a
+separate one for the single caller that genuinely has a token from elsewhere
+(`crates/fono-core/src/llama_gen.rs:167-183`).
+
+**Eleven tests covered the grammar and not one asked whether a token was ever forbidden.**
+They proved the grammar text parses, the symbols link, the memory frees, and every opening
+marker is recognised — all construction, no enforcement. The new test counts how much of the
+vocabulary the sampler is actually refusing, and pins the doubling itself as the disarming
+mistake it is (`crates/fono-core/src/llama_gen.rs:576-647`). The trace now also reports
+whether the rails ever bit, not merely that they were armed
+(`crates/fono-assistant/src/llama_local.rs:1980-1982`) — a setting that says `on` while
+having no effect is worse than no setting at all.
+
+**With the rails holding, they fix the mistake that was breaking most commands.** 19 of 22
+cells differ between the arms now. The headline numbers move a little — 4 passes to 5,
+first-try routing 18 % to 23 % — and they badly understate what changed. Unconstrained, the
+model kept putting the *device name in the room field*: "turn on the Balcony lights" became
+a command aimed at a room called `Balcony lights`, over and over, and three rounds of
+rewording the prompt had never stopped it. Constrained, that is no longer possible to write:
+every one of those becomes a real room with the device in its own field. That failure is
+gone.
+
+**Three failures remain and none of them are the model's grammar to fix.** The kind of
+device is still chosen freely and contradicts the device named — `Air conditioner` called a
+`light`, which the house refuses outright, when Fono's own catalogue already records that it
+is a climate device. Optional fields are volunteered blank (`"floor": ""`) because an empty
+string is still a string. And one speaker in this house is stored under the joined name
+`Office display, Boxa birou`, which no command can use — the same alias bug fixed last
+session for the test fixture, one layer further in. All three are cheap and are now written
+up as the next tasks; the benchmark number gets re-taken after them, which is the first run
+where a miss can only mean the model chose badly.
+
+## 2026-07-31 — A learned shortcut now earns its place by whether you complained, not by asking the house twice
+
+Planning only; no code changed. The next item on the voice-actions plan was a debt called
+no-op detection: "turn on" a light that is already on reads back as `Confirmed`, which is
+honest wording but was written down as unusable evidence for learning a shortcut, and it
+gated two other tasks. The user pushed back on all three of its premises, and the pushback
+held.
+
+**Two of the three objections were already answered by the code, and the third killed the
+task.** The worry that a state check cannot generalise to every MCP server does not apply:
+the check is gated twice over, and `checks()` only answers for a tool whose *name* states a
+desired end state (`crates/fono/src/actions/vendor.rs:285-287`), so a weather question never
+produces `Confirmed` at all — it produces `Accepted`. The worry about latency was smaller
+than feared: the readback is one plain MCP call at ~100 ms with no model in the loop
+(`crates/fono/src/actions/mod.rs:915`), not seconds of decoding. But the third point is
+fatal, and it was not in the plan: **a `Confirmed` verdict never proved correct targeting in
+the first place.** `confirms` looks up the devices the *server itself claimed it touched* —
+`claimed_entities` reads `data.success[]` (`crates/fono/src/actions/vendor.rs:299,392-397`)
+— not the devices the user asked for. Command the wrong lamp, watch that lamp obey, and the
+verdict is `Confirmed`. Paying for a pre-state read would have bought a slightly less weak
+signal that was still not promotion-grade.
+
+**So the evidence moved from the world to the user, and shrank to three sentences.** A run
+is clean if the reply reported no error *and* the user did not touch the same device again
+within 30 seconds of the reply finishing. Two clean runs of the same phrase, with the same
+call, make it fast. One dirty run, or a changed tool, makes it slow again. Everything else
+falls out: "no error" already includes the transport failure, `isError`, `NothingWorked`,
+`PartlyWorked` and `Contradicted`, so a partial failure is already dirty and the separate
+per-device promotion clause is gone. Watching the *device* rather than the *words* deletes
+all correction detection — no lists of "no", "not that one", "undo", which would have needed
+one list per spoken language in a tool that is used in several. Judging is lazy: a run is
+scored when the phrase is next used, which is always after its window closed, so there is no
+timer and no background task, and a phrase never said again is never promoted.
+
+**The 30-second bound came from the user and is load-bearing.** Without it the rule would
+have excluded its own best candidates: "turn on the kitchen lights" said again half an hour
+later is a *new* command, because someone switched them off — not a complaint. A complaint
+is fast; an unobeyed user repeats themselves at once. Two details recorded with it: the clock
+starts when the reply finishes rather than when the command arrived, or a slow turn eats the
+window and pushes a real complaint outside it; and "turn it on" followed by "dim it" is read
+as a complaint, which costs nothing but a phrase staying slow, and if it ever proves common
+the fix is one clause using machinery that already exists.
+
+The no-op question then disappears rather than being solved: an already-on lamp with a
+satisfied user is clean, and a wrong lamp that *did* move is dirty on the next turn — the
+exact case the extra read cannot see. What is still owed is cheap and gates nothing: the
+actions page should say "state as asked" rather than "confirmed" for a post-condition pass,
+and the limit belongs in a doc comment so a later task cannot over-trust the verdict.
+
+**Two tasks closed instead of one, and the last gate on shortcuts is gone.** The companion
+question — what may be promoted on a server Fono cannot read — stops being a dilemma, since
+the evidence no longer depends on a vendor understanding the reply. An unrecognised server
+promotes on the same threshold in a weaker form (no error, and the phrase was not repeated
+within 30 s, because there are no devices to watch), and the "can't be checked" label now
+describes only how the result is narrated, not whether it can be learned. Shortcut rows are
+unblocked; the grammar A/B measurement is still the next thing to run.
+
+## 2026-07-29 — Everything the assistant can do now has a page, and it is built for finding out why a command went wrong
+
+The user asked for the tool list to leave the settings page: five MCP servers of ten
+tools each buries every other setting, and there was nowhere to show what each server
+had actually reported. That request was already recorded — `plans/2026-07-26-voice-actions-v4.md:966-981`
+answers §15 Q3 with a `#/actions` route — but it sat behind Task 18 (shortcuts), which
+is gated on evidence work we have not done. Asked what such a page would do for
+debugging, the answer split the task in two: the *inspector* half needs nothing but
+data already in the store, so it ships now; the *shortcut rows* half still waits on
+Tasks 19 and 23. `plans/2026-07-28-voice-actions-universal-first-v5.md:547` records the
+split as Task 18a (done) and Task 18b (open).
+
+**Why a page at all.** The two most expensive defects in this plan had the same shape:
+F36 (the retry fired correctly and was read aloud as JSON) and F40 (the harness
+reported `calls: 0` while the trace showed a call per turn). In both the mechanism was
+right and the only place to look was in another crate reporting something else. The
+page is the structural fix — it renders from the same payload the prompt is built
+from, one hop from the model.
+
+**What it shows.** Grouped by the server that offered it: every tool with its own first
+sentence as the row title (what the model reads when choosing), and, expanded, each
+published field with what the server says about it and — when the rails are on — what
+Fono narrows it to. The panels beneath carry the house as the servers reported it
+(rooms, devices by kind, with a marker on the comma-separated multi-name devices that
+caused F43) and the literal sentences the assistant is given, with the catalogue
+fingerprint and a copy button. Badges appear only when something is *not* ordinary:
+twenty-six rows each wearing "on / available / reported" teach nothing, two rows
+wearing "off" and "missing" answer the question. Two facts that previously took an
+afternoon in the traces are now a glance: no Home Assistant tool declares a required
+field, and `available` (the server stopped offering it) is told apart from `enabled`
+(you switched it off).
+
+**And a lever.** Per-tool switches move here, plus "All on / All off / Only this" per
+server. With 23 near-identical `Hass*` signatures competing (F33), silencing all but
+one server and re-running separates "chose the wrong tool" from "sent the wrong
+arguments" without editing config or restarting.
+
+Settings keeps only what belongs there: the servers, the rails switch, a one-line
+count, and a link. Nothing on the new page participates in Save/Discard — a page you
+visit mid-debug must not be able to strand an unsaved change elsewhere.
+
+Stated so the page is not over-trusted: it shows what was stored and what the model was
+*told*. What the model actually *decoded* stays in the trace. The page is state; the
+trace is the event.
+
+**And a history.** Each row now also carries when it last ran, who asked, how many times
+it has run, and how long the command and the check took. Recorded at the moment the
+call returns, in the same store — so latency is a standing number rather than one
+re-derived from a trace on every investigation, and the run count is the raw signal
+Task 18b will promote shortcuts from. The asker's name comes from the speaker already
+identified upstream, which makes "it worked for me but not for her" a readable row
+instead of a guess. First version put all of it in the per-tool drawer and the user
+could not find it — correctly, since finding it required guessing which of twenty-six
+rows to click. It now reads on the row itself (`worked 12 min ago · 401 ms · Bogdan`),
+green or amber, and the fuller sentence stays in the drawer. In a catalogue where
+almost nothing has ever run, those few lines double as the marker for which rows are
+worth opening at all, and the count moved into the opening line of the page.
+
+**One correctness fix on top.** Changing the master switch, the rails switch or the
+server list in settings left the new page rendering the state the daemon had already
+left behind, because the tools payload is derived from the config and was only fetched
+once. It is now re-read after a successful save and again on the way into the page. A
+debugging page that can show a stale switch is worse than no page: it invents a defect
+that isn't there.
+
+**A second UX pass, and per-device history.** The first row layout was wrong and the
+screenshot said so: `HassTurnOff · failed 60 min ago · 145 ms · Bogdan · 2 runs`, five
+facts at one weight, appended to a variable-width name so the status started at a
+different x on every row — twenty-six of them could not be compared without reading
+each one, which is the opposite of what the page is for. The status is now a
+**reserved, right-aligned column**, two lines (how it went, then when), present on every
+row whether or not it has anything to say; duration, who asked and the total moved back
+into the drawer, where someone has already chosen a row. The per-row switch also stopped
+shouting: at full brand red, twenty-six of them were louder than the one amber word the
+page exists to surface, so on this page it is a filled outline instead.
+
+Devices now carry their own count and last outcome, because "the office lamp never comes
+on" is what people actually notice and a per-tool count cannot answer it — one
+instruction naming a room reaches six things and routinely fails on the sixth. Which
+things a reply says it reached is Home-Assistant-specific knowledge, so it went behind
+the vendor trait as `targets()`, read off the same `success` / `failed` lists
+`admission()` already judges; every other server returns empty and therefore collects no
+history rather than a row of zeroes. Chips show the count and a coloured outline, and the
+names are matched through the comma-separated aliases and case-insensitively, since the
+house answers with whichever alias matched. One bug found while doing it: device
+discovery replaced the whole table on every pass, which would have erased every count
+several times a day — rows are now updated in place and only genuinely departed devices
+are removed.
+
+**Fast path designed, not built.** `plans/2026-07-28-voice-actions-universal-first-v5.md:586-648`
+now carries the whole Task 18b design: the two counters promotion may read (and the rule
+that a phrase is promotable only when every device it reached is itself confirmed), the
+two further vendor questions it needs (`identity_args`, `canonical_args` — so "two
+degrees warmer" can never become a shortcut and one device's aliases cannot become two
+shortcuts), the single `shortcut` table, and the row UX, which reuses the status column
+from this session for the same scanning reason. Still gated on Tasks 19 and 23: a
+shortcut replays a routing decision, and replaying a wrong one faster is worse than
+having none.
+
+Touched: `crates/fono-core/src/tool_catalog.rs` (`sources()` and `devices()` readers,
+the run-history column set and its migration, per-device counters, in-place device
+sync), `crates/fono/src/actions/mod.rs` (`page_extras`, `execute()` split out of
+`run_one`, run recording), `crates/fono/src/actions/vendor.rs` (`targets()`),
+`crates/fono/src/daemon.rs`, `crates/fono/src/session.rs`, `crates/fono/src/doctor.rs`,
+`crates/fono-net/src/web_settings/` (mod + the three assets).
+
+**A third UX pass: the drawer was mostly copies of itself.** Screenshot of two rows
+open side by side made it plain — `HassTurnOff` and `HassTurnOn` rendered as the *same
+block of text*, twice: same five fields, same "This server does not say any field is
+required", same "Afterwards: checked … GetLiveContext", same schema fingerprint
+`f789deb8`. On a stock Home Assistant that repeated 23 times. Within one drawer the row
+title was also repeated verbatim as the first sentence of the description, and the
+three-column field table's middle column said "text" or "a list of text" almost
+everywhere.
+
+Fixed by asking, of each line, *whose* fact it is. Facts true of every tool on a server
+are now stated **once, under the rows**, in `actServerFacts()` — the verification story,
+the missing `required` declarations, and (new) "all 23 expect exactly the same fields …
+the assistant is choosing between them on their names alone", which is F33 stated as a
+property of the catalogue rather than inferred from a trace. Per-tool facts stay in the
+drawer. A server whose tools are verified *differently* still prints the line per row,
+because there the row is the only place it can be said.
+
+**And the thing the page was missing: what each tool was actually asked to do.** The
+conversation log already records a `tool_call` turn with the exact arguments, sandwiched
+between the user's utterance and the result — three rows that answer the whole question
+and were never shown together anywhere. `ConversationStore::recent_tool_uses()` stitches
+them back with two correlated subqueries, and the drawer prints the last four per tool:
+what was said, what was sent, what came back. The live database made the case
+immediately — `"turn off the office light"` → `{"area":"Office light"}`, a device name
+routed into the room field, legible without knowing anything about the schema. That is
+F39, which originally cost a manual `tools/list` dump and an afternoon of reading.
+
+The verdict is **stored, not re-read from the prose**: a new nullable `ok` column on
+`turn`, written from the executor's own `failed` flag at `ToolEvent::Result`. This is a
+deliberate repeat of the lesson in `classify_tool_outcome`
+(`crates/fono/src/assistant.rs:3113-3138`) — a Home Assistant success ends in
+`"failed": []`, and matching those words once told a user their light had not come on
+while it visibly had. Three tests pin it, including that a call with no result yet reads
+as unknown rather than failed. The panel is absent when conversation history is off, and
+says so; nothing is recorded for this page's benefit and the daemon will not create a
+history file for someone who has switched history off.
+
+Also added: **the server's own JSON, pretty-printed**, in a collapsed `<details>` per
+tool — the standing answer to "is Fono reading this schema right?", which until now
+meant dumping `tools/list` from a terminal.
+
+Touched, this pass: `crates/fono-core/src/conversations.rs` (`ok` column + migration,
+`ToolUse`, `recent_tool_uses`), `crates/fono/src/conversation_log.rs`,
+`crates/fono/src/assistant.rs` (two call sites now pass the verdict),
+`crates/fono/src/actions/mod.rs` (`uses_by_tool`), `crates/fono/src/daemon.rs`,
+`crates/fono-net/src/web_settings/` (mod + app.js + app.css).
+
+**Next:** Task 22, the grammar A/B. Yesterday's bench runs predate Task 16d — no
+`grammar` field in the traces, so the measurement has not been made. Baseline sighted:
+33 % routed, 17 % finished on six office cases, and all three Romanian cases answered
+in English (F42 confirmed).
 
 ## 2026-07-29 — Two live-dictation defects: a teardown deadlock, and a transcript wandering into scripts the user never speaks
 

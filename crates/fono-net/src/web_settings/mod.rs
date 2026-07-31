@@ -188,9 +188,18 @@ pub type ListUtterancesFn =
 pub type DeleteUtteranceFn = Arc<dyn Fn(i64, i64) -> std::result::Result<(), String> + Send + Sync>;
 
 /// List the discovered tool catalogue (`GET /api/tools`):
-/// `{"servers": [{name, url, configured}, …], "tools": [{source, name,
-/// enabled, available, capability, verify_class, …}, …]}`. Reads the local
-/// store only — never contacts a server, so the page renders instantly.
+/// `{"servers": [{name, url, configured, last_seen}, …], "tools": [{source,
+/// name, description, schema, enabled, available, capability, verify_class,
+/// …}, …]}`, plus what the Tools &amp; actions page needs to explain them:
+/// `house` (the rooms, devices and kinds the servers reported), `slots`
+/// (which published field carries a room, a device and a kind, or nulls for a
+/// server Fono has no specific knowledge of), `hint` (the literal sentences
+/// the model is given about the home), `grammar`, `place_names`,
+/// `catalogue_hash` and `offered`.
+///
+/// Reads the local store only — never contacts a server, so the page renders
+/// instantly. Built by the same code that builds the prompt, so what the page
+/// shows and what the model was told cannot drift apart.
 pub type ListToolsFn =
     Arc<dyn Fn() -> std::result::Result<serde_json::Value, String> + Send + Sync>;
 /// Allow or deny one tool (`PATCH /api/tools`). Args `(source, name,
@@ -1027,6 +1036,25 @@ mod tests {
         assert!(FAVICON_SVG.contains("<svg"));
     }
 
+    /// The tools & actions page is a route of its own, reachable from the
+    /// header and from the settings section that used to hold the list. All
+    /// three have to exist together: a shell with no view renders blank, and a
+    /// view nothing links to cannot be found.
+    #[test]
+    fn the_tools_and_actions_page_is_reachable() {
+        assert!(INDEX_HTML.contains("view-actions"), "the page needs somewhere to render");
+        assert!(INDEX_HTML.contains("href=\"#/actions\""), "and a way in from the header");
+        assert!(APP_JS.contains("'#/actions'"), "and a route that recognises it");
+        assert!(APP_JS.contains("href=\"#/actions\""), "and a link from the settings summary");
+        // The panels that make it a debugging instrument rather than a list:
+        // what a tool was really asked to do, what each field is narrowed to,
+        // the server's own words, and the words the model is given.
+        assert!(APP_JS.contains("act-uses"), "the commands that actually reached a tool");
+        assert!(APP_JS.contains("held to "), "which fields Fono is narrowing");
+        assert!(APP_JS.contains("What the server published, word for word"));
+        assert!(APP_JS.contains("The exact words the assistant is given"));
+    }
+
     /// The settings page auto-picks a backend when a language-model role
     /// is switched on with none chosen, and must reach the same verdict
     /// the daemon would. That means duplicating `LLM_AUTOSELECT_ORDER`
@@ -1112,6 +1140,100 @@ mod tests {
             assert!(
                 found.iter().any(|a| handled(a)),
                 "button at byte {at} has no click-handled attribute (saw {found:?})"
+            );
+        }
+    }
+
+    /// The key that identifies a row must never be written into the document.
+    ///
+    /// It joins the server and the tool name with a NUL, and an HTML attribute
+    /// cannot carry one: the parser rewrites U+0000 to U+FFFD, so the key read
+    /// back off a click never equals the key the renderer looks up and no row
+    /// ever opens. Every automated check passed while the page was in exactly
+    /// that state — the buttons existed, the handler was bound, the classes were
+    /// styled, and the one thing the page is for did not work. This asserts the
+    /// invariant that was actually broken: the separator stays in JavaScript.
+    #[test]
+    fn the_row_key_never_reaches_the_html() {
+        // The quoted literal, so the comment describing the key does not count
+        // as a second use of it.
+        let sep = APP_JS.match_indices("'\\u0000'").count();
+        assert!(sep > 0, "the scan has stopped seeing the key builder");
+        assert_eq!(
+            sep, 1,
+            "the NUL row-key separator appears more than once — it belongs only in `actKey`, \
+             never in emitted markup, because the HTML parser silently corrupts it"
+        );
+        assert!(
+            !APP_JS.contains("esc(k)"),
+            "a composite row key is being escaped into an attribute; pass its parts as \
+             separate `data-` attributes and rebuild the key in JavaScript"
+        );
+    }
+
+    /// Every class the tools & actions page paints on itself must exist in
+    /// the stylesheet.
+    ///
+    /// The page carries a lot of meaning in colour alone — a failed run, a
+    /// tool switched off, a value Fono is holding to your home. A class name
+    /// that has drifted does not break anything loudly; it just quietly stops
+    /// saying the thing, on the one page whose whole job is to say things
+    /// plainly. Scoped to the `act-*` family and the pill variants, which is
+    /// where that meaning lives.
+    #[test]
+    fn every_actions_page_class_is_styled() {
+        let mut wanted: Vec<String> = Vec::new();
+        for prefix in ["act-", "chip-"] {
+            for (at, _) in APP_JS.match_indices(prefix) {
+                // `data-act-*` attributes are behaviour, not style, and are
+                // covered by the click-handler test above.
+                if at >= 5 && &APP_JS[at - 5..at] == "data-" {
+                    continue;
+                }
+                let rest = &APP_JS[at..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                    .unwrap_or(rest.len());
+                let name = rest[..end].trim_end_matches('-');
+                if name.len() > 4 {
+                    wanted.push(name.to_owned());
+                }
+            }
+        }
+        // Pill variants, read off the `pill(label, kind, …)` call sites rather
+        // than by looking for the bare word anywhere in the file — `'strong'`
+        // and `'warn'` are also used by the calibration and doctor views for
+        // something else entirely.
+        for (at, _) in APP_JS.match_indices("pill('") {
+            let rest = &APP_JS[at + "pill('".len()..];
+            // Past the label, then the kind, when both are plain literals.
+            let Some(label_end) = rest.find('\'') else { continue };
+            let Some(kind) = rest[label_end + 1..].strip_prefix(", '") else { continue };
+            let Some(end) = kind.find('\'') else { continue };
+            if !kind[..end].is_empty() {
+                wanted.push(format!("pill.{}", &kind[..end]));
+            }
+        }
+        wanted.sort();
+        wanted.dedup();
+        // The parser going blind is the failure mode that would make this test
+        // pass forever while checking nothing — the exact shape of an earlier
+        // defect where a harness reported zero of something it could not see.
+        assert!(wanted.len() > 10, "found only {wanted:?} — the scan has stopped seeing the page");
+
+        // Boundary-aware: `.act-ran` must not be satisfied by `.act-rans`.
+        let styled = |c: &str| {
+            APP_CSS.match_indices(&format!(".{c}")).any(|(at, m)| {
+                APP_CSS[at + m.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|n| !(n.is_ascii_alphanumeric() || n == '-' || n == '_'))
+            })
+        };
+        for c in wanted {
+            assert!(
+                styled(&c),
+                "app.js paints `{c}` on the actions page but app.css never styles it"
             );
         }
     }

@@ -417,8 +417,182 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
 .turn.assistant .what { color: var(--ink-mute); }
 .turn.tool_call .what, .turn.tool_result .what { font-family: var(--mono); font-size: 12px; color: var(--ink-mute); }
 
+/* ---------- tools & actions page ---------- */
+.act-lede { font-size: 13.5px; color: var(--ink-mute); margin: 0 0 14px; text-wrap: pretty; }
+.act-lede b { color: var(--ink); }
+.act-srv { border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-2); margin: 14px 0; }
+.act-srv-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+.act-srv-head .info { min-width: 0; flex: 1; }
+.act-srv-head .lbl { font-weight: 600; font-size: 14px; }
+.act-srv-head .desc { font-size: 12px; color: var(--ink-mute); margin-top: 2px; }
+.act-srv-head .ctl { display: flex; gap: 4px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+.act-fold {
+  background: none; border: 0; cursor: pointer; color: var(--ink-dim);
+  font-size: 10px; padding: 4px; line-height: 1;
+}
+.act-fold:hover { color: var(--ink); }
+.act-rows { padding: 4px 0; }
+.act-row { display: flex; align-items: center; gap: 10px; padding: 2px 14px 2px 10px; }
+.act-row + .act-row, .act-detail + .act-row { border-top: 1px solid var(--line); }
+/* The row opens, and until it lit up on hover nothing said so: a 9px triangle at
+   the far left is not an affordance, and a reader who never opens a row never
+   finds who last used the thing or what it expects. */
+.act-row:hover { background: var(--bg-3); }
+.act-row.act-open { background: var(--bg-3); }
+/* The whole left side is the disclosure control: a 26-row list is unusable if
+   only a 10px chevron is clickable. */
+.act-head {
+  display: flex; align-items: baseline; gap: 8px; flex: 1; min-width: 0;
+  background: none; border: 0; padding: 9px 0; cursor: pointer;
+  font: inherit; color: inherit; text-align: left;
+}
+.act-head .chev { font-size: 11px; color: var(--ink-mute); flex-shrink: 0; transition: none; }
+.act-row:hover .chev { color: var(--ink); }
+.act-head .info { min-width: 0; }
+.act-head .lbl { display: block; font-size: 13.5px; color: var(--ink); text-wrap: pretty; }
+.act-head .desc { display: block; font-size: 11.5px; color: var(--ink-dim); margin-top: 3px; }
+.act-head .desc .mono { font-size: 11.5px; }
+.act-row.act-dim .act-head .lbl { color: var(--ink-mute); }
+.act-detail { padding: 4px 14px 16px 28px; border-left: 2px solid var(--line-2); margin: 0 0 0 18px; }
+.act-said { font-size: 12.5px; color: var(--ink-mute); margin: 6px 0 12px; text-wrap: pretty; }
+.act-detail .hint { margin: 8px 0 0; max-width: 66ch; }
+.pill {
+  display: inline-block; padding: 0 7px; margin-right: 4px; border-radius: 10px;
+  font-size: 10.5px; border: 1px solid var(--line-2); color: var(--ink-mute);
+  font-family: var(--sans); vertical-align: 1px;
+}
+.pill.weak { color: var(--accent); border-color: var(--accent); }
+/* "Did this ever work, when, for whom" — the first question a row is opened
+   to answer, so it reads a step louder than the hints below it. Never-used is
+   the ordinary case and stays quiet; a failed last run does not. */
+.act-hist { margin: 8px 0 0; font-size: 12.5px; color: var(--ink); max-width: 76ch; }
+.act-hist.none { color: var(--ink-dim); }
+/* Only the verdict is coloured. Colouring the whole sentence made the two
+   timings and the speaker's name read as part of the complaint, and left the
+   one word anyone came for indistinguishable from its own footnotes. */
+.act-hist .v-ok { color: var(--ok); }
+.act-hist .v-bad { color: var(--warn); }
+/* Fixed-width column, right-aligned, reserved on every row whether or not it
+   has anything to say. Reserving it on empty rows is the whole trick: the words
+   then start at the same x all the way down, so "failed" is found by scanning a
+   strip rather than by reading twenty-six sentences. Two lines, not one, so the
+   outcome is never crowded by its own timestamp. */
+.act-ran {
+  flex: 0 0 8.5em; text-align: right; font-size: 11.5px; line-height: 1.35;
+  color: var(--ink-dim); align-self: center;
+}
+.act-ran .w { display: block; font-weight: 600; }
+.act-ran .a { display: block; }
+.act-ran.good .w { color: var(--ok); }
+.act-ran.bad .w { color: var(--warn); }
+/* What a tool was actually asked to do. The three lines are deliberately
+   different weights, because they answer different questions: the words spoken
+   are the human's, the arguments are the model's reading of them, and the
+   result is the server's verdict. Stacked in that order the failure mode reads
+   top to bottom — "turn off the office light" becoming {"area":"Office light"}
+   is visible without knowing anything about the schema. The left rule carries
+   the colour so the JSON stays legible. */
+.act-uses { margin: 12px 0 0; display: flex; flex-direction: column; gap: 8px; }
+.act-uses .use {
+  border-left: 2px solid var(--line-2); padding: 1px 0 1px 10px; max-width: 82ch;
+}
+.act-uses .use.good { border-left-color: var(--ok); }
+.act-uses .use.bad { border-left-color: var(--warn); }
+.act-uses .said { font-size: 12.5px; color: var(--ink); text-wrap: pretty; }
+.act-uses .said .when { color: var(--ink-dim); font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.act-uses .sent {
+  font-size: 11.5px; color: var(--ink-mute); margin-top: 2px;
+  overflow-wrap: anywhere; line-height: 1.45;
+}
+/* 2.1em, not 1.2em, so the column is wide enough for the tick *and* the fold
+   caret — and reserved at that width on attempts with no recorded reply too, or
+   the arguments would start at two different places down one list, which is the
+   same misalignment the status column on the rows above exists to avoid. */
+.act-uses .sent .m { display: inline-block; width: 2.1em; }
+.act-uses .use.good .sent .m { color: var(--ok); }
+.act-uses .use.bad .sent .m { color: var(--warn); }
+/* The arguments line is itself the handle for the reply. A separate "what came
+   back" row was a line on every attempt that said nothing until opened, and the
+   request already names what the reply is about. The only marks of it being a
+   fold are a caret in the tick's own column and the line lifting on hover —
+   loud enough to invite the click, quiet enough that ten stacked attempts still
+   read as a list of arguments rather than a list of buttons. */
+.act-uses summary.sent { cursor: pointer; list-style: none; }
+.act-uses summary.sent::-webkit-details-marker { display: none; }
+.act-uses summary.sent .m::after { content: '\25b8'; margin-left: 2px; color: var(--ink-dim); }
+.act-uses .got[open] > summary.sent .m::after { content: '\25be'; }
+.act-uses summary.sent:hover { color: var(--ink); }
+.act-uses .reply {
+  font-size: 11.5px; color: var(--ink-dim); margin: 3px 0 2px 2.1em;
+  overflow-wrap: anywhere; line-height: 1.45;
+}
+/* One line per published field. Was a three-column table whose middle column
+   said "text" twenty-six times; the type is now a quiet suffix and the thing
+   worth seeing — that Fono is narrowing this field — is the only part in full
+   contrast. */
+.act-fields { list-style: none; margin: 12px 0 0; padding: 0; font-size: 12.5px; }
+.act-fields li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; flex-wrap: wrap; }
+.act-fields .f { color: var(--ink); }
+.act-fields .req {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 9px; padding: 0 6px;
+}
+.act-fields .ty { color: var(--ink-dim); }
+.act-fields .held { color: var(--ink-mute); }
+.act-raw { margin: 12px 0 0; font-size: 12px; }
+.act-raw summary { cursor: pointer; color: var(--ink-dim); }
+.act-raw summary:hover { color: var(--ink); }
+.act-raw pre {
+  margin: 8px 0 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: var(--radius); font-size: 11.5px; line-height: 1.5;
+  max-height: 22em; overflow: auto; color: var(--ink-mute);
+}
+/* Said once per server rather than once per tool. Sits under the rows, not
+   above them, because it is a footnote about the whole list — and a footnote
+   printed twenty-three times is what taught the eye to skip this region. */
+.act-srv-facts {
+  margin: 0; padding: 9px 14px 11px 34px; border-top: 1px solid var(--line);
+  font-size: 12px; color: var(--ink-mute); text-wrap: pretty;
+}
+.act-srv-facts b { color: var(--ink); }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; margin: 10px 0; }
+.chips-lbl { flex: 0 0 100%; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-dim); }
+.chips-lbl.mono { text-transform: none; letter-spacing: 0; font-size: 11.5px; }
+.chip { padding: 2px 9px; border-radius: 11px; background: var(--bg-3); border: 1px solid var(--line); font-size: 12px; }
+.chip.chip-note { border-color: var(--warn); }
+/* A device that has actually been operated, and whether the last attempt
+   landed. Colour on the border rather than the text: these are names, often
+   long, and re-colouring a hundred of them would make the list unreadable while
+   saying nothing more than the outline already does. */
+.chip.chip-ok { border-color: var(--ok); }
+.chip.chip-bad { border-color: var(--warn); background: var(--bg-2); }
+.chip .n {
+  margin-left: 6px; padding-left: 6px; border-left: 1px solid var(--line-2);
+  font-size: 11px; font-weight: 600; color: var(--ink-mute);
+}
+.chip.chip-ok .n { color: var(--ok); }
+.chip.chip-bad .n { color: var(--warn); }
+.act-prompt {
+  margin: 10px 0; padding: 12px 14px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 12px; line-height: 1.5; color: var(--ink-mute);
+  white-space: pre-wrap; overflow-x: auto; max-height: 340px; overflow-y: auto;
+}
+
 @media (max-width: 560px) {
   main { padding: 24px 14px 140px; }
   details.sec .body { padding-left: 18px; }
   .row { flex-wrap: wrap; }
+  .act-srv-head { flex-wrap: wrap; }
+  .act-srv-head .ctl { flex: 1 1 100%; justify-content: flex-start; }
+  /* Narrower, but still a reserved column — losing the alignment on a phone
+     would lose the only reason the column exists. */
+  .act-ran { flex-basis: 6em; font-size: 11px; }
+  /* Three columns of prose do not fit; stack the field and label it inline.
+     Stacked, the two values would read as one sentence, so the narrowed value
+     keeps an arrow — losing which column you are in is losing the point. */
+  .slotgrid, .slotgrid.held { grid-template-columns: 1fr; gap: 2px; }
+  .slotgrid .sh { display: none; }
+  .slotgrid .sf { margin-top: 8px; }
+  .slotgrid .sv-held::before { content: '\2192\a0'; color: var(--ink-dim); }
+  .act-detail { padding-left: 14px; margin-left: 10px; }
 }

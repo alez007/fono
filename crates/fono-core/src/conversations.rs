@@ -110,6 +110,15 @@ pub struct Turn {
     /// True when generation was cut short (user cancelled mid-reply). The
     /// text is what was produced up to that point.
     pub partial: bool,
+    /// For a [`TurnRole::ToolResult`] turn: whether the call succeeded, as
+    /// judged by the executor at the time. `None` on every other role, and
+    /// on rows written before this was recorded.
+    ///
+    /// This is stored rather than re-derived because the verdict is not
+    /// legible in the text: a Home Assistant call that *worked* returns a
+    /// payload ending in `"failed": []`, and matching on those words once
+    /// told a user their light had not come on while it visibly had.
+    pub ok: Option<bool>,
 }
 
 impl Turn {
@@ -125,8 +134,36 @@ impl Turn {
             speaker: None,
             latency_ms: None,
             partial: false,
+            ok: None,
         }
     }
+}
+
+/// One past invocation of a tool, reassembled from the conversation log:
+/// what was said, what was sent, and what came back.
+///
+/// Nothing here is stored for this purpose — it is the ordinary transcript,
+/// read back at an angle. So it is available only while conversation
+/// history is switched on and within its retention window, and it
+/// disappears when the user clears their history. That is the correct
+/// coupling: a record of what someone said in their home should not
+/// outlive the place they went to delete it.
+#[derive(Debug, Clone)]
+pub struct ToolUse {
+    /// Tool name, taken as the first token of the `tool_call` turn.
+    pub tool: String,
+    pub at: i64,
+    /// The arguments the assistant sent, verbatim — the rest of the turn.
+    /// Empty when the call took none.
+    pub args: String,
+    /// The spoken utterance that led to the call: the nearest preceding
+    /// user turn in the same thread. `None` if the tool ran without one.
+    pub said: Option<String>,
+    pub speaker: Option<String>,
+    /// What the tool handed back, and the executor's verdict on it.
+    /// `None` when the thread ends before the result was recorded.
+    pub result: Option<String>,
+    pub ok: Option<bool>,
 }
 
 /// A conversation thread, with the denormalised summary fields the history
@@ -227,6 +264,7 @@ impl ConversationStore {
                 speaker     TEXT,
                 latency_ms  INTEGER,
                 partial     INTEGER NOT NULL DEFAULT 0,
+                ok          INTEGER,
                 FOREIGN KEY (thread_id) REFERENCES thread(id) ON DELETE CASCADE
             );
 
@@ -234,6 +272,10 @@ impl ConversationStore {
                 ON turn(thread_id, ordinal);
             ",
         )?;
+        // Added after the table shipped. `ALTER TABLE … ADD COLUMN` errors
+        // when the column is already there, which is the ordinary case, so
+        // the failure is the success path and is deliberately ignored.
+        let _ = self.conn.execute("ALTER TABLE turn ADD COLUMN ok INTEGER", []);
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -271,8 +313,8 @@ impl ConversationStore {
             |r| r.get(0),
         )?;
         self.conn.execute(
-            "INSERT INTO turn(thread_id, ordinal, role, text, ts, speaker, latency_ms, partial)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO turn(thread_id, ordinal, role, text, ts, speaker, latency_ms, partial, ok)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 t.thread_id,
                 ordinal,
@@ -282,6 +324,7 @@ impl ConversationStore {
                 t.speaker,
                 t.latency_ms,
                 i64::from(t.partial),
+                t.ok.map(i64::from),
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -326,7 +369,7 @@ impl ConversationStore {
     /// Every turn in a thread, oldest-first.
     pub fn turns(&self, thread_id: i64) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, thread_id, ordinal, role, text, ts, speaker, latency_ms, partial
+            "SELECT id, thread_id, ordinal, role, text, ts, speaker, latency_ms, partial, ok
              FROM turn WHERE thread_id = ?1 ORDER BY ordinal ASC",
         )?;
         let rows = stmt
@@ -340,13 +383,64 @@ impl ConversationStore {
     /// conversation in full.
     pub fn recent_turns(&self, thread_id: i64, limit: usize) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, thread_id, ordinal, role, text, ts, speaker, latency_ms, partial
+            "SELECT id, thread_id, ordinal, role, text, ts, speaker, latency_ms, partial, ok
              FROM turn WHERE thread_id = ?1 ORDER BY ordinal DESC LIMIT ?2",
         )?;
         let mut rows = stmt
             .query_map(params![thread_id, limit as i64], row_to_turn)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.reverse();
+        Ok(rows)
+    }
+
+    /// The last `limit` tool invocations across every thread, newest-first,
+    /// each stitched back together with the utterance that caused it and the
+    /// result it produced.
+    ///
+    /// One query for all tools rather than one per tool: a stock Home
+    /// Assistant publishes two dozen, and the caller wants a handful of
+    /// examples for each, so scanning the recent tail once and grouping in
+    /// memory is both cheaper and gives an honest "nothing recent" for the
+    /// tools that have been quiet.
+    pub fn recent_tool_uses(&self, limit: usize) -> Result<Vec<ToolUse>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.ts, c.text,
+                    (SELECT u.text FROM turn u
+                      WHERE u.thread_id = c.thread_id AND u.ordinal < c.ordinal
+                        AND u.role = 'user'
+                      ORDER BY u.ordinal DESC LIMIT 1),
+                    (SELECT u.speaker FROM turn u
+                      WHERE u.thread_id = c.thread_id AND u.ordinal < c.ordinal
+                        AND u.role = 'user'
+                      ORDER BY u.ordinal DESC LIMIT 1),
+                    (SELECT r.text FROM turn r
+                      WHERE r.thread_id = c.thread_id AND r.ordinal > c.ordinal
+                        AND r.role = 'tool_result'
+                      ORDER BY r.ordinal ASC LIMIT 1),
+                    (SELECT r.ok FROM turn r
+                      WHERE r.thread_id = c.thread_id AND r.ordinal > c.ordinal
+                        AND r.role = 'tool_result'
+                      ORDER BY r.ordinal ASC LIMIT 1)
+             FROM turn c
+             WHERE c.role = 'tool_call'
+             ORDER BY c.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let ts: i64 = r.get(0)?;
+                let call: String = r.get(1)?;
+                let (tool, args) = call.split_once(char::is_whitespace).unwrap_or((&call, ""));
+                Ok(ToolUse {
+                    tool: tool.to_string(),
+                    at: ts,
+                    args: args.trim().to_string(),
+                    said: r.get(2)?,
+                    speaker: r.get(3)?,
+                    result: r.get(4)?,
+                    ok: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -452,6 +546,7 @@ fn row_to_turn(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
         speaker: r.get(6)?,
         latency_ms: r.get(7)?,
         partial: r.get::<_, i64>(8)? != 0,
+        ok: r.get::<_, Option<i64>>(9)?.map(|v| v != 0),
     })
 }
 
@@ -531,6 +626,68 @@ mod tests {
         db.append_turn(&Turn::new(tid, TurnRole::ToolResult, "ok")).unwrap();
         let roles: Vec<_> = db.turns(tid).unwrap().iter().map(|t| t.role).collect();
         assert_eq!(roles, vec![TurnRole::User, TurnRole::ToolCall, TurnRole::ToolResult]);
+    }
+
+    /// A past invocation is only useful if all three parts arrive together:
+    /// the words spoken, the arguments that were derived from them, and what
+    /// came back. Reading them separately is what the raw transcript already
+    /// offers, and it is what made the routing bugs so slow to see.
+    #[test]
+    fn a_tool_use_is_stitched_back_to_what_was_said() {
+        let db = store();
+        let tid = db.open_thread(None, None, None, None).unwrap();
+        let mut said = Turn::new(tid, TurnRole::User, "turn off the office light");
+        said.speaker = Some("Bogdan".into());
+        db.append_turn(&said).unwrap();
+        db.append_turn(&Turn::new(tid, TurnRole::ToolCall, r#"HassTurnOff {"area":"Office"}"#))
+            .unwrap();
+        let mut res = Turn::new(tid, TurnRole::ToolResult, "HassTurnOff failed: no such area");
+        res.ok = Some(false);
+        db.append_turn(&res).unwrap();
+
+        let uses = db.recent_tool_uses(20).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].tool, "HassTurnOff");
+        assert_eq!(uses[0].args, r#"{"area":"Office"}"#);
+        assert_eq!(uses[0].said.as_deref(), Some("turn off the office light"));
+        assert_eq!(uses[0].speaker.as_deref(), Some("Bogdan"));
+        assert_eq!(uses[0].ok, Some(false));
+    }
+
+    /// The verdict must survive as recorded, not be re-read from the words.
+    /// A Home Assistant call that worked comes back saying `"failed": []`,
+    /// and once that text was matched on, a light that had visibly come on
+    /// was reported to the user as not having.
+    #[test]
+    fn the_verdict_is_stored_not_inferred_from_the_text() {
+        let db = store();
+        let tid = db.open_thread(None, None, None, None).unwrap();
+        db.append_turn(&Turn::new(tid, TurnRole::User, "hall lamp on")).unwrap();
+        db.append_turn(&Turn::new(tid, TurnRole::ToolCall, "HassTurnOn {}")).unwrap();
+        let mut res = Turn::new(
+            tid,
+            TurnRole::ToolResult,
+            r#"{"data": {"success": [{"name": "Hall lamp"}], "failed": []}}"#,
+        );
+        res.ok = Some(true);
+        db.append_turn(&res).unwrap();
+
+        let uses = db.recent_tool_uses(20).unwrap();
+        assert_eq!(uses[0].ok, Some(true), "the word 'failed' in the payload must not decide");
+    }
+
+    /// A call whose thread ended before the result landed still lists, with
+    /// the outcome honestly unknown rather than guessed as a failure.
+    #[test]
+    fn a_call_with_no_result_yet_is_not_reported_as_failed() {
+        let db = store();
+        let tid = db.open_thread(None, None, None, None).unwrap();
+        db.append_turn(&Turn::new(tid, TurnRole::ToolCall, "HassTurnOn")).unwrap();
+        let uses = db.recent_tool_uses(20).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].args, "", "a call with no arguments has none, not a stray name");
+        assert_eq!(uses[0].ok, None);
+        assert_eq!(uses[0].result, None);
     }
 
     /// The dictation redactor must never be reintroduced on this path.

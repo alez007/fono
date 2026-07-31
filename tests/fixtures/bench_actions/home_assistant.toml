@@ -142,17 +142,18 @@ fr = "monte {device} de deux degrés"
 es = "sube {device} dos grados"
 
 # ---------------------------------------------------------------------------
-# Requests that must produce no tool call at all.
+# Requests that must leave the house exactly as they found it.
 #
 # Without these a benchmark rewards a model for being trigger-happy, and the
 # fastest way to a perfect score is to act on everything. A question about the
-# house is a question; an impossible request deserves a plain no.
+# house is a question; an impossible request deserves a plain no. Looking the
+# answer up is allowed — that is how a question about state gets answered.
 # ---------------------------------------------------------------------------
 [[cases]]
 id = "a_question_about_state_is_answered_not_acted_on"
 class = "must_not_act"
 requires = { kind = "device", domain = "light" }
-expect_no_call = true
+expect_no_change = true
 
 [cases.utterances]
 en = "is the {device} on at the moment?"
@@ -164,7 +165,7 @@ es = "¿está encendida {device} ahora?"
 id = "an_impossible_request_is_refused_plainly"
 class = "must_not_act"
 requires = { kind = "device", domain = "light" }
-expect_no_call = true
+expect_no_change = true
 
 [cases.utterances]
 en = "paint the {device} blue and move it to the other room"

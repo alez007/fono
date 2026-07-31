@@ -6,8 +6,13 @@
 (`gemma-4-e2b`) trace: the wording pass was cold-prefilling every tool turn.
 **Status:** signed off. Phases 0, 0.5, 1 and 4b are **complete**; Phase 3 is
 substantially complete (the §7 ladder ships, including partial-outcome
-reporting) but still owes no-op detection (§7.2) and a permanent home for the
-live house test (§12.1); Phases 2, 4, 5 and 6 are open.
+reporting); Phases 2, 4, 5 and 6 are open.
+**Revised 2026-07-31 —** the two debts this header used to list are closed: the
+live house test has a home (`tests/live_house.py`), and **no-op detection is
+dropped**, which changes the promotion and demotion rules in §7.2, §9 and §9.1.
+Read `plans/2026-07-28-voice-actions-universal-first-v5.md` Task 18b for the
+rule that replaces them; the paragraphs below are kept as the record of what was
+thought first.
 **Supersedes:** `plans/2026-07-25-voice-actions-v3.md` decisions **D3** and
 **D5**. Everything else in v3 (D1, D2, D4, D6–D8, and the crate/phase
 skeleton) is **inherited unchanged** and not restated here — read v3 first.
@@ -596,7 +601,13 @@ Three rules follow, and they are the honest part:
 - `PostCondition` costs one extra round trip (~100 ms) and is the only
   definitive proof for state-changing tools. At Tier 0/1 latencies that
   is affordable; use it for `enabled` state-changing tools.
-- **No-op must be distinguished from success.** "Turn on" a light that
+- ~~**No-op must be distinguished from success.**~~ **Dropped 2026-07-31** — see
+  v5 Task 19. In short: a `Confirmed` verdict never proved correct targeting in
+  the first place, because it reads back the devices the *server* claimed it
+  touched, so removing no-ops would not have made it promotion-grade. The
+  behavioural rule in v5 Task 18b covers all three cases for free. Original
+  wording kept below.
+- "Turn on" a light that
   is already on yields no state change: it is *not* a failure, but it is
   *not evidence* that targeting was correct, so it must not count toward
   promotion (§8). **Still owed — and it gates Phase 5.** `confirms`
@@ -660,6 +671,15 @@ exists to prevent. Two consequences:
 ---
 
 ## 9. A5 — Promotion gated on verification (refines v3 D4)
+
+> **Superseded 2026-07-31.** Promotion is no longer a verification question. A run
+> is clean if the reply reported no error and the user did not touch the same
+> device again within 30 s of the reply finishing; two clean runs of the same
+> phrase with the same call promote it; one dirty run or a changed tool demotes it.
+> See v5 Task 18b. What survives from this section verbatim: `Dangerous` never
+> auto-promotes, an amount-shaped call never promotes, structural invalidation is
+> immediate, demotion is a reset rather than a ban, demotion is a trace event, and
+> a replay still executes and still narrates from the real result.
 
 v3 D4's promotion rule (same normalised phrase → same action,
 successfully, ≥ 2 times; never if it ever resolved differently; never
@@ -823,10 +843,10 @@ ordering below reflects that latency architecture now precedes breadth.
 - **Phase 5 — Tier 0 replay, with demotion** (§9, §9.1). Verified
   promotion, continuous re-verification on replay, immediate demotion on
   verified failure, structural invalidation. Target ~200 ms on the third
-  utterance. **Depends on Phase 3's no-op detection** (§7.2) — a light that
-  was already on must not count as promotion evidence — so that lands first.
-  Sliced so each step is testable with no model involvement: (0) no-op
-  detection; (1) shortcut store, additive tables in the existing
+  utterance. **No longer depends on no-op detection** (dropped 2026-07-31, §7.2
+  and v5 Task 19); slice (0) below is deleted and Phase 5 starts at the store.
+  Sliced so each step is testable with no model involvement: ~~(0) no-op
+  detection;~~ (1) shortcut store, additive tables in the existing
   `tools.sqlite`, no new database and no new dependency; (2) learning —
   phrase → (tool, arguments, verified outcome); (3) replay — normalise,
   look up, execute, verify, let the model phrase it; (4) demotion and the

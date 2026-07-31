@@ -146,62 +146,133 @@ async fn run_cases(
     house: &House,
     out: &mut RunOutcome,
 ) -> Result<()> {
+    // Devices this house turned out not to be able to switch on our behalf.
+    //
+    // Learned the only way it can be — by being refused — because the device
+    // list gives no hint of it: Home Assistant will not act on a name two
+    // entities answer to, and a house accumulates those (a lamp and a media
+    // player both called `Couch`). Remembered for the rest of the run so the
+    // next case does not walk into the same wall, and so the case that did is
+    // re-aimed at a device the house will actually move.
+    let mut unaddressable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for case in &manifest.cases {
         if let Some(f) = &opts.only {
             if !case.id.contains(f.as_str()) {
                 continue;
             }
         }
-        // Resolve once per case, not once per language: the same device must
-        // be used in every language or the cells are not comparable.
-        let target = match case.requires.resolve(house) {
-            Ok(t) => t,
-            Err(why) => {
-                // A dry run that silently omits a case is worse than useless:
-                // it is read as "these are the cases that will run", and a
-                // missing row looks like a fixture that was never written.
-                if opts.dry_run {
-                    println!("  {:<34} skipped — {why}", case.id);
+        // Three tries: each refusal rules out one device, and a fixture that
+        // is still being refused after three has run out of house rather than
+        // luck.
+        for attempt in 0..3 {
+            let usable = house.without(&unaddressable);
+            // Resolve once per case, not once per language: the same device
+            // must be used in every language or the cells are not comparable.
+            let target = match case.requires.resolve(&usable) {
+                Ok(t) => t,
+                Err(why) => {
+                    // A dry run that silently omits a case is worse than
+                    // useless: it is read as "these are the cases that will
+                    // run", and a missing row looks like a fixture that was
+                    // never written.
+                    if opts.dry_run {
+                        println!("  {:<34} skipped — {why}", case.id);
+                    }
+                    for lang in &opts.languages {
+                        out.safe.push(skipped(case, lang, &why.to_string()));
+                    }
+                    break;
                 }
-                for lang in &opts.languages {
-                    out.safe.push(skipped(case, lang, &why.to_string()));
-                }
-                continue;
-            }
-        };
-        for lang in &opts.languages {
-            let Some(template) = case.utterances.get(lang) else {
-                out.safe.push(skipped(case, lang, "no utterance written in this language"));
-                continue;
             };
-            let said =
-                super::fixture::render(template, &target.device.name, target.area.as_deref());
-            if opts.dry_run {
-                let targets = if target.is_group() {
-                    format!("{} devices: {}", target.group.len(), target.group_names().join(", "))
-                } else {
-                    format!("device: {}", target.device.name)
-                };
-                println!(
-                    "  {:<34} {lang}  \"{said}\"\n      {targets}{}",
-                    case.id,
-                    target
-                        .bystander
-                        .as_ref()
-                        .map(|b| format!("   must not move: {}", b.name))
-                        .unwrap_or_default()
-                );
-                continue;
-            }
-            for _ in 0..opts.repeats.max(1) {
-                let (report, detail) =
-                    run_one(case, &target, &said, lang, driver, ep, opts).await?;
-                out.safe.push(report);
-                out.detail.push(detail);
+            match run_case(case, &target, driver, ep, opts).await? {
+                CaseRun::Scored { safe, detail } => {
+                    out.safe.extend(safe);
+                    out.detail.extend(detail);
+                    break;
+                }
+                // Nothing scored yet, so the rows from this attempt are
+                // dropped rather than mixed with the retry's: half the
+                // languages measured against one device and half against
+                // another is not a comparison.
+                CaseRun::Unaddressable(name) => {
+                    println!(
+                        "  {:<34} re-aiming: this home cannot act on `{name}` by name",
+                        case.id
+                    );
+                    unaddressable.insert(name.clone());
+                    if attempt == 2 {
+                        let why = format!("this home would not act on `{name}` by name");
+                        for lang in &opts.languages {
+                            out.safe.push(skipped(case, lang, &why));
+                        }
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// How one case ended: scored in every language, or stopped before it could
+/// be, by a device the house refuses to move.
+enum CaseRun {
+    Scored { safe: Vec<CaseReport>, detail: Vec<CaseDetail> },
+    Unaddressable(String),
+}
+
+/// One case, in every requested language, against one resolved target.
+async fn run_case(
+    case: &Case,
+    target: &Target,
+    driver: &TurnDriver,
+    ep: &McpEndpoint,
+    opts: &RunOptions,
+) -> Result<CaseRun> {
+    let mut safe = Vec::new();
+    let mut detail = Vec::new();
+    for lang in &opts.languages {
+        let Some(template) = case.utterances.get(lang) else {
+            safe.push(skipped(case, lang, "no utterance written in this language"));
+            continue;
+        };
+        let said = super::fixture::render(template, &target.device.name, target.area.as_deref());
+        if opts.dry_run {
+            let targets = if target.is_group() {
+                format!("{} devices: {}", target.group.len(), target.group_names().join(", "))
+            } else {
+                format!("device: {}", target.device.name)
+            };
+            println!(
+                "  {:<34} {lang}  \"{said}\"\n      {targets}{}",
+                case.id,
+                target
+                    .bystander
+                    .as_ref()
+                    .map(|b| format!("   must not move: {}", b.name))
+                    .unwrap_or_default()
+            );
+            continue;
+        }
+        for _ in 0..opts.repeats.max(1) {
+            match run_one(case, target, &said, lang, driver, ep, opts).await? {
+                Ran::Scored(report, one) => {
+                    safe.push(report);
+                    detail.push(*one);
+                }
+                Ran::Unaddressable(name) => return Ok(CaseRun::Unaddressable(name)),
+            }
+        }
+    }
+    Ok(CaseRun::Scored { safe, detail })
+}
+
+/// How one turn ended.
+enum Ran {
+    Scored(CaseReport, Box<CaseDetail>),
+    /// The staging call was refused, naming the device the house would not
+    /// move. Not a score: the model was never asked anything.
+    Unaddressable(String),
 }
 
 /// One case, in one language, once.
@@ -213,7 +284,7 @@ async fn run_one(
     driver: &TurnDriver,
     ep: &McpEndpoint,
     opts: &RunOptions,
-) -> Result<(CaseReport, CaseDetail)> {
+) -> Result<Ran> {
     let mut notes = Vec::new();
 
     // Stage. Without a known starting state, "turn off the lamp" against an
@@ -223,9 +294,16 @@ async fn run_one(
         // three lamps starts from a half-lit room, and "turn them on" would
         // then be scored against a state it was already partly in.
         for e in &target.group {
-            set_state(ep, e, want)
-                .await
-                .with_context(|| format!("could not stage {} before `{}`", e.name, case.id))?;
+            // A device the house will not switch on our behalf costs this one
+            // case, not the run. Aborting here threw away the eighty per cent
+            // of the suite that had nothing to do with the sulking device,
+            // after twenty minutes of talking to a model. The caller re-aims
+            // the case at another device instead; nothing is left half-changed
+            // that matters, because the end-of-run pass reads the house and
+            // puts back anything this attempt moved before it gave up.
+            if set_state(ep, e, want).await.is_err() {
+                return Ok(Ran::Unaddressable(e.name.clone()));
+            }
         }
         tokio::time::sleep(SETTLE).await;
     }
@@ -289,7 +367,7 @@ async fn run_one(
         skipped_because: None,
         ..report_bits
     };
-    Ok((report, detail))
+    Ok(Ran::Scored(report, Box::new(detail)))
 }
 
 /// Did the model open correctly?
@@ -297,12 +375,23 @@ async fn run_one(
 /// Scored on the **first** call only. The gap between this and the final
 /// outcome is the measured worth of the retry ladder, and collapsing the two
 /// into one number hides the thing the harness was built to see.
-fn score_routing(case: &Case, obs: &TurnObservation, notes: &mut Vec<String>) -> bool {
-    let Some(call) = obs.first_call() else { return case.expect_no_call };
-    if case.expect_no_call {
-        notes.push(format!("called `{}` when it should have asked or explained", call.name));
-        return false;
+fn score_routing(
+    case: &Case,
+    obs: &TurnObservation,
+    moved: Option<&str>,
+    notes: &mut Vec<String>,
+) -> bool {
+    // A request that must leave the house alone is judged on the house. A
+    // lookup is how a model answers a question about state, so making one is
+    // right and only a change is wrong.
+    if case.expect_no_change {
+        if let Some(what) = moved {
+            notes.push(format!("changed the {what} when it should have asked or explained"));
+            return false;
+        }
+        return true;
     }
+    let Some(call) = obs.first_call() else { return false };
 
     let name_ok = case.expect_tool.as_ref().is_none_or(|w| &call.name == w);
     if !name_ok {
@@ -344,14 +433,24 @@ fn score_outcome(
     target: &Target,
     obs: &TurnObservation,
     after: &House,
+    moved: Option<&str>,
     notes: &mut Vec<String>,
 ) -> bool {
-    // For a case that must not act, the right outcome is that nothing
-    // happened. Without this the model calls a tool, routing scores false,
+    // For a case that must leave the house alone, the right outcome is that
+    // nothing in it moved. Without this the model acts, routing scores false,
     // the outcome scores true by default, and the case is reported as having
     // *recovered* — the exact opposite of what it did.
-    if case.expect_no_call {
-        return obs.calls.is_empty();
+    //
+    // A house that moved while the model called nothing at all moved on its
+    // own: nothing here could have caused it, and blaming the model for the
+    // heating coming on would be measuring the house.
+    if case.expect_no_change {
+        let Some(what) = moved else { return true };
+        if obs.calls.is_empty() {
+            notes.push(format!("the {what} moved while nothing was called"));
+            return true;
+        }
+        return false;
     }
 
     // A level, when the case names one. Checked before the on/off test and
@@ -454,8 +553,12 @@ fn judge(
     lang: &str,
     notes: &mut Vec<String>,
 ) -> (Verdict, CaseReport) {
-    let routed_first_try = score_routing(case, obs, notes);
-    let outcome_correct = score_outcome(case, target, obs, after, notes);
+    // Whether this home is in the state it started in, for the cases whose
+    // whole assertion is that it should be. Read once and given to both
+    // scorers, so the tool call and the outcome cannot disagree about it.
+    let moved = case.expect_no_change.then(|| drift(before, after, &[])).flatten();
+    let routed_first_try = score_routing(case, obs, moved.as_deref(), notes);
+    let outcome_correct = score_outcome(case, target, obs, after, moved.as_deref(), notes);
 
     // Did anything else move? The room-command failure is invisible in the
     // tool call — asking for a whole room is a well-formed request that also
@@ -479,7 +582,11 @@ fn judge(
         .into_iter()
         .chain(target.bystander.as_ref().map(|b| b.name.as_str()))
         .collect();
-    let drifted = drift(before, after, &ignore);
+    // A case that had to leave the house alone, acted, and moved something has
+    // already been charged for it. Excusing the same change as drift here would
+    // downgrade the failure to "somebody else did it".
+    let blamed = moved.is_some() && !obs.calls.is_empty();
+    let drifted = (!blamed).then(|| drift(before, after, &ignore)).flatten();
     if let Some(what) = &drifted {
         notes.push(format!("{what} changed on its own during this case"));
     }
@@ -521,7 +628,7 @@ fn judge(
         notes.push(format!("replied in the wrong language (wanted {lang})"));
     }
 
-    let non_idempotent_retry = !case.retry_allowed && obs.retried();
+    let non_idempotent_retry = !case.retry_allowed && obs.doubled();
     if non_idempotent_retry {
         notes.push(
             "repeated a command that must never be repeated — asking twice for two degrees \
@@ -737,7 +844,7 @@ async fn restore_baseline(ep: &McpEndpoint, baseline: &House) -> Result<usize> {
     let mut failures = Vec::new();
 
     for was in &baseline.entities {
-        if !was.safe_to_target() {
+        if !baseline.targetable(was) {
             continue;
         }
         let Some(is) = now.get(&was.name) else { continue };
@@ -1012,7 +1119,7 @@ mod tests {
             id: "v".into(),
             class: Class::ToolChoice,
             requires: super::super::house::Requirement::Device { domain: "media_player".into() },
-            utterances: Default::default(),
+            utterances: BTreeMap::default(),
             precondition: None,
             expect_device: None,
             expect_level: Some(want),
@@ -1020,7 +1127,7 @@ mod tests {
             expect_tool: None,
             expect_args: None,
             forbid_args: Vec::new(),
-            expect_no_call: false,
+            expect_no_change: false,
             retry_allowed: true,
         }
     }
@@ -1078,5 +1185,70 @@ mod tests {
 
         let plain = House::parse("- names: Speaker\n  domain: media_player\n  state: playing\n");
         assert!(score_level(&volume_case(70), &target, &plain, &mut notes));
+    }
+
+    fn asked(calls: &[&str]) -> TurnObservation {
+        TurnObservation {
+            reply: "it is on".into(),
+            calls: calls
+                .iter()
+                .map(|n| super::super::turn::ObservedCall {
+                    name: (*n).to_string(),
+                    arguments: "{}".into(),
+                    outcome: None,
+                    failed: false,
+                })
+                .collect(),
+            elapsed: std::time::Duration::ZERO,
+            produced: true,
+            aborted: false,
+        }
+    }
+
+    /// Verbatim from a run: asked whether a lamp was on, the model looked it up
+    /// and answered correctly, and the harness failed it for making the lookup.
+    /// Reading the house to answer a question about the house is the right
+    /// behaviour, and only a change to the house is the wrong one.
+    #[test]
+    fn looking_something_up_is_not_acting_on_it() {
+        let mut case = volume_case(0);
+        case.expect_level = None;
+        case.expect_no_change = true;
+        let target = speaker_target();
+        let mut notes = Vec::new();
+        assert!(score_routing(&case, &asked(&["GetLiveContext"]), None, &mut notes));
+        assert!(score_outcome(
+            &case,
+            &target,
+            &asked(&["GetLiveContext"]),
+            &speaker_at(20),
+            None,
+            &mut notes
+        ));
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // Acting is still the failure this class exists to catch.
+        assert!(!score_routing(&case, &asked(&["HassTurnOn"]), Some("light"), &mut notes));
+        assert!(!score_outcome(
+            &case,
+            &target,
+            &asked(&["HassTurnOn"]),
+            &speaker_at(20),
+            Some("light"),
+            &mut notes
+        ));
+
+        // A house that moved while nothing was called moved on its own, and
+        // charging the model for the heating coming on measures the house.
+        let mut notes = Vec::new();
+        assert!(score_outcome(
+            &case,
+            &target,
+            &asked(&[]),
+            &speaker_at(20),
+            Some("climate"),
+            &mut notes
+        ));
+        assert!(notes[0].contains("on its own") || notes[0].contains("moved while"), "{notes:?}");
     }
 }

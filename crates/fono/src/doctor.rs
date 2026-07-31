@@ -525,7 +525,9 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
         {
             let head = fono_assistant::compose_head(
                 &crate::session::assistant_prompt_context(
-                    crate::actions::build(c, paths).as_ref().and_then(|a| a.hint.as_deref()),
+                    // Nobody is speaking during a health check, so no run is
+                    // attributed to anyone.
+                    crate::actions::build(c, paths, None).as_ref().and_then(|a| a.hint.as_deref()),
                 ),
                 None,
                 Some(&c.assistant.prompt_main),

@@ -272,7 +272,9 @@ fn assistant_head_and_descriptors(
     paths: Option<&Paths>,
     (backend, can_act): (&str, bool),
 ) -> (String, String, Vec<serde_json::Value>) {
-    let built = paths.and_then(|p| crate::actions::build(config, p));
+    // Warming a prompt is not a turn: nobody has spoken, so there is nobody to
+    // attribute a run to.
+    let built = paths.and_then(|p| crate::actions::build(config, p, None));
     let (actions, tools_note) = crate::actions::for_backend(built, can_act, backend);
     let context = assistant_prompt_context(tools_note.as_deref());
     let instructions = config.assistant.prompt_main.trim().to_string();
@@ -3421,7 +3423,10 @@ impl SessionOrchestrator {
         // data already on disk, so this costs no network — including the
         // room names, which have to be in hand *before* the prompt is
         // composed and so cannot be fetched now.
-        let actions = self.paths.as_ref().and_then(|p| crate::actions::build(&cfg, p));
+        let actions = self
+            .paths
+            .as_ref()
+            .and_then(|p| crate::actions::build(&cfg, p, assistant_speaker.as_deref()));
         // Not every backend can invoke them. One that cannot does not error —
         // it answers fluently, having ignored the tools, and promises to
         // switch the light on. So the tools are withheld and the model told.

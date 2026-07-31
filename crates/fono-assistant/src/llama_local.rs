@@ -18,8 +18,9 @@ use async_trait::async_trait;
 use fono_core::brain_tap::{decode_token_with_tap, BrainTap};
 use fono_core::llama_backend::{backend, shared_model, streaming_model_params};
 use fono_core::llama_gen::{
-    first_stop_marker, generation_sampler, generation_sampler_with_grammar, is_control_token,
-    safe_stream_end, turn_markers, warn_on_template_vocab_mismatch, TurnMarkers,
+    adopt_sampled_token, first_stop_marker, generation_sampler, generation_sampler_with_grammar,
+    is_control_token, ruled_out, safe_stream_end, sample_next, turn_markers,
+    warn_on_template_vocab_mismatch, TurnMarkers,
 };
 use fono_core::tool_grammar::trigger_patterns;
 use fono_core::turn_trace::{
@@ -1849,8 +1850,19 @@ where
     // (no-op unless the tap is installed AND a sink is listening).
     fono_core::brain_tap::publish_reply_begin(tap);
     for n_cur in (start_pos..).take(max_new_tokens.max(1) as usize) {
-        let token = next_token.take().unwrap_or_else(|| sampler.sample(ctx, sample_idx));
-        sampler.accept(token);
+        // `sample_next` leaves the accepting to llama.cpp, which does it inside
+        // the sample call. A token that came from somewhere else — the prompt
+        // cache samples the first one from the restored state — is the one the
+        // sampler has to be told about by hand. Doing both to the same token
+        // fed it twice and cost us the tool-call rails entirely; see
+        // `fono_core::llama_gen::sample_next`.
+        let token = match next_token.take() {
+            Some(first) => {
+                adopt_sampled_token(&mut sampler, first);
+                first
+            }
+            None => sample_next(&mut sampler, ctx, sample_idx),
+        };
         // Model-agnostic stop: any token this vocabulary tags as Control ends
         // the turn, however the marker is spelled (gemma-4-e2b ships `<turn|>`,
         // not `<end_of_turn>` — literal lookups were dead code; see
@@ -1958,6 +1970,16 @@ where
             _ => "off",
         };
         obj.insert("grammar".into(), state.into());
+        // Armed is not the same as effective, and the difference is not
+        // academic: for one whole measurement the rails were armed on every
+        // generation and held the model to nothing, because the sampler was
+        // being fed each token twice and never recognised the opener. So the
+        // trace also reports whether the constraint was still holding anything
+        // when the model stopped — false on a turn that wrote a command means
+        // the rails were bypassed, however green the setting looks.
+        if rails_armed {
+            obj.insert("rails_bit".into(), (ruled_out(model, &sampler) > 0).into());
+        }
     }
     gen_span.finish(gen_args);
     Ok(GenerationResult { text: out, elapsed_ms, tokens: decoded_tokens })
@@ -2333,43 +2355,53 @@ impl Assistant for LlamaLocalAssistant {
                 // Returns the raw text (which the next prompt must reproduce
                 // exactly, or the checkpoint saved moments ago cannot match),
                 // the part that was spoken, and the part held back.
-                let mut run_pass =
-                    |full: &str, prefix: &str, suffix: &str| -> Result<(String, String, String)> {
-                        let mut buf = String::new();
-                        let mut spoken = String::new();
-                        let mut header_done = false;
-                        let text = me.run_inference_with_prefix_cache(
-                            full,
-                            prefix,
-                            suffix,
-                            PromptStateCacheLayer::F8ChatPrefix,
-                            // Never pinned: this pass's prefix carries this
-                            // turn's own words, so pinning it would evict the
-                            // static head pin — the one entry every later
-                            // conversation depends on.
-                            GenParams { pin_prefix: false, ..gen_params.clone() },
-                            |delta| {
-                                buf.push_str(delta.trim_start_matches('\u{feff}'));
-                                if !header_done {
-                                    if local_tools::maybe_preamble(&buf) {
-                                        return Ok(true);
-                                    }
-                                    buf = local_tools::strip_preamble(&buf).to_string();
-                                    header_done = true;
-                                }
-                                let (speak, hold) = local_tools::split_speakable(&buf);
-                                let flush = speak.to_string();
-                                buf = hold.to_string();
-                                if flush.is_empty() {
+                //
+                // `written` is text the prompt already put in the model's mouth,
+                // and it is counted as generated: the buffer starts with it, so
+                // an opener written for the model still hides the command from
+                // the speaker, and the raw text still reproduces the whole reply
+                // for the next prompt. A pass that starts mid-sentence has no
+                // channel header to strip either.
+                let mut run_pass = |full: &str,
+                                    prefix: &str,
+                                    suffix: &str,
+                                    written: &str|
+                 -> Result<(String, String, String)> {
+                    let mut buf = written.to_string();
+                    let mut spoken = String::new();
+                    let mut header_done = !written.is_empty();
+                    let text = me.run_inference_with_prefix_cache(
+                        full,
+                        prefix,
+                        suffix,
+                        PromptStateCacheLayer::F8ChatPrefix,
+                        // Never pinned: this pass's prefix carries this turn's
+                        // own words, so pinning it would evict the static head
+                        // pin — the one entry every later conversation depends
+                        // on.
+                        GenParams { pin_prefix: false, ..gen_params.clone() },
+                        |delta| {
+                            buf.push_str(delta.trim_start_matches('\u{feff}'));
+                            if !header_done {
+                                if local_tools::maybe_preamble(&buf) {
                                     return Ok(true);
                                 }
-                                spoken.push_str(&flush);
-                                deltas_emitted = deltas_emitted.saturating_add(1);
-                                Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok())
-                            },
-                        )?;
-                        Ok((text, spoken, buf))
-                    };
+                                buf = local_tools::strip_preamble(&buf).to_string();
+                                header_done = true;
+                            }
+                            let (speak, hold) = local_tools::split_speakable(&buf);
+                            let flush = speak.to_string();
+                            buf = hold.to_string();
+                            if flush.is_empty() {
+                                return Ok(true);
+                            }
+                            spoken.push_str(&flush);
+                            deltas_emitted = deltas_emitted.saturating_add(1);
+                            Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok())
+                        },
+                    )?;
+                    Ok((format!("{written}{text}"), spoken, buf))
+                };
 
                 // Run the call, word the result, and — at most once, and only
                 // for a failure the executor judged safe to repeat — let the
@@ -2410,18 +2442,30 @@ impl Assistant for LlamaLocalAssistant {
                         &outcome.summary,
                         &model_name_owned,
                     );
+                    let may_retry = attempt == 0 && outcome.retryable;
+                    // The correction is written for the model, not asked of it.
+                    // Ending the prompt with the opener leaves it mid-command,
+                    // so the only way to continue is to write one — and the
+                    // rails arm on its first `{`, which is what makes the second
+                    // attempt land inside this house instead of repeating the
+                    // guess that just failed. The invitation this replaces was
+                    // declined every time: a small model reads "correct it and
+                    // call the tool once more; otherwise tell the user plainly
+                    // what went wrong" and picks the apology. Home Assistant had
+                    // already said the name was the problem.
+                    let written = if may_retry { local_tools::OPEN } else { "" };
+                    let full = format!("{cont}{written}");
                     let turn_prefix = format!("{base}{call_text}{closer}\n");
-                    let (cont_prefix, cont_suffix) = match cont.strip_prefix(turn_prefix.as_str()) {
+                    let (cont_prefix, cont_suffix) = match full.strip_prefix(turn_prefix.as_str()) {
                         Some(rest) if !rest.is_empty() => (turn_prefix, rest.to_string()),
                         // Belt and braces: an empty suffix would generate from
                         // nothing, so fall back to the old system-prefix split.
                         _ => (
                             cache_prefix.clone(),
-                            cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
+                            full.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
                         ),
                     };
-                    let may_retry = attempt == 0 && outcome.retryable;
-                    let (raw, spoken, held) = run_pass(&cont, &cont_prefix, &cont_suffix)?;
+                    let (raw, spoken, held) = run_pass(&full, &cont_prefix, &cont_suffix, written)?;
 
                     let parsed = local_tools::parse_call(&held);
                     let retry =
@@ -3114,6 +3158,118 @@ mod tests {
             "raw machinery leaked into speech: {spoken:?}"
         );
         println!("call: {:?}\nspoken: {spoken:?}", calls[0]);
+    }
+
+    /// Three places have to agree about how a command opens, and if any two of
+    /// them drift the mechanism fails *silently* — which is exactly how the
+    /// rails came to be switched on for a year while holding the model to
+    /// nothing. The prompt writes the opener for the model on a correction, the
+    /// rails watch for it to know when to start constraining, and the parser
+    /// looks for it to know a command was written at all. One string, checked
+    /// here, because none of the three fails loudly on its own.
+    #[test]
+    fn the_opener_written_for_the_model_is_the_one_the_rails_and_parser_watch_for() {
+        let opener = local_tools::OPEN;
+        let patterns = fono_core::tool_grammar::trigger_patterns();
+        assert!(
+            patterns.iter().any(|p| p.contains(opener)),
+            "no rail watches for {opener:?}; a correction would generate unconstrained: {patterns:?}"
+        );
+        // And the parser reads a command whose opener it did not see generated.
+        let written = format!(
+            "{opener}{{\"name\": \"HassTurnOn\", \"arguments\": {{\"area\": \"Office\"}}}}"
+        );
+        let (name, args) = local_tools::parse_call(&written).expect("the parser reads it back");
+        assert_eq!(name, "HassTurnOn");
+        assert!(args.contains("Office"), "{args}");
+    }
+
+    /// A command that failed must be corrected, not apologised for.
+    ///
+    /// The invitation this replaces was prose — "correct it and call the tool
+    /// once more; otherwise tell the user plainly what went wrong" — and a small
+    /// model took the second option every time, ending the turn with the lights
+    /// still off and the user having to say the whole thing again. So the opener
+    /// is now written for it: there is no prose branch to take. This is the only
+    /// way to check that, because what is being tested is what the model does
+    /// when it is left mid-sentence.
+    #[tokio::test]
+    #[ignore = "requires FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf"]
+    async fn a_failed_command_is_corrected_rather_than_apologised_for() {
+        use crate::traits::{ActionTools, ToolOutcome};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let model_path = std::env::var_os("FONO_TEST_ASSISTANT_GGUF")
+            .expect("set FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf");
+        let context = std::env::var("FONO_TEST_ASSISTANT_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let assistant = LlamaLocalAssistant::new(model_path, context);
+
+        let seen: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let actions = Arc::new(ActionTools {
+            descriptors: vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "HassTurnOn",
+                    "description": "Turns on lights or devices in an area of the home.",
+                    "parameters": {"type": "object", "properties": {"area": {"type": "string"}}}
+                }
+            })],
+            hint: Some("Rooms in this home: Kitchen, Office.".into()),
+            grammar: None,
+            execute: Arc::new(move |call: ToolCall| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    let mut log = recorder.lock().expect("poisoned");
+                    log.push(call);
+                    // The first go fails in a way that changed nothing and names
+                    // the problem, which is the shape a real server refuses in.
+                    if log.len() == 1 {
+                        ToolOutcome {
+                            summary: "No such area. Nothing was changed.".into(),
+                            failed: true,
+                            retryable: true,
+                        }
+                    } else {
+                        ToolOutcome::worked(
+                            "{\"success\": [{\"name\": \"Office light\"}], \"failed\": []}".into(),
+                        )
+                    }
+                })
+            }),
+        });
+
+        let ctx = AssistantContext {
+            system_prompt: "You are Fono, a terse voice assistant. Reply in one short sentence."
+                .into(),
+            actions: Some(actions),
+            ..AssistantContext::default()
+        };
+        let mut stream =
+            assistant.reply_stream("turn on the office light", &ctx).await.expect("stream");
+        let mut spoken = String::new();
+        while let Some(delta) = stream.next().await {
+            let delta = delta.expect("delta");
+            if delta.tool_event.is_none() {
+                spoken.push_str(&delta.text);
+            }
+        }
+
+        let calls = seen.lock().expect("poisoned").clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "a failure that changed nothing must be corrected, not spoken about: {calls:?} \
+             said {spoken:?}"
+        );
+        assert!(
+            !spoken.contains("<tool_call>") && !spoken.contains('{'),
+            "the correction leaked into speech: {spoken:?}"
+        );
     }
 
     #[test]

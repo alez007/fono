@@ -19,13 +19,19 @@
 //! degenerates into an infinite verbatim loop: once the model reproduces
 //! the (near-echo) input, the highest-probability continuation is to
 //! reproduce it AGAIN, so it never emits its end-of-turn token and runs
-//! to the token cap. llama.cpp's penalty sampler only sees tokens passed
-//! to `sampler.accept()`, and the backends accept ONLY generated tokens
-//! (prefill goes through `ctx.decode`), so the penalty discourages the
-//! model from repeating ITS OWN output without penalising faithful reuse
-//! of prompt content. A modest `repeat = 1.3` over the recent window
-//! breaks the loop while staying deterministic: greedy still picks the
-//! argmax of the penalised logits.
+//! to the token cap. llama.cpp's penalty sampler only sees tokens the
+//! sampler has *accepted*, and the backends decode prefill through
+//! `ctx.decode`, so only generated tokens are ever accepted — the penalty
+//! discourages the model from repeating ITS OWN output without penalising
+//! faithful reuse of prompt content. A modest `repeat = 1.3` over the
+//! recent window breaks the loop while staying deterministic: greedy still
+//! picks the argmax of the penalised logits.
+//!
+//! Accepting is llama.cpp's job, not the caller's — see [`sample_next`],
+//! which every decode loop must go through. Accepting a token that was
+//! just sampled feeds it to the sampler twice, and that is not a rounding
+//! error: it silently disarmed the tool-call rails for an entire
+//! measurement (see [`generation_sampler_with_grammar`]).
 //!
 //! **Stop predicate** ([`is_control_token`]): stop the moment the model
 //! samples ANY token tagged `LlamaTokenAttr::Control`, regardless of how
@@ -131,6 +137,70 @@ pub fn generation_sampler_with_grammar(
         LlamaSampler::greedy(),
     ]);
     (chain, true)
+}
+
+/// Sample the next token, leaving the sampler's state exactly as llama.cpp
+/// wants it.
+///
+/// **Every decode loop must go through this.** `llama_sampler_sample` accepts
+/// the token it returns before handing it back (`llama-sampler.cpp`, the
+/// `llama_sampler_accept(smpl, token)` immediately before its `return`), so a
+/// caller that also calls `accept()` feeds the sampler every token twice.
+///
+/// That looked harmless for a year, and it was not. What it cost:
+///
+/// * **The tool-call rails never engaged.** A lazy grammar decides when to
+///   start constraining by matching a pattern against the text it has been
+///   given. Fed twice, that text reads `<<tooltool__callcall>>{"{"`, which
+///   contains no opener anything would recognise, so the grammar sat waiting
+///   for a trigger that could not arrive. Two `bench-actions` runs came back
+///   byte-for-byte identical with the rails switched on and off, and a house
+///   full of traces recorded commands the grammar forbids — while the trace
+///   said `on`, because arming a sampler and it having any effect are two
+///   different facts.
+/// * **The repetition penalty saw half the history it was configured for**,
+///   each entry twice over.
+///
+/// A token that was sampled somewhere else — the prompt cache samples the
+/// first one from the restored state — is the one case a caller *must* hand
+/// over itself, with [`adopt_sampled_token`].
+pub fn sample_next(
+    sampler: &mut LlamaSampler,
+    ctx: &llama_cpp_2::context::LlamaContext<'_>,
+    idx: i32,
+) -> LlamaToken {
+    sampler.sample(ctx, idx)
+}
+
+/// Tell the sampler about a token it did not sample itself.
+///
+/// The counterpart to [`sample_next`], and the only correct use of `accept`
+/// in a decode loop: the prompt-cache path samples the first token from the
+/// restored state with its own sampler, and the generation sampler has to be
+/// told, or its penalty window and its grammar both start a token behind.
+pub fn adopt_sampled_token(sampler: &mut LlamaSampler, token: LlamaToken) {
+    sampler.accept(token);
+}
+
+/// How many of this vocabulary's tokens `sampler` is currently ruling out.
+///
+/// This is the only way to see a grammar working from outside llama.cpp: a
+/// rule being enforced shows up as `-inf` on everything it forbids. Zero means
+/// the sampler is not holding the model to anything right now — which, for a
+/// lazy grammar that has been fed a complete command, is a defect and not a
+/// state.
+///
+/// Costs one pass over the vocabulary, so it is for tests and for the one
+/// end-of-generation check that reports whether the rails ever bit.
+#[must_use]
+pub fn ruled_out(model: &LlamaModel, sampler: &LlamaSampler) -> usize {
+    let mut all = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(
+        (0..model.n_vocab())
+            .map(|i| llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i), 0.0, 0.0)),
+        false,
+    );
+    sampler.apply(&mut all);
+    all.data.iter().filter(|d| d.logit() == f32::NEG_INFINITY).count()
 }
 
 /// Compile-time proof that the two `llama-cpp-2` handle types really are bare
@@ -440,6 +510,8 @@ mod tests {
             available: true,
             enabled: true,
             user_touched: false,
+            runs: 0,
+            last_run: None,
         }];
         let mut slots = crate::tool_grammar::SlotValues::new();
         slots.set("area", vec!["Kitchen".into(), "Master bedroom".into()]);
@@ -483,6 +555,95 @@ mod tests {
         // Building it and freeing it is the whole test: a wrongly-built chain
         // aborts on drop rather than returning.
         drop(sampler);
+    }
+
+    /// The test every other grammar test here was standing in for: that the
+    /// rails, once armed, actually **stop** the room this house does not have.
+    ///
+    /// Everything before this proved construction — the symbol links, the text
+    /// parses, the pointer frees cleanly, every opener is accepted. None of it
+    /// proved a single token was ever masked, and a house full of traces then
+    /// recorded commands that the grammar forbids being written anyway, with
+    /// the trace saying `on`. Construction is not enforcement, and only this
+    /// shape of test can tell them apart.
+    ///
+    /// Two halves, and both matter. Before an opener, nothing at all is ruled
+    /// out — that is the lazy form keeping ordinary talking free. After one,
+    /// the vocabulary is cut down, and a room the caller never supplied cannot
+    /// be spelled while the one that was supplied can.
+    #[test]
+    #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
+    fn the_rails_refuse_a_room_this_house_does_not_have() {
+        let model = vocab_model();
+        let tools = [crate::tool_catalog::ToolRow {
+            source: "ha".into(),
+            name: "HassTurnOn".into(),
+            description: String::new(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "area": {"type": "string"}, "name": {"type": "string"} },
+            }),
+            schema_hash: String::new(),
+            capability: crate::tool_catalog::Capability::Safe,
+            verify_class: crate::tool_catalog::VerifyClass::None,
+            readback_tool: None,
+            available: true,
+            enabled: true,
+            user_touched: false,
+            runs: 0,
+            last_run: None,
+        }];
+        let mut slots = crate::tool_grammar::SlotValues::new();
+        slots.set("area", vec!["Kitchen".into()]);
+        let grammar = crate::tool_grammar::build(&tools, &slots).expect("a grammar");
+        let mut sampler =
+            grammar_sampler(&model, &grammar, &crate::tool_grammar::trigger_patterns())
+                .expect("llama.cpp took the grammar");
+
+        assert_eq!(
+            ruled_out(&model, &sampler),
+            0,
+            "before any opener a lazy grammar must leave every token available"
+        );
+
+        let opener = r#"<tool_call>{"name": "HassTurnOn", "arguments": {"area": ""#;
+        let written = model.str_to_token(opener, AddBos::Never).expect("tokenize the opener");
+        for token in &written {
+            adopt_sampled_token(&mut sampler, *token);
+        }
+
+        let after = ruled_out(&model, &sampler);
+        assert!(
+            after > 0,
+            "the rails were armed and then held the model to nothing: not one of \
+             {} tokens was ruled out after `{opener}`",
+            model.n_vocab()
+        );
+        // And the one room that was supplied is still reachable, so the model
+        // is being narrowed rather than cornered.
+        assert!(
+            after < model.n_vocab() as usize,
+            "every token was ruled out — the model has nothing left to write"
+        );
+
+        // The second half is the bug itself, pinned. Handing the same tokens
+        // over twice — which is what a decode loop does if it accepts a token
+        // `sample()` already accepted — leaves the opener unreadable and the
+        // rails waiting for a trigger that can never arrive. This is not a
+        // hypothetical: it is what shipped, and what made an entire A/B
+        // measurement come back byte-for-byte identical in both arms.
+        let mut doubled =
+            grammar_sampler(&model, &grammar, &crate::tool_grammar::trigger_patterns())
+                .expect("llama.cpp took the grammar");
+        for token in &written {
+            adopt_sampled_token(&mut doubled, *token);
+            adopt_sampled_token(&mut doubled, *token);
+        }
+        assert_eq!(
+            ruled_out(&model, &doubled),
+            0,
+            "a token handed over twice must be understood as the disarming mistake it is"
+        );
     }
 
     /// Every opener the reply parser will honour has to arm the rails.

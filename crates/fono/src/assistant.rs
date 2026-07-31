@@ -82,6 +82,11 @@ pub struct RecordedCall {
     /// before deciding whether to correct itself. `None` when the turn ended
     /// before a result arrived.
     pub outcome: Option<String>,
+    /// Whether the executor reported it as a failure. `false` until a result
+    /// arrives, and the one thing that says whether a repeat of this call could
+    /// have doubled an effect in the world: a call the server refused moved
+    /// nothing, so asking again is asking once.
+    pub failed: bool,
 }
 
 impl TurnRecord {
@@ -91,6 +96,7 @@ impl TurnRecord {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
             outcome: None,
+            failed: false,
         });
     }
 
@@ -101,9 +107,10 @@ impl TurnRecord {
     /// first unanswered call is the one this result belongs to. A backend
     /// that omits ids is a wire-format quirk, not a reason to lose the
     /// outcome.
-    fn answered(&mut self, summary: &str) {
+    fn answered(&mut self, summary: &str, failed: bool) {
         if let Some(c) = self.calls.iter_mut().find(|c| c.outcome.is_none()) {
             c.outcome = Some(summary.to_string());
+            c.failed = failed;
         }
     }
 }
@@ -1123,9 +1130,9 @@ pub async fn run_assistant_turn(
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, .. } => {
-                    s.log.record_tool_result(&summary, Some(provider));
-                    record.answered(&summary);
+                ToolEvent::Result { tool_call_id, summary, failed } => {
+                    s.log.record_tool_result(&summary, failed, Some(provider));
+                    record.answered(&summary, failed);
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -1410,9 +1417,9 @@ async fn drive_text_only_reply(
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, .. } => {
-                    s.log.record_tool_result(&summary, Some(provider));
-                    record.answered(&summary);
+                ToolEvent::Result { tool_call_id, summary, failed } => {
+                    s.log.record_tool_result(&summary, failed, Some(provider));
+                    record.answered(&summary, failed);
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -3220,7 +3227,7 @@ mod tests {
         };
         record.called(&call);
         history.push_assistant_tool_calls(String::new(), vec![call]);
-        record.answered("turned on 1 light");
+        record.answered("turned on 1 light", false);
         history.push_tool_result("local-1".into(), "turned on 1 light".into());
         record.reply = "Done.".into();
         history.push_assistant("Done.".into());
@@ -3246,9 +3253,9 @@ mod tests {
             arguments: "{}".into(),
         };
         record.called(&call("a", "HassLightSet"));
-        record.answered("no matching entity");
+        record.answered("no matching entity", true);
         record.called(&call("b", "HassTurnOn"));
-        record.answered("turned on 1 light");
+        record.answered("turned on 1 light", false);
 
         assert_eq!(record.calls[0].outcome.as_deref(), Some("no matching entity"));
         assert_eq!(record.calls[1].outcome.as_deref(), Some("turned on 1 light"));

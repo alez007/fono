@@ -4448,6 +4448,13 @@ fn set_secret_hook(
     })
 }
 
+/// How far back down the transcript to look for past tool invocations.
+///
+/// A tail, not the whole history: the page wants a few recent examples per
+/// tool, and scanning further would cost more the longer someone has been
+/// using Fono, which is exactly backwards.
+const RECENT_TOOL_USES: usize = 300;
+
 /// Tool-catalogue hooks (`/api/tools`).
 ///
 /// The store is reopened per call — the same cheap-SQLite-open pattern the
@@ -4469,21 +4476,9 @@ fn tool_catalog_hooks(
 
     let db = paths.tool_catalog_db();
     let cp = paths.config_file();
+    let conv_db = paths.conversations_db();
     let list_tools: fono_net::web_settings::ListToolsFn = Arc::new(move || {
         let cfg = Config::load(&cp).map_err(|e| format!("load config: {e}"))?;
-        let servers: Vec<serde_json::Value> = cfg
-            .assistant
-            .tools
-            .mcp
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "url": s.url,
-                    "auth_token_ref": s.auth_token_ref,
-                })
-            })
-            .collect();
         let store = ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
         // The config is the authority on which servers exist. Remove one and
         // its tools must go with it, otherwise the page lists tools from a
@@ -4496,12 +4491,55 @@ fn tool_catalog_hooks(
         if forgotten > 0 {
             info!(target: "fono::tools", forgotten, "forgot tools from removed servers");
         }
+        // When each server last actually answered, which is a different
+        // question from whether it is configured — and the one someone asks
+        // when a command has stopped working.
+        let seen: std::collections::HashMap<String, Option<i64>> = store
+            .sources()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.name, s.last_seen))
+            .collect();
+        let servers: Vec<serde_json::Value> = cfg
+            .assistant
+            .tools
+            .mcp
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "url": s.url,
+                    "auth_token_ref": s.auth_token_ref,
+                    "last_seen": seen.get(&s.name).copied().flatten(),
+                })
+            })
+            .collect();
         let tools = store.all_tools().map_err(|e| format!("list tools: {e}"))?;
-        Ok(serde_json::json!({
+        let mut out = serde_json::json!({
             "enabled": cfg.assistant.tools.enabled,
             "servers": servers,
             "tools": tools,
-        }))
+        });
+        // What has actually been asked of these tools, in the user's own
+        // words, read back out of the ordinary transcript. Opened read-only
+        // here and only when the user keeps conversations at all — this page
+        // must not be the thing that creates a history file for someone who
+        // has switched history off.
+        let uses = if cfg.conversations.enabled {
+            fono_core::conversations::ConversationStore::open(&conv_db)
+                .and_then(|c| c.recent_tool_uses(RECENT_TOOL_USES))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Folded in rather than nested so the page has one payload to reason
+        // about, and the settings summary and the page can never disagree.
+        if let (Some(dst), serde_json::Value::Object(extras)) =
+            (out.as_object_mut(), crate::actions::page_extras(&cfg, &store, &uses))
+        {
+            dst.extend(extras);
+        }
+        Ok(out)
     });
 
     let db = paths.tool_catalog_db();

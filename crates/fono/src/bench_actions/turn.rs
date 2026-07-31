@@ -67,6 +67,8 @@ pub struct ObservedCall {
     /// The executor's own prose verdict, which is also what the model read
     /// before deciding whether to try again.
     pub outcome: Option<String>,
+    /// Whether the executor called it a failure.
+    pub failed: bool,
 }
 
 impl TurnObservation {
@@ -79,11 +81,18 @@ impl TurnObservation {
         self.calls.first()
     }
 
-    /// True when the model called a tool more than once, which is the
-    /// signature of a recovery attempt.
+    /// True when a repeat could have doubled an effect in the world: the model
+    /// called again after a call that did something.
+    ///
+    /// A repeat after a refusal is not this. Asked to make the office two
+    /// degrees warmer, a model wrote the temperature against a device Home
+    /// Assistant could not find, was told so, and tried once more. Nothing
+    /// moved either time, and scoring that as four degrees would charge the
+    /// model for the one thing the retry ladder exists to do.
     #[must_use]
-    pub fn retried(&self) -> bool {
-        self.calls.len() > 1
+    pub fn doubled(&self) -> bool {
+        let all_but_last = self.calls.len().saturating_sub(1);
+        self.calls.iter().take(all_but_last).any(|c| !c.failed)
     }
 }
 
@@ -158,7 +167,10 @@ impl TurnDriver {
 
         // Built exactly as `session.rs` builds it for a spoken turn, including
         // the withhold-and-tell-the-model path for a backend that cannot act.
-        let actions = crate::actions::build(&self.config, &self.paths);
+        // No speaker was identified: a benchmark run is nobody's voice, and a
+        // run recorded against an enrolled name would put a person's name on
+        // a measurement they did not make.
+        let actions = crate::actions::build(&self.config, &self.paths, None);
         let (actions, tools_note) = crate::actions::for_backend(
             actions,
             self.assistant.can_run_actions(),
@@ -189,6 +201,10 @@ impl TurnDriver {
             screen_capture_fn: None,
             actions,
             active_window_context: None,
+            // There is no audio to trim, and correcting spellings would edit
+            // the very sentence the fixture is measuring.
+            trim_silence: false,
+            vocabulary: fono_core::correction::VocabularyTable::default(),
         };
 
         let notify = Arc::new(Notify::new());
@@ -216,7 +232,12 @@ impl TurnDriver {
             calls: record
                 .calls
                 .into_iter()
-                .map(|c| ObservedCall { name: c.name, arguments: c.arguments, outcome: c.outcome })
+                .map(|c| ObservedCall {
+                    name: c.name,
+                    arguments: c.arguments,
+                    outcome: c.outcome,
+                    failed: c.failed,
+                })
                 .collect(),
             elapsed,
             produced,
@@ -246,5 +267,41 @@ impl fono_stt::traits::SpeechToText for SilentStt {
     }
     fn name(&self) -> &'static str {
         "bench-no-stt"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(calls: &[bool]) -> TurnObservation {
+        TurnObservation {
+            reply: String::new(),
+            calls: calls
+                .iter()
+                .map(|failed| ObservedCall {
+                    name: "HassClimateSetTemperature".into(),
+                    arguments: "{}".into(),
+                    outcome: Some("…".into()),
+                    failed: *failed,
+                })
+                .collect(),
+            elapsed: std::time::Duration::ZERO,
+            produced: true,
+            aborted: false,
+        }
+    }
+
+    /// Only a repeat that could double something counts. Asked to make a room
+    /// two degrees warmer, a model whose first attempt the house refused tried
+    /// again and moved nothing twice — charging it four degrees for that would
+    /// punish the recovery the ladder exists to provide.
+    #[test]
+    fn a_repeat_after_a_refusal_cannot_double_anything() {
+        assert!(!turn(&[true, true]).doubled(), "neither attempt moved anything");
+        assert!(!turn(&[true]).doubled(), "one call is not a repeat");
+        assert!(!turn(&[]).doubled());
+        assert!(turn(&[false, false]).doubled(), "the first one landed, so the second doubled it");
+        assert!(!turn(&[true, false]).doubled(), "only the last one landed");
     }
 }

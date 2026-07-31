@@ -70,6 +70,15 @@ pub struct Args {
     /// leave them on the fifth.
     pub backend: Option<String>,
     pub model: Option<String>,
+    /// Hold the model to this home's own rooms and devices while it writes a
+    /// command, or leave it free — overriding the configured setting for this
+    /// run only.
+    ///
+    /// The whole value of the rails is the pair of numbers with and without
+    /// them, and getting that pair by editing the config file twice invites
+    /// the two runs to differ in some other way as well — or to leave the
+    /// setting on afterwards, exactly as `--backend` is careful not to.
+    pub grammar: Option<bool>,
     /// List every entity the house reports and stop.
     ///
     /// Needed to write a fixture that names a real device. The committed
@@ -98,6 +107,9 @@ pub async fn run(mut config: Config, paths: &Paths, args: &Args) -> Result<()> {
     }
     if let Some(m) = &args.model {
         set_model(&mut config, m);
+    }
+    if let Some(on) = args.grammar {
+        config.assistant.tools.grammar = on;
     }
     if !config.assistant.tools.enabled || config.assistant.tools.mcp.is_empty() {
         anyhow::bail!(
@@ -343,6 +355,11 @@ fn write_reports(dir: &Path, out: &RunOutcome, driver: &TurnDriver, config: &Con
     let summary = serde_json::json!({
         "backend": driver.backend_name(),
         "model": model_name(config),
+        // Which arm this is. A run scored without it is a number nobody can
+        // attribute later, and the whole point of the setting is the
+        // comparison — so it is recorded beside the model rather than left to
+        // be remembered.
+        "grammar": config.assistant.tools.grammar,
         "overall": runner::summarise(&out.safe),
         "by_language": runner::group_by(&out.safe, |r| r.language.clone()),
         "by_class": runner::group_by(&out.safe, |r| format!("{:?}", r.class)),

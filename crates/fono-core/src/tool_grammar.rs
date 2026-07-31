@@ -394,6 +394,8 @@ mod tests {
             available: true,
             enabled: true,
             user_touched: false,
+            runs: 0,
+            last_run: None,
         }
     }
 

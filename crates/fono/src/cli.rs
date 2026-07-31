@@ -234,6 +234,14 @@ pub enum Cmd {
         /// Use a different model, without changing your config.
         #[arg(long)]
         model: Option<String>,
+        /// Hold the model to this home's rooms and devices while it writes a
+        /// command (`on`), or leave it free (`off`), without changing your
+        /// config.
+        ///
+        /// Use this to measure what the rails are worth: the same fixtures,
+        /// once each way. Defaults to whatever your config says.
+        #[arg(long, value_parser = ["on", "off"])]
+        grammar: Option<String>,
         /// List every device the home reports, and stop.
         ///
         /// Use this to write a fixture that names one particular device.
@@ -893,6 +901,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             only,
             backend,
             model,
+            grammar,
             show_house,
             no_trace,
             out,
@@ -907,6 +916,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 only,
                 backend,
                 model,
+                grammar: grammar.map(|g| g == "on"),
                 show_house,
                 trace: !no_trace,
                 out,

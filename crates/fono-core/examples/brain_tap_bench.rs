@@ -33,7 +33,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use fono_core::brain_tap::{decode_token_with_tap, BrainTap, OVERHEAD_BUDGET};
 use fono_core::llama_backend::{backend, decode_threads, shared_model};
-use fono_core::llama_gen::generation_sampler;
+use fono_core::llama_gen::{generation_sampler, sample_next};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -79,8 +79,9 @@ fn run(model: &LlamaModel, tap: Option<&BrainTap>, arm: bool, n_tokens: u32) -> 
 
     let started = Instant::now();
     for (step, pos) in (0..n_tokens).zip(start_pos..) {
-        let token = sampler.sample(&ctx, sample_idx);
-        sampler.accept(token);
+        // llama.cpp accepts the token inside the sample call; see
+        // `fono_core::llama_gen::sample_next`.
+        let token = sample_next(&mut sampler, &ctx, sample_idx);
         single.clear();
         single.add(token, pos, &[0], true).context("decode batch.add")?;
         sample_idx = 0;

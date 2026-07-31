@@ -84,11 +84,19 @@ pub struct Case {
     /// because it was there.
     #[serde(default)]
     pub forbid_args: Vec<String>,
-    /// When true, no tool may be called at all: an ambiguous request, a
-    /// question about state, a request to explain something. Without cases
-    /// like these a benchmark rewards trigger-happiness.
+    /// When true, this request must leave the house exactly as it found it: an
+    /// ambiguous request, a question about state, a request to explain
+    /// something. Without cases like these a benchmark rewards
+    /// trigger-happiness.
+    ///
+    /// Judged on the house, not on the tool call. Answering *is the balcony
+    /// light on?* takes a lookup, and the harness used to fail the model for
+    /// making it — scoring correct behaviour as trigger-happiness. Which tools
+    /// only read is a thing no server here states: Home Assistant publishes no
+    /// annotations at all, so the only honest evidence is whether anything
+    /// moved.
     #[serde(default)]
-    pub expect_no_call: bool,
+    pub expect_no_change: bool,
     /// When false, a second call to the same tool is itself a failure — the
     /// relative-change case, where asking twice for two degrees warmer is
     /// four degrees.
@@ -120,7 +128,7 @@ pub enum Class {
     MisleadingName,
     /// A command that must never be repeated.
     NonIdempotent,
-    /// A request that must produce no tool call at all.
+    /// A request that must leave the house exactly as it found it.
     MustNotAct,
 }
 
@@ -311,7 +319,7 @@ mod tests {
                 // two would contradict each other and the case could never
                 // pass however the model behaved.
                 assert!(
-                    !(c.expect_no_call && c.expect_tool.is_some()),
+                    !(c.expect_no_change && c.expect_tool.is_some()),
                     "`{}` both forbids and requires a tool call",
                     c.id
                 );

@@ -21,7 +21,7 @@
 //!   no media player has nothing to say about media routing, and scoring it
 //!   zero would be a lie about the model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use fono_assistant::mcp_client::{self, McpEndpoint};
@@ -349,6 +349,50 @@ impl House {
             })
             .min_by_key(|e| e.name.len())
     }
+
+    /// Whether the server can be asked for this entity by name at all.
+    ///
+    /// Home Assistant refuses a name that two entities answer to rather than
+    /// picking one, and a real house has plenty: a `light` called `Couch` and
+    /// a `media_player` called `Couch` are one word to a person and an
+    /// impossible request to the server. Nobody — model, harness or user —
+    /// can command such a device by name, so a fixture aimed at one measures
+    /// the house rather than the model. Worse, it took the whole run down
+    /// with it: the *staging* step could not switch the device either.
+    #[must_use]
+    pub fn addressable(&self, e: &Entity) -> bool {
+        // One match is the entity itself; a second is a twin.
+        self.entities.iter().filter(|o| o.every_name().any(|n| loose_eq(n, &e.name))).count() <= 1
+    }
+
+    /// Whether a fixture may aim at this entity: safe to move *and* reachable
+    /// by name. The two questions are always asked together.
+    #[must_use]
+    pub fn targetable(&self, e: &Entity) -> bool {
+        e.safe_to_target() && self.addressable(e)
+    }
+
+    /// The same house with some devices taken out of consideration.
+    ///
+    /// Used when the server refuses to act on a device it nonetheless listed —
+    /// the run learns that the hard way, and re-resolves the fixture against
+    /// the house minus the offender rather than losing the case. Matching is
+    /// loose and covers aliases: the same physical device is out however the
+    /// requirement asks for it.
+    #[must_use]
+    pub fn without(&self, names: &BTreeSet<String>) -> Self {
+        if names.is_empty() {
+            return self.clone();
+        }
+        Self {
+            entities: self
+                .entities
+                .iter()
+                .filter(|e| !e.every_name().any(|n| names.iter().any(|d| loose_eq(n, d))))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// Split into lowercase alphanumeric words.
@@ -516,7 +560,7 @@ impl Requirement {
                 let device = house
                     .entities
                     .iter()
-                    .find(|e| &e.domain == domain && e.safe_to_target())
+                    .find(|e| &e.domain == domain && house.targetable(e))
                     .ok_or_else(|| Unsatisfied(format!("no {domain} in this home")))?;
                 Ok(Target::single(device.clone(), device.areas.first().cloned(), None))
             }
@@ -524,14 +568,14 @@ impl Requirement {
                 let device = house
                     .entities
                     .iter()
-                    .find(|e| &e.domain == domain && e.is_dimmable() && e.safe_to_target())
+                    .find(|e| &e.domain == domain && e.is_dimmable() && house.targetable(e))
                     .ok_or_else(|| Unsatisfied(format!("no dimmable {domain} in this home")))?;
                 Ok(Target::single(device.clone(), device.areas.first().cloned(), None))
             }
             Self::AreaWithBystander { domain } => {
                 for area in house.areas() {
                     let here: Vec<&Entity> =
-                        house.in_area(&area).filter(|e| e.safe_to_target()).collect();
+                        house.in_area(&area).filter(|e| house.targetable(e)).collect();
                     let Some(device) = here.iter().find(|e| &e.domain == domain) else {
                         continue;
                     };
@@ -563,7 +607,7 @@ impl Requirement {
                     // A named device that exists but is excluded is a mistake
                     // in the fixture, not a house without the device, and
                     // saying so plainly saves a confusing skip.
-                    .filter(|e| e.safe_to_target())
+                    .filter(|e| house.targetable(e))
                     .ok_or_else(|| {
                         Unsatisfied(format!(
                             "this home exposes no device matching `{name}` (try --show-house)"
@@ -581,7 +625,7 @@ impl Requirement {
                     .ok_or_else(|| Unsatisfied(format!("this home has no area `{area}`")))?;
                 let group: Vec<Entity> = house
                     .in_area(&real)
-                    .filter(|e| &e.domain == domain && e.safe_to_target())
+                    .filter(|e| &e.domain == domain && house.targetable(e))
                     .cloned()
                     .collect();
                 let device = group.first().cloned().ok_or_else(|| {
@@ -668,6 +712,58 @@ mod tests {
         assert!(!h.get("Office PIR").unwrap().safe_to_target());
         assert!(!h.get("Hall temp").unwrap().safe_to_target());
         assert!(!h.get("Ceiling lamp").is_some_and(Entity::is_reading));
+    }
+
+    /// A house where two entities answer to one word. The server refuses such
+    /// a name outright rather than choosing, so the fixture must pick the
+    /// other lamp — aiming at the twin measured the house, and took the run
+    /// down at the staging step before the model was even asked.
+    #[test]
+    fn a_name_two_devices_answer_to_is_never_targeted() {
+        let h = House::parse(
+            "- names: Couch\n  domain: light\n  state: 'off'\n  brightness: 40\n  areas: \
+             Living\n- names: Couch\n  domain: media_player\n  state: 'off'\n  areas: Living\n- \
+             names: Reading lamp\n  domain: light\n  state: 'off'\n  brightness: 90\n  areas: \
+             Living\n",
+        );
+        let couch = h.get("Couch").unwrap();
+        assert!(couch.safe_to_target(), "a lamp is safe in itself");
+        assert!(!h.addressable(couch), "but the server cannot be asked for it");
+        assert!(!h.targetable(couch));
+
+        // Every requirement routes around it, including the one that asks by
+        // name and the one that stages a whole room.
+        for req in [
+            Requirement::Device { domain: "light".into() },
+            Requirement::DimmableDevice { domain: "light".into() },
+            Requirement::NamedArea { area: "Living".into(), domain: "light".into() },
+        ] {
+            let t = req.resolve(&h).unwrap();
+            assert_eq!(t.device.name, "Reading lamp", "{req:?} picked an uncommandable device");
+            assert!(!t.group_names().contains(&"Couch"), "{req:?} staged an uncommandable device");
+        }
+        let err = Requirement::NamedDevice { name: "Couch".into() }.resolve(&h).unwrap_err();
+        assert!(err.0.contains("Couch"));
+    }
+
+    /// A device the house listed but then refused to act on is dropped from
+    /// consideration, aliases and all, so the same fixture re-resolves onto a
+    /// device that works rather than being lost.
+    #[test]
+    fn a_refused_device_is_taken_out_of_consideration() {
+        let h = House::parse(
+            "- names: Couch, Canapea\n  domain: light\n  state: 'off'\n  brightness: 40\n  areas: \
+             Living\n- names: Reading lamp\n  domain: light\n  state: 'off'\n  brightness: 90\n  \
+             areas: Living\n",
+        );
+        let req = Requirement::Device { domain: "light".into() };
+        assert_eq!(req.resolve(&h).unwrap().device.name, "Couch");
+
+        let refused = BTreeSet::from(["couch".to_string()]);
+        let usable = h.without(&refused);
+        assert_eq!(usable.entities.len(), 1, "the alias row is the same device, also out");
+        assert_eq!(req.resolve(&usable).unwrap().device.name, "Reading lamp");
+        assert_eq!(h.without(&BTreeSet::new()).entities.len(), 2);
     }
 
     /// The bystander is found without anyone naming it: the office has a lamp

@@ -125,17 +125,125 @@ pub struct DiscoveredTool {
 /// work out which kinds are present in this home, never interpreted. A
 /// server that does not report one leaves it empty, and Fono falls back to
 /// treating the device as being of no particular kind.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Device {
     pub name: String,
     pub domain: String,
+    /// How many times a command has actually reached this device. Zero for
+    /// everything in the home nothing has ever been asked to do, which is most
+    /// of it.
+    pub runs: i64,
+    /// When it was last reached, in Unix seconds.
+    pub last_run: Option<i64>,
+    /// Whether that last attempt landed. `None` until there has been one.
+    ///
+    /// This is per *device*, not per command: a single instruction naming a room
+    /// routinely switches five things and fails on the sixth, and only this
+    /// tells you which sixth.
+    pub last_ok: Option<bool>,
 }
 
 impl Device {
     /// Convenience for tests and for callers that only have a name.
     pub fn new(name: impl Into<String>, domain: impl Into<String>) -> Self {
-        Self { name: name.into(), domain: domain.into() }
+        Self { name: name.into(), domain: domain.into(), ..Self::default() }
     }
+}
+
+/// The one name of a device that a command may actually use.
+///
+/// A home records a device's alternative names on the same line, comma
+/// separated: one speaker in the home this was built against is called
+/// `Office display, Boxa birou` — an English name and a Romanian one. The whole
+/// line is kept, because a reply naming either has to be recognised as that
+/// speaker, but only the leading name is ever offered to the model. The joined
+/// string is a name the home itself refuses, so offering it hands the model a
+/// device it cannot operate and makes the failure look like the model's.
+pub fn primary_name(stored: &str) -> &str {
+    stored.split(',').next().unwrap_or(stored).trim()
+}
+
+/// One server the catalogue has heard from, and when it last answered.
+///
+/// `last_seen` is a Unix timestamp, absent only for a row written before the
+/// column existed. Kept separate from the configured server list because the
+/// two answer different questions: config says what the user asked for, this
+/// says what replied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceRow {
+    pub name: String,
+    pub transport: String,
+    pub last_seen: Option<i64>,
+}
+
+/// How a tool call turned out, as far as Fono is entitled to claim.
+///
+/// Deliberately not a boolean. A tool Fono cannot check afterwards
+/// ([`VerifyClass::None`]) can only ever be reported as [`Self::Sent`] — the
+/// request left, and nothing more is known. Collapsing that into "worked"
+/// would put a claim on the page that nothing supports, which is the failure
+/// this whole area keeps producing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// Checked afterwards, and the world is as the user asked.
+    Confirmed,
+    /// The server accepted it and reported no error.
+    Accepted,
+    /// The request went out; nothing about the result is knowable.
+    Sent,
+    /// It failed, or the check said the world did not change.
+    Failed,
+}
+
+impl RunOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Accepted => "accepted",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "confirmed" => Some(Self::Confirmed),
+            "accepted" => Some(Self::Accepted),
+            "sent" => Some(Self::Sent),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// The last time a tool actually ran, and how it went.
+///
+/// One row per tool rather than a full log: the questions this answers are
+/// "did this ever work, when, and for whom", and a growing history of every
+/// command anyone has ever spoken is a privacy cost with no matching use. The
+/// count is kept because "ran once" and "ran forty times" are different
+/// things to a reader, and because Fono needs it later to decide what may be
+/// replayed — but it is a counter, not a transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LastRun {
+    /// Unix seconds.
+    pub at: i64,
+    pub outcome: RunOutcome,
+    /// How long the call itself took, in milliseconds — the round trip to the
+    /// server plus whatever re-reading was needed to confirm it.
+    pub ms: i64,
+    /// How long the assistant spent deciding to make this call, in
+    /// milliseconds: from the moment the turn's tools were built (or the
+    /// previous call returned) to the moment this one was issued. Usually the
+    /// larger of the two, and the reason a command feels slow — so reporting
+    /// only `ms` reads as a boast rather than a measurement. `None` for runs
+    /// recorded before it was measured.
+    pub think_ms: Option<i64>,
+    /// The enrolled speaker Fono recognised, when it recognised one. `None`
+    /// means nobody was identified — not that nobody spoke.
+    pub speaker: Option<String>,
 }
 
 /// A stored tool, as the rest of Fono sees it.
@@ -156,6 +264,11 @@ pub struct ToolRow {
     /// The user has expressed an explicit preference, so defaults must not
     /// overwrite it.
     pub user_touched: bool,
+    /// How many times this has been run. Zero for everything discovered and
+    /// never used, which is most of a catalogue.
+    pub runs: i64,
+    /// The most recent run, absent until there has been one.
+    pub last_run: Option<LastRun>,
 }
 
 /// What one [`ToolCatalogStore::reconcile`] pass changed.
@@ -273,6 +386,30 @@ impl ToolCatalogStore {
         let _ = self
             .conn
             .execute("ALTER TABLE device_name ADD COLUMN domain TEXT NOT NULL DEFAULT ''", []);
+        // What has actually run, as opposed to what was merely offered. Added
+        // after the table shipped; same ignore-the-error reason as above.
+        // Deliberately five columns on the existing row rather than a history
+        // table: a log of every command anyone ever spoke is a standing
+        // privacy cost, and the questions being answered ("has this ever
+        // worked, when, for whom, how slow") need only the latest.
+        for col in [
+            "runs INTEGER NOT NULL DEFAULT 0",
+            "last_run INTEGER",
+            "last_outcome TEXT",
+            "last_ms INTEGER",
+            "last_speaker TEXT",
+            "last_think_ms INTEGER",
+        ] {
+            let _ = self.conn.execute(&format!("ALTER TABLE tool ADD COLUMN {col}"), []);
+        }
+        // The same three questions per *device*, which is the unit a person
+        // actually thinks in: "the office lamp never works" is a sentence
+        // people say, "HassTurnOn never works" is not. Same
+        // ignore-the-error reason as above, and the same deliberate absence of
+        // a history table.
+        for col in ["runs INTEGER NOT NULL DEFAULT 0", "last_run INTEGER", "last_ok INTEGER"] {
+            let _ = self.conn.execute(&format!("ALTER TABLE device_name ADD COLUMN {col}"), []);
+        }
         Ok(())
     }
 
@@ -513,12 +650,28 @@ impl ToolCatalogStore {
             return Ok(false);
         }
 
-        self.conn.execute("DELETE FROM device_name WHERE source_id = ?1", params![id])?;
+        // Updated in place, with only the names that actually vanished
+        // removed — deliberately not the delete-everything-and-reinsert this
+        // used to be. Each row now carries how many times that device has been
+        // operated, and discovery runs on every reconnect: wiping and rewriting
+        // the table would reset every device's history several times a day,
+        // which is the same as not keeping one.
         for (name, domain) in &after {
             self.conn.execute(
-                "INSERT OR IGNORE INTO device_name(source_id, name, domain) VALUES (?1, ?2, ?3)",
+                "INSERT INTO device_name(source_id, name, domain) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source_id, name) DO UPDATE SET domain = excluded.domain",
                 params![id, name, domain],
             )?;
+        }
+        let kept: std::collections::BTreeSet<&str> =
+            after.iter().map(|(n, _)| n.as_str()).collect();
+        for (name, _) in &before {
+            if !kept.contains(name.as_str()) {
+                self.conn.execute(
+                    "DELETE FROM device_name WHERE source_id = ?1 AND name = ?2",
+                    params![id, name],
+                )?;
+            }
         }
         Ok(before != after)
     }
@@ -573,15 +726,113 @@ impl ToolCatalogStore {
         Ok(before != after)
     }
 
+    /// Every device, with the kind of thing it is, across every source.
+    ///
+    /// [`Self::device_names`] is what the prompt needs; this is what a person
+    /// needs. Reading a list of names alone, a lamp filed under the wrong kind
+    /// looks exactly like a lamp filed correctly — and the kind is what
+    /// decides whether a room-wide command reaches it.
+    pub fn devices(&self) -> Result<Vec<Device>> {
+        // Grouped rather than `DISTINCT` because two servers can offer the same
+        // device, and the reader wants one row saying it has worked nine times —
+        // not two rows saying four and five. `MAX(last_run)` with a bare
+        // `last_ok` is SQLite's documented pick-from-the-max-row behaviour, so
+        // the outcome shown always belongs to the run whose time is shown.
+        let mut stmt = self.conn.prepare(
+            "SELECT name, domain, SUM(COALESCE(runs, 0)), MAX(last_run), last_ok
+             FROM device_name GROUP BY name, domain ORDER BY domain, name COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Device {
+                    // The name a command may use, never the joined alias list.
+                    name: primary_name(&r.get::<_, String>(0)?).to_owned(),
+                    domain: r.get(1)?,
+                    runs: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    last_run: r.get(3)?,
+                    last_ok: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Note that a command reached one thing in the home, and whether it landed.
+    ///
+    /// See [`primary_name`]: the stored name may carry aliases, so the target is
+    /// matched against every one of them.
+    ///
+    /// The name is whatever the server called it, so it is matched against the
+    /// devices already learned from that server — exactly, then against each
+    /// comma-separated alias, then ignoring case. An unmatched name is dropped:
+    /// a reply is evidence about the home, not a source of new devices, and
+    /// inventing a row from one would fill the list with things that do not
+    /// exist. Returns whether a device was found, for tests and traces.
+    pub fn record_device_run(&self, source: &str, target: &str, landed: bool) -> Result<bool> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Ok(false);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT d.name FROM device_name d JOIN tool_source s ON s.id = d.source_id
+             WHERE s.name = ?1",
+        )?;
+        let known = stmt
+            .query_map(params![source], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let matches =
+            |stored: &str| stored.split(',').any(|alias| alias.trim().eq_ignore_ascii_case(target));
+        let Some(stored) = known.iter().find(|n| matches(n)) else { return Ok(false) };
+
+        self.conn.execute(
+            "UPDATE device_name
+                SET runs = COALESCE(runs, 0) + 1, last_run = ?1, last_ok = ?2
+              WHERE name = ?3 AND source_id = (SELECT id FROM tool_source WHERE name = ?4)",
+            params![now_unix(), i64::from(landed), stored, source],
+        )?;
+        Ok(true)
+    }
+
+    /// Every server the catalogue holds tools from, and when it last answered.
+    ///
+    /// The config is the authority on which servers *exist*; this says which
+    /// ones have ever actually replied, which is a different question and the
+    /// one someone asks when a command stops working.
+    pub fn sources(&self) -> Result<Vec<SourceRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, transport, last_seen FROM tool_source ORDER BY name")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SourceRow { name: r.get(0)?, transport: r.get(1)?, last_seen: r.get(2)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Every device name across every source, sorted and de-duplicated.
     ///
     /// Sorted for the same reason as the places: these become part of a
     /// system prompt we want to stay byte-stable between turns.
+    /// Only the leading name of each device reaches this list — see
+    /// [`primary_name`] for why the rest are kept but never offered.
     pub fn device_names(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT name FROM device_name ORDER BY name COLLATE NOCASE")?;
-        let names = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        let mut names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .iter()
+            .map(|n| primary_name(n).to_owned())
+            .filter(|n| !n.is_empty())
+            .collect();
+        // Two devices can share a leading name once the aliases are dropped,
+        // and the same name twice in a prompt teaches nothing.
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
         Ok(names)
     }
 
@@ -600,7 +851,9 @@ impl ToolCatalogStore {
         let filter = if active_only { "WHERE t.enabled = 1 AND t.available = 1" } else { "" };
         let sql = format!(
             "SELECT s.name, t.name, t.schema_json, t.schema_hash, t.capability, t.verify_class,
-                    t.readback_tool, t.available, t.enabled, t.user_touched, t.description
+                    t.readback_tool, t.available, t.enabled, t.user_touched, t.description,
+                    t.runs, t.last_run, t.last_outcome, t.last_ms, t.last_speaker,
+                    t.last_think_ms
              FROM tool t JOIN tool_source s ON s.id = t.source_id
              {filter}
              ORDER BY s.name, t.name"
@@ -609,6 +862,22 @@ impl ToolCatalogStore {
         let rows = stmt
             .query_map([], |r| {
                 let schema_json: String = r.get(2)?;
+                // A run is only reported when both the time and the outcome
+                // are there. Half a record would be shown as a run that
+                // happened and cannot be described, which reads as a bug in
+                // the page rather than in the data.
+                let at: Option<i64> = r.get(12)?;
+                let outcome: Option<String> = r.get(13)?;
+                let last_run = match (at, outcome.as_deref().and_then(RunOutcome::parse)) {
+                    (Some(at), Some(outcome)) => Some(LastRun {
+                        at,
+                        outcome,
+                        ms: r.get::<_, Option<i64>>(14)?.unwrap_or(0),
+                        speaker: r.get::<_, Option<String>>(15)?.filter(|s| !s.is_empty()),
+                        think_ms: r.get::<_, Option<i64>>(16)?.filter(|&v| v > 0),
+                    }),
+                    _ => None,
+                };
                 Ok(ToolRow {
                     source: r.get(0)?,
                     name: r.get(1)?,
@@ -621,10 +890,43 @@ impl ToolCatalogStore {
                     enabled: r.get::<_, i64>(8)? != 0,
                     user_touched: r.get::<_, i64>(9)? != 0,
                     description: r.get(10)?,
+                    runs: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    last_run,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Note that a tool ran, and how it went.
+    ///
+    /// Called once per executed call. Overwrites the previous run and bumps
+    /// the counter; nothing accumulates, so this cannot grow the database with
+    /// use. Unknown `(source, name)` pairs are ignored rather than inserted —
+    /// a run belongs to a discovered tool, and inventing a catalogue row from
+    /// a call would let a typo masquerade as something the server offers.
+    ///
+    /// `speaker` is the enrolled name Fono recognised, when it recognised
+    /// one; `None` records that nobody was identified.
+    pub fn record_run(
+        &self,
+        source: &str,
+        name: &str,
+        outcome: RunOutcome,
+        ms: i64,
+        think_ms: Option<i64>,
+        speaker: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool
+                SET runs = COALESCE(runs, 0) + 1,
+                    last_run = ?1, last_outcome = ?2, last_ms = ?3, last_speaker = ?4,
+                    last_think_ms = ?5
+              WHERE name = ?6
+                AND source_id = (SELECT id FROM tool_source WHERE name = ?7)",
+            params![now_unix(), outcome.as_str(), ms, speaker, think_ms, name, source],
+        )?;
+        Ok(())
     }
 
     /// Canonical rendering of the active catalogue, for the model prompt.
@@ -944,6 +1246,27 @@ mod tests {
         assert_eq!(db.device_names().unwrap(), vec!["Attic lamp"]);
     }
 
+    /// A device with a second-language name is one device, and the name the
+    /// model is offered has to be one the home will match. `Office display,
+    /// Boxa birou` is one speaker in the home this was built against; offered
+    /// whole, the command is refused outright and the model takes the blame.
+    /// Either name still finds it — that half is
+    /// `a_device_remembers_how_often_it_worked_across_a_refresh`.
+    #[test]
+    fn a_device_with_two_names_is_offered_under_the_first_of_them() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+        let home = [
+            Device::new("Office display, Boxa birou", "media_player"),
+            Device::new("Bec", "light"),
+        ];
+        db.set_devices("ha", &home).unwrap();
+
+        assert_eq!(db.device_names().unwrap(), vec!["Bec", "Office display"]);
+        let listed: Vec<String> = db.devices().unwrap().into_iter().map(|d| d.name).collect();
+        assert_eq!(listed, vec!["Bec", "Office display"]);
+    }
+
     /// The refresh that runs at every startup has to say whether it found
     /// anything different, because that answer decides whether the warm prompt
     /// cache is thrown away. Getting it wrong either way is expensive: a false
@@ -1038,6 +1361,117 @@ mod tests {
 
         db.forget_sources_except(&[]).unwrap();
         assert!(db.device_domains().unwrap().is_empty());
+    }
+
+    /// What a person reading the page needs, which is not what the prompt
+    /// needs: the kind beside every device, and which servers have replied.
+    #[test]
+    fn the_page_can_see_the_house_and_who_reported_it() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+        db.set_devices(
+            "ha",
+            &[
+                Device::new("Living room blind", "cover"),
+                Device::new("Kitchen lights", "light"),
+                Device::new("Mystery gadget", ""),
+            ],
+        )
+        .unwrap();
+
+        // Grouped by kind, so a device filed under the wrong one stands out —
+        // and an unreported kind reads as blank rather than as a guess.
+        assert_eq!(
+            db.devices().unwrap(),
+            vec![
+                Device::new("Mystery gadget", ""),
+                Device::new("Living room blind", "cover"),
+                Device::new("Kitchen lights", "light"),
+            ]
+        );
+
+        let sources = db.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "ha");
+        assert_eq!(sources[0].transport, "sse");
+        assert!(sources[0].last_seen.unwrap_or(0) > 0, "a server that answered has a time");
+
+        // Removing the server takes both readings with it: the page must never
+        // show a house belonging to a server the user deleted.
+        db.forget_sources_except(&[]).unwrap();
+        assert!(db.devices().unwrap().is_empty());
+        assert!(db.sources().unwrap().is_empty());
+    }
+
+    /// "The office lamp never works" is a sentence people actually say, so the
+    /// count has to live on the device and survive the thing that happens most
+    /// often to it: another discovery pass.
+    #[test]
+    fn a_device_remembers_how_often_it_worked_across_a_refresh() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+        let home = [
+            Device::new("Office display, Boxa birou", "media_player"),
+            Device::new("Hall lamp", "light"),
+        ];
+        db.set_devices("ha", &home).unwrap();
+
+        assert!(db.record_device_run("ha", "Hall lamp", true).unwrap());
+        assert!(db.record_device_run("ha", "Hall lamp", false).unwrap());
+        // Home Assistant answers with whichever alias matched, and case is not
+        // reliable either — both have to find the one stored row.
+        assert!(db.record_device_run("ha", "boxa birou", true).unwrap());
+        // A name that is not in this home is dropped rather than added: a reply
+        // must not be able to invent a device.
+        assert!(!db.record_device_run("ha", "Ghost lamp", true).unwrap());
+        assert!(!db.record_device_run("ha", "  ", true).unwrap());
+
+        let by_name =
+            |name: &str| db.devices().unwrap().into_iter().find(|d| d.name == name).unwrap();
+        let lamp = by_name("Hall lamp");
+        assert_eq!(lamp.runs, 2);
+        assert_eq!(lamp.last_ok, Some(false), "the latest attempt is the one shown");
+        assert!(lamp.last_run.unwrap_or(0) > 0);
+        // Listed under its leading name, though the alias is what matched.
+        assert_eq!(by_name("Office display").runs, 1);
+        assert_eq!(db.devices().unwrap().iter().filter(|d| d.runs == 0).count(), 0);
+
+        // The load-bearing part. Discovery runs on every reconnect, several
+        // times a day; a history that resets then is a history nobody can use.
+        db.set_devices("ha", &home).unwrap();
+        assert_eq!(by_name("Hall lamp").runs, 2, "a refresh must not erase the count");
+        assert_eq!(by_name("Hall lamp").last_ok, Some(false));
+
+        // A device that genuinely leaves the home does go, along with its
+        // history — it is no longer something the page can honestly list.
+        db.set_devices("ha", &[Device::new("Hall lamp", "light")]).unwrap();
+        assert_eq!(db.devices().unwrap().len(), 1);
+        assert_eq!(by_name("Hall lamp").runs, 2);
+    }
+
+    /// Both clocks, not one. Reporting only the round trip to the server makes
+    /// Fono look several times faster than it feels, and hides the half of the
+    /// wait — the assistant choosing a command — that is usually the reason
+    /// anyone opened this page.
+    #[test]
+    fn a_run_records_how_long_the_thinking_took_as_well_as_the_call() {
+        let db = ToolCatalogStore::open_in_memory().unwrap();
+        db.reconcile("ha", "sse", &[light_on()]).unwrap();
+
+        db.record_run("ha", "HassTurnOn", RunOutcome::Confirmed, 401, Some(2870), Some("Bogdan"))
+            .unwrap();
+        let row = db.active_tools().unwrap().pop().unwrap();
+        let last = row.last_run.clone().expect("the run is remembered");
+        assert_eq!(last.ms, 401, "the call itself");
+        assert_eq!(last.think_ms, Some(2870), "and what it cost to decide on it");
+        assert_eq!(last.speaker.as_deref(), Some("Bogdan"));
+        assert_eq!(row.runs, 1);
+
+        // A run recorded before the second clock existed has no figure for it,
+        // and a page printing "0 ms to decide" would be stating something
+        // untrue rather than admitting it does not know.
+        db.conn.execute("UPDATE tool SET last_think_ms = NULL", []).unwrap();
+        assert_eq!(db.active_tools().unwrap()[0].last_run.as_ref().unwrap().think_ms, None);
     }
 
     #[test]
