@@ -405,7 +405,7 @@ sets `enabled = true` for you.
 ```toml
 [assistant.tools]
 enabled = true              # off by default; offers no tools to the model
-place_names = true          # tell the model the real room names (see below)
+place_names = true          # tell the model your areas, devices and the rules (see below)
 
 [[assistant.tools.mcp]]
 name = "Home Assistant"     # also names the token: HOME_ASSISTANT_TOKEN
@@ -425,30 +425,63 @@ restarting, and a shorter list is both faster and more accurate — the
 model picks the wrong device less often when it is not sifting dozens of
 irrelevant ones. Removing a server forgets its tools entirely.
 
-`place_names` tells the assistant what the rooms are actually called.
-Without it the model invents a name: asked in Romanian it sends
-`bucătărie` to a house whose areas are all English, Home Assistant
-matches nothing, and the lights do not move. The list costs roughly
-thirty tokens and is fetched when a server is connected, never while you
-are waiting for a command. It also picks up any alternative names you
-have given a room. Leave it on unless you are measuring the difference —
-switching it off breaks commands in any language your rooms are not
-named in. It is deliberately file-only, with no checkbox in the web UI.
+`place_names` tells the assistant what your home is actually called.
+Despite the name it sends three things: the area names, the device names
+when there are fewer than two hundred of them, and a short list of rules
+for acting on a home. Without it the model invents a name: asked in
+Romanian it sends `bucătărie` to a house whose areas are all English,
+Home Assistant matches nothing, and the lights do not move.
 
-**Not every assistant backend can act.** Only the OpenAI-compatible
-chat backends (`openai`, `network`, and anything else speaking that wire
-format) can invoke tools today; the embedded local model and the
-Anthropic backend cannot. Rather than let a backend that cannot act
-reply "I'll turn the light on" while nothing happens, Fono withholds the
-tools from it and tells the model plainly that it is unable to act, so
-it says so. Switch `[assistant] backend` to an OpenAI-compatible one to
-control devices.
+It is not cheap. On a home with ~70 devices it costs about 700 tokens,
+roughly 400 of them the device list. The list is read when a server is
+connected. It also picks up any alternative names you have given an area.
+
+Leave it on. The one reason to switch it off: with a **cloud** assistant
+backend, the names of every area and device in your home are sent to
+that service on every command. Nothing else sends them — never the
+speech recogniser (see [privacy](privacy.md)) — and with a local model
+they never leave the machine. Switching it off costs you commands in any
+language your areas are not named in. It is deliberately file-only, with
+no checkbox in the web UI.
+
+**Not every assistant backend can act.** The embedded local model and
+the OpenAI-compatible chat backends (`openai`, `network`, and anything
+else speaking that wire format) can invoke tools; the Anthropic backend
+cannot. Rather than let a backend that cannot act reply "I'll turn the
+light on" while nothing happens, Fono withholds the tools from it and
+tells the model plainly that it is unable to act, so it says so.
 
 > Fono only claims an action is **done** when it can check. Home
 > Assistant answers cheerfully even when a command matched nothing, so
 > Fono reads what was actually switched; a command that touched nothing
 > is reported as not having worked. For a tool whose effect cannot be
 > observed — sending a message, say — it says only that it was *sent*.
+
+**Commands you repeat stop waiting for the model.** Fono remembers the
+words and what they did. A run counts as good if nothing reported an
+error and you did not come back about the same thing within half a
+minute — an unobeyed user repeats themselves at once, so coming straight
+back reads as a complaint. After two good runs the same words run the
+command directly, in milliseconds instead of seconds. One bad run sends
+the phrase back to the model: two runs to earn the shortcut, one to lose
+it, because a wrong replay moves something real. Words are matched
+exactly, ignoring case and punctuation. Anything asking for an *amount*
+— "two degrees warmer" — is never learned, since running it twice is
+four degrees; naming a thing and the state it should end in is safe to
+repeat. Tools marked dangerous never earn it.
+
+**Settings → Tools & actions** lists what has been learned under
+**Things you can say**, with how often each ran and how long the
+shortcut takes. Every wording of one command sits together: the words
+Fono heard work, with any wordings you added indented beneath. The `+`
+on a row adds another wording, which runs straight away because the
+command under it is the one already proved; `{ }` shows exactly what the
+row sends; `×` forgets the row, and forgetting the heard one takes its
+other wordings with it. No command can be typed in from scratch: the
+mapping from words to command is only ever won by working twice. Switch
+a tool off and its phrases show as paused until it returns; change a
+server so a command no longer looks the way it did, and its phrases ask
+the model again until they have proved themselves afresh.
 
 ### MCP voice-tool relevance filter
 

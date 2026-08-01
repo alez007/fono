@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Platform-neutral tray menu model. Phase 7 Task 7.2 of
-//! `plans/2026-07-03-macos-port-v1.md`.
+//! Platform-neutral tray menu model.
 //!
 //! The menu *content* — every label, submenu, checkmark, active-marker
 //! and conditional row — is built exactly once, here, as a declarative

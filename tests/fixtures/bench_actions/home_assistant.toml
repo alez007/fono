@@ -3,7 +3,7 @@
 # Spoken commands against a real home.
 #
 # No device is named anywhere in this file, and none ever should be. Each case
-# states what it needs — "any light", "a room with a light and something else
+# states what it needs — "any light", "an area with a light and something else
 # switchable in it" — and the name is filled in from whatever home the suite is
 # pointed at. That is what makes this file safe to commit, and it is also what
 # makes it somebody else's benchmark rather than one person's script: clone the
@@ -48,21 +48,21 @@ fr = "éteins {device}"
 es = "apaga {device}"
 
 # ---------------------------------------------------------------------------
-# The room command, and the reason this harness watches the house rather than
+# The area command, and the reason this harness watches the house rather than
 # the tool call.
 #
-# Asked in Romanian to turn on *the light* in a room, a model asked for the
-# whole room instead. That is a perfectly well-formed call — a room-wide
+# Asked in Romanian to turn on *the light* in an area, a model asked for the
+# whole area instead. That is a perfectly well-formed call — an area-wide
 # switch-on is a real thing to want — and inspecting it finds nothing wrong.
 # What was wrong only showed up in the house: the air conditioning came on.
 #
 # So this case is scored twice over. The call must carry the kind of device
-# that was asked for, and the other switchable thing in that room must still be
+# that was asked for, and the other switchable thing in that area must still be
 # where it was. The second assertion is the one that catches it.
 # ---------------------------------------------------------------------------
 [[cases]]
-id = "room_command_names_the_kind_of_device"
-class = "room_command"
+id = "area_command_names_the_kind_of_device"
+class = "area_command"
 requires = { kind = "area_with_bystander", domain = "light" }
 expect_device = "on"
 expect_bystander_unchanged = true
@@ -125,7 +125,7 @@ es = "pon {device} al treinta por ciento"
 # asking twice for two degrees warmer is four degrees warmer. A second call is
 # the failure, whatever the server said about the first.
 #
-# The device is named rather than the room, because a thermostat is not
+# The device is named rather than the area, because a thermostat is not
 # guaranteed to be filed under an area and a command addressed to nowhere
 # would fail for a reason that has nothing to do with repetition.
 # ---------------------------------------------------------------------------

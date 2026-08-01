@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Criterion bench — measures the overhead of the bench runner itself
-//! (and, by proxy once the orchestrator from
-//! `docs/plans/2026-04-25-fono-pipeline-wiring-v1.md` lands, the
-//! production pipeline overhead) against a fake STT/LLM pair.
+//! (and, by proxy, the production pipeline overhead) against a fake
+//! STT/LLM pair.
 //!
-//! This is the network-free, deterministic CI gate referenced as Task
-//! L27 in `docs/plans/2026-04-25-fono-latency-v1.md`. Budget:
-//! orchestrator overhead + injection + history write < 50 ms p95 over
-//! the sum of fake STT/LLM latencies.
+//! This is the network-free, deterministic CI gate for the latency
+//! budget: orchestrator overhead + injection + history write < 50 ms
+//! p95 over the sum of fake STT/LLM latencies.
 
 use std::sync::Arc;
 use std::time::Duration;

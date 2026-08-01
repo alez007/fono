@@ -2,7 +2,7 @@
 //! One benchmark utterance, taken through the production assistant turn.
 //!
 //! The whole point of this module is how little it does. Everything that
-//! decides whether a command works — the prompt composition, the room hint,
+//! decides whether a command works — the prompt composition, the area hint,
 //! the blank-argument trimming, the schema check, the retry ladder, the vendor
 //! admission rungs, the readback — belongs to
 //! [`crate::assistant::run_assistant_turn`] and to [`crate::actions`], and none
@@ -151,10 +151,12 @@ impl TurnDriver {
 
     /// Run one utterance through the production turn and observe the result.
     ///
-    /// `language` is what the user's configuration would have supplied; the
-    /// utterance's own language is not declared to the model, because guessing
-    /// it is part of what is being measured.
-    pub async fn run(&self, utterance: &str) -> Result<TurnObservation> {
+    /// The utterance's language is declared to the model, because production
+    /// declares it: the recogniser's own verdict reaches `AssistantContext`
+    /// (see `run_assistant_turn`), and it is the configured override only when
+    /// the user has pinned one. Withholding it here scored a correct Romanian
+    /// command as a failure for answering in English.
+    pub async fn run(&self, utterance: &str, language: &str) -> Result<TurnObservation> {
         // A fresh history per utterance. Fixtures are independent by
         // construction, and carrying context between them would make the
         // score depend on fixture order.
@@ -170,7 +172,11 @@ impl TurnDriver {
         // No speaker was identified: a benchmark run is nobody's voice, and a
         // run recorded against an enrolled name would put a person's name on
         // a measurement they did not make.
-        let actions = crate::actions::build(&self.config, &self.paths, None);
+        // Nothing is learned from a benchmark run, and nothing may be replayed
+        // into one. A remembered phrase would answer the next case without
+        // asking the model at all, which is precisely the thing being measured.
+        let learning = crate::actions::Learning::none();
+        let actions = crate::actions::build(&self.config, &self.paths, None, &learning);
         let (actions, tools_note) = crate::actions::for_backend(
             actions,
             self.assistant.can_run_actions(),
@@ -179,6 +185,7 @@ impl TurnDriver {
         let system_prompt = crate::session::assistant_prompt_context(tools_note.as_deref());
 
         let inputs = AssistantTurnInputs {
+            learning,
             // No microphone. The pump's `pre_transcribed` branch skips STT
             // entirely, so an empty buffer is never read.
             pcm: Vec::new(),
@@ -193,7 +200,7 @@ impl TurnDriver {
             // Speaker verification has no meaning without audio.
             speaker_note: None,
             speaker: None,
-            language: self.config.general.language_override().map(str::to_string),
+            language: Some(language.to_string()),
             action_tx: self.action_tx.clone(),
             overlay: None,
             pre_transcribed: Some(utterance.to_string()),
@@ -292,7 +299,7 @@ mod tests {
         }
     }
 
-    /// Only a repeat that could double something counts. Asked to make a room
+    /// Only a repeat that could double something counts. Asked to make an area
     /// two degrees warmer, a model whose first attempt the house refused tried
     /// again and moved nothing twice — charging it four degrees for that would
     /// punish the recovery the ladder exists to provide.

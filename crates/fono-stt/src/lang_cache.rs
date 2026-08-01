@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! In-memory per-backend language cache.
 //!
-//! Plan v3 (`plans/2026-04-28-multi-language-stt-no-primary-v3.md`)
-//! task 2. The cache records the most recently observed
+//! The cache records the most recently observed
 //! correctly-detected language code per cloud STT backend and is
 //! consulted **only as a rerun target** when post-validation fires.
 //! No persistence, no file I/O — daemon restarts rebuild within one
-//! or two utterances. OS-locale bootstrap (task 3) seeds the cache at
+//! or two utterances. An OS-locale bootstrap seeds the cache at
 //! daemon start when the detected locale is in the configured
 //! allow-list.
 //!

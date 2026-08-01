@@ -17,7 +17,7 @@
 
 use crate::envelope::{rms_to_dbfs, EnvelopeSnapshot};
 
-/// Default parameters per `plans/2026-05-22-fono-auto-stop-silence-v1.md`.
+/// Minimum duration of voiced frames required to arm the watch.
 pub const DEFAULT_SPEECH_CONFIRM_ARM_MS: u32 = 100;
 /// Minimum duration of voiced frames required to leave `Pondering`
 /// back to `Speaking`. Without this, a single noisy frame (breath,
@@ -76,9 +76,9 @@ pub enum SilenceState {
     /// current silence is shorter than `pondering_visual_ms`).
     Speaking,
     /// Silence has persisted long enough to be considered "pondering".
-    /// Slice 4 will fire auto-stop after a further
-    /// `auto_stop_silence_ms - pondering_visual_ms`; slice 2 only
-    /// drives the label.
+    /// When `auto_stop_silence_ms` is set, staying here for a further
+    /// `auto_stop_silence_ms - pondering_visual_ms` fires
+    /// [`SilenceEvent::Committed`]; otherwise this only drives the label.
     Pondering,
 }
 

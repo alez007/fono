@@ -6,16 +6,15 @@
 //! conversations, prompt-TTS echo that AEC didn't cancel) so the
 //! listen loop keeps waiting instead of returning noise to the agent.
 //!
-//! Stage 1 — **heuristic** (Slice 3 of plan v7) — always runs when
-//! the filter is enabled. Cheap on-device checks: empty transcripts,
-//! filler-only utterances, and prompt-echo via Jaro-Winkler
-//! similarity. No network calls; safe to run on every utterance.
+//! Stage 1 — **heuristic** — always runs when the filter is enabled.
+//! Cheap on-device checks: empty transcripts, filler-only utterances,
+//! and prompt-echo via Jaro-Winkler similarity. No network calls; safe
+//! to run on every utterance.
 //!
-//! Stage 2 — **LLM classifier** (Slice 4 of plan v7, separate module
-//! extension) — opt-in via `[mcp].relevance_filter = "llm"`. Reuses
-//! the configured polish backend. Bounded by a hardcoded 1.5 s
-//! timeout (see Slice 4) and fails open on timeout / error so the
-//! agent never hangs on a slow classifier.
+//! Stage 2 — **LLM classifier** — opt-in via
+//! `[mcp].relevance_filter = "llm"`. Reuses the configured polish
+//! backend. Bounded by a hardcoded 1.5 s timeout and fails open on
+//! timeout / error so the agent never hangs on a slow classifier.
 //!
 //! ## Privacy
 //!
@@ -32,8 +31,8 @@ use tracing::debug;
 use crate::voice_io;
 
 /// Outcome of a single relevance evaluation. The accompanying
-/// `IgnoreReason` lets the overlay paint a discriminable label
-/// (Slice 5) and the agent surface a debug signal.
+/// `IgnoreReason` lets the overlay paint a discriminable label and the
+/// agent surface a debug signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelevanceVerdict {
     /// The transcript is plausibly a direct answer to the agent's
@@ -58,7 +57,7 @@ pub enum IgnoreReason {
     /// (Jaro-Winkler ≥ `ECHO_THRESHOLD`). AEC didn't fully cancel
     /// the TTS playback.
     PromptEcho,
-    /// LLM classifier returned `BACKGROUND`. Slice 4.
+    /// LLM classifier returned `BACKGROUND`.
     Background,
 }
 

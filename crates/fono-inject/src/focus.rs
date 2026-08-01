@@ -10,7 +10,7 @@ pub struct FocusInfo {
     /// PID of the focused window's owning process, when available.
     /// Populated on X11 via `_NET_WM_PID`, on sway via the tree JSON `pid`
     /// field, and on Hyprland via `hyprctl activewindow -j`. Reserved for
-    /// Phase C `/proc` terminal deep-enrichment — not yet consumed.
+    /// `/proc` terminal deep-enrichment — not yet consumed.
     pub window_pid: Option<u32>,
 }
 
@@ -34,7 +34,7 @@ pub struct FocusInfo {
 /// `GetWindowThreadProcessId` + `QueryFullProcessImageNameW` for the
 /// owning process, whose bare executable name (e.g. `chrome.exe`,
 /// `Code.exe`, `WindowsTerminal.exe`) is returned as `window_class` so
-/// the classifier's Windows rules match (Windows port plan Phase 9).
+/// the classifier's Windows rules match.
 /// Over a non-interactive session (e.g. headless SSH) there is no
 /// foreground window and the probe degrades to an empty `FocusInfo`.
 ///
@@ -198,7 +198,7 @@ fn macos_focus() -> FocusInfo {
 /// Gated on `target_os = "linux"` — not merely `not(macos)` — because
 /// `sway_focus` speaks the i3 IPC protocol over a Unix-domain socket
 /// and the whole cascade probes Linux display-server environments
-/// that carry no signal elsewhere (Windows port plan Task 1.3).
+/// that carry no signal elsewhere.
 #[cfg(target_os = "linux")]
 fn detect_focus_linux_desktop() -> FocusInfo {
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
@@ -598,7 +598,7 @@ fn x11_focus() -> Result<FocusInfo> {
         Some(String::from_utf8_lossy(&title_reply.value).into_owned())
     };
 
-    // Read _NET_WM_PID for Phase C terminal deep-enrichment.
+    // Read _NET_WM_PID for terminal deep-enrichment.
     let pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
     let pid_reply =
         conn.get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)?.reply()?;

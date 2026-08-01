@@ -70,8 +70,7 @@ const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// to serialise the entire database into one response.
 const MAX_HISTORY_LIMIT: usize = 500;
 
-/// Embedded page assets. Design source: the 2026-07-02 search-first
-/// accordion handoff (see `plans/2026-07-02-web-config-ui-v2.md`).
+/// Embedded page assets for the search-first accordion layout.
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const APP_JS: &str = include_str!("assets/app.js");
@@ -191,8 +190,8 @@ pub type DeleteUtteranceFn = Arc<dyn Fn(i64, i64) -> std::result::Result<(), Str
 /// `{"servers": [{name, url, configured, last_seen}, …], "tools": [{source,
 /// name, description, schema, enabled, available, capability, verify_class,
 /// …}, …]}`, plus what the Tools &amp; actions page needs to explain them:
-/// `house` (the rooms, devices and kinds the servers reported), `slots`
-/// (which published field carries a room, a device and a kind, or nulls for a
+/// `house` (the areas, devices and kinds the servers reported), `slots`
+/// (which published field carries an area, a device and a kind, or nulls for a
 /// server Fono has no specific knowledge of), `hint` (the literal sentences
 /// the model is given about the home), `grammar`, `place_names`,
 /// `catalogue_hash` and `offered`.
@@ -220,6 +219,18 @@ pub type DiscoverToolsFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Change one of the phrases Fono has learned. `(phrase, also)`.
+///
+/// Two edits only, because they are the two that cannot lie: `Some(also)` adds
+/// another way of saying what `phrase` already runs (`POST /api/shortcuts`), and
+/// `None` forgets `phrase` outright (`DELETE /api/shortcuts?phrase=…`).
+///
+/// Rewriting which command a phrase runs is deliberately not offered — that
+/// mapping is earned by working twice, and letting it be typed in would make the
+/// earning decorative. An added phrase starts unpromoted like any other.
+pub type EditShortcutFn =
+    Arc<dyn Fn(&str, Option<&str>) -> std::result::Result<(), String> + Send + Sync>;
 
 /// Probe a self-hosted OpenAI-compatible LLM server (`POST
 /// /api/llm/probe`). The body carries `{url, api_key_ref?}`; the daemon
@@ -300,6 +311,8 @@ pub struct WebSettingsHooks {
     pub list_tools: ListToolsFn,
     pub set_tool_enabled: SetToolEnabledFn,
     pub discover_tools: DiscoverToolsFn,
+    /// Add another way of saying a learned phrase, or forget one.
+    pub edit_shortcut: EditShortcutFn,
     /// Test a self-hosted OpenAI-compatible LLM endpoint and list its
     /// models (`POST /api/llm/probe`).
     pub probe_llm: ProbeLlmFn,
@@ -552,7 +565,7 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
         (m, p) if p == "/api/speakers" || p.starts_with("/api/speakers/") => {
             route_speakers(m, p, req, &ctx).await
         }
-        (m, p) if p == "/api/tools" || p == "/api/tools/discover" => {
+        (m, p) if p == "/api/tools" || p == "/api/tools/discover" || p == "/api/shortcuts" => {
             route_tools(m, p, req, &ctx).await
         }
         (m, p) if p.starts_with("/api/history/") => route_history(m, p, req.uri().query(), &ctx),
@@ -767,7 +780,8 @@ async fn route_llm_probe(req: Request<Incoming>, ctx: &ServerCtx) -> Response<Re
     }
 }
 
-/// `/api/tools*` — the discovered tool catalogue the assistant may use.
+/// `/api/tools*` and `/api/shortcuts` — the discovered tool catalogue the
+/// assistant may use, and the phrases Fono has learned to run without it.
 ///
 /// `GET` and `PATCH` read and write the local store only, so the page
 /// renders and toggles instantly. Only `POST /api/tools/discover` talks to
@@ -807,6 +821,34 @@ async fn route_tools(
             match (ctx.hooks.discover_tools)(probe).await {
                 Ok(v) => json_ok(&v),
                 Err(e) => error_response(StatusCode::BAD_GATEWAY, &e),
+            }
+        }
+        (&Method::POST, "/api/shortcuts") => {
+            let Some(body) = read_json_body(req).await else {
+                return error_response(StatusCode::BAD_REQUEST, "invalid or oversized JSON body");
+            };
+            let like = body.get("like").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(phrase) = body.get("phrase").and_then(|v| v.as_str()) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "body must be {\"like\": \"…\", \"phrase\": \"…\"}",
+                );
+            };
+            match (ctx.hooks.edit_shortcut)(like, Some(phrase)) {
+                Ok(()) => json_ok(&serde_json::json!({ "ok": true })),
+                Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
+            }
+        }
+        // A delete rather than a switch: the user saying they do not want a
+        // phrase is not the same as the world changing under it, which the row
+        // already reports on its own.
+        (&Method::DELETE, "/api/shortcuts") => {
+            let Some(phrase) = query_param(req.uri().query(), "phrase") else {
+                return error_response(StatusCode::BAD_REQUEST, "?phrase=… is required");
+            };
+            match (ctx.hooks.edit_shortcut)(&phrase, None) {
+                Ok(()) => json_ok(&serde_json::json!({ "ok": true })),
+                Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
             }
         }
         _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
@@ -1273,12 +1315,11 @@ mod tests {
             // driven by `fono mcp` / `fono voices` tooling
             "mcp.voices",
             "mcp.summarize_prompt",
-            // Glass Cortex brain-keyframe capture (Phase 1 of the
-            // brain-visualization plan) — gets a UI toggle when the
-            // overlay style ships (plan Task 4.1)
+            // Glass Cortex brain-keyframe capture — gets a UI toggle
+            // once the overlay style ships
             "overlay.brain_capture",
-            // Telling the model the real room names is what makes a command
-            // in any language hit the right room, so it is on and stays on.
+            // Telling the model the real area names is what makes a command
+            // in any language hit the right area, so it is on and stays on.
             // A hand edit exists only to rule it out when diagnosing.
             "assistant.tools.place_names",
         ];

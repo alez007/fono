@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! End-to-end integration test for the Wyoming **server** (Slice 3).
+//! End-to-end integration test for the Wyoming **server**.
 //!
 //! Stands up a real `WyomingServer` on a loopback ephemeral port,
 //! backed by a mock `SpeechToText` that records the PCM it received
 //! and returns a canned transcript. Drives it with the real
-//! `WyomingStt` client from `fono-stt` (Slice 2). This is the
-//! verification gate for slice 3 of
-//! `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`:
+//! `WyomingStt` client from `fono-stt`. This is the verification gate:
 //! "real client ↔ real server ↔ mock STT".
 
 #![cfg(feature = "wyoming-server")]

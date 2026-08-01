@@ -250,8 +250,7 @@ mod tests {
 
     /// Windows has no `DISPLAY` / `WAYLAND_DISPLAY` — auto-detect must
     /// still land on the global-hotkey (Win32 `RegisterHotKey`) listener
-    /// rather than falling through to `Disabled`. Regression guard for
-    /// Windows port plan Task 8.1.
+    /// rather than falling through to `Disabled`.
     #[test]
     #[cfg(target_os = "windows")]
     fn auto_detect_on_windows_is_always_the_global_hotkey_listener() {

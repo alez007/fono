@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Windows notification-area backend: renders the shared [`crate::menu`]
 //! model as a `Shell_NotifyIcon` tray icon via the `tray-icon` crate
-//! (with `muda` menus, reached through `tray_icon::menu`). Windows port
-//! plan Task 6.2.
+//! (with `muda` menus, reached through `tray_icon::menu`).
 //!
 //! # Architecture: one dedicated thread, two channels
 //!

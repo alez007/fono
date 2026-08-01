@@ -7,19 +7,19 @@
 //! **It runs against the real house, not a simulator.** A simulator would be
 //! repeatable and would measure the wrong thing: the difficulty in routing a
 //! command comes from the real catalogue size, the real device names, two
-//! lamps in different rooms called almost the same, a name that mentions a
-//! room the device is not in. Recreate the house and you recreate only the
+//! lamps in different areas called almost the same, a name that mentions a
+//! area the device is not in. Recreate the house and you recreate only the
 //! parts you already thought of, which are the parts that already work.
 //!
 //! **It goes through the production turn.** The utterance arrives as text, and
 //! from there it is [`crate::assistant::run_assistant_turn`] and
-//! [`crate::actions`] with nothing swapped out — the same prompt, the same room
+//! [`crate::actions`] with nothing swapped out — the same prompt, the same area
 //! hint, the same schema check, the same retry ladder, the same readback. A
 //! harness that posted its own request to the model would grade the model;
 //! this grades what the user will actually experience.
 //!
 //! **The fixtures name no device.** They state a requirement — "any light",
-//! "a room with a light and something else switchable in it" — and it is
+//! "an area with a light and something else switchable in it" — and it is
 //! resolved against whatever house the suite is pointed at. That is what makes
 //! them safe to commit, and it also makes them somebody else's benchmark: a
 //! stranger clones the repo and runs it on their home with no configuration at
@@ -70,15 +70,6 @@ pub struct Args {
     /// leave them on the fifth.
     pub backend: Option<String>,
     pub model: Option<String>,
-    /// Hold the model to this home's own rooms and devices while it writes a
-    /// command, or leave it free — overriding the configured setting for this
-    /// run only.
-    ///
-    /// The whole value of the rails is the pair of numbers with and without
-    /// them, and getting that pair by editing the config file twice invites
-    /// the two runs to differ in some other way as well — or to leave the
-    /// setting on afterwards, exactly as `--backend` is careful not to.
-    pub grammar: Option<bool>,
     /// List every entity the house reports and stop.
     ///
     /// Needed to write a fixture that names a real device. The committed
@@ -107,9 +98,6 @@ pub async fn run(mut config: Config, paths: &Paths, args: &Args) -> Result<()> {
     }
     if let Some(m) = &args.model {
         set_model(&mut config, m);
-    }
-    if let Some(on) = args.grammar {
-        config.assistant.tools.grammar = on;
     }
     if !config.assistant.tools.enabled || config.assistant.tools.mcp.is_empty() {
         anyhow::bail!(
@@ -210,8 +198,35 @@ pub async fn run(mut config: Config, paths: &Paths, args: &Args) -> Result<()> {
 
     write_reports(&dir, &all, &driver, &config)?;
     print_summary(&all);
+    warn_if_unconstrained(&dir);
     println!("\nFull results in {}", dir.display());
     Ok(())
+}
+
+/// Say so, loudly, if the rails were rejected during the run.
+///
+/// A grammar llama.cpp refuses samples exactly as no grammar does, so a run
+/// with a broken grammar looks like a run of a worse model. That happened: one
+/// whole 22-command measurement was written unconstrained because a field named
+/// `device_class` put an underscore in a rule label, and the numbers were within
+/// a whisker of being recorded as a regression caused by an unrelated change.
+/// The generation itself stamps the outcome rather than the request, so the
+/// evidence is already on disk — this only refuses to let it go unread.
+fn warn_if_unconstrained(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir.join("traces")) else { return };
+    let rejected = entries
+        .flatten()
+        .filter(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|t| t.contains(r#""grammar": "rejected""#))
+        })
+        .count();
+    if rejected > 0 {
+        println!(
+            "\n!! {rejected} traces say the tool-call grammar was rejected, so those commands \
+             were written with nothing holding them to this house. Treat these numbers as \
+             measuring an unconstrained model, not this change."
+        );
+    }
 }
 
 /// Print every entity the house reports, grouped by area.
@@ -355,11 +370,6 @@ fn write_reports(dir: &Path, out: &RunOutcome, driver: &TurnDriver, config: &Con
     let summary = serde_json::json!({
         "backend": driver.backend_name(),
         "model": model_name(config),
-        // Which arm this is. A run scored without it is a number nobody can
-        // attribute later, and the whole point of the setting is the
-        // comparison — so it is recorded beside the model rather than left to
-        // be remembered.
-        "grammar": config.assistant.tools.grammar,
         "overall": runner::summarise(&out.safe),
         "by_language": runner::group_by(&out.safe, |r| r.language.clone()),
         "by_class": runner::group_by(&out.safe, |r| format!("{:?}", r.class)),

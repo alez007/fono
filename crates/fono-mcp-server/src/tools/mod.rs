@@ -73,7 +73,6 @@ pub struct McpContext {
     /// (used in tests). Tried in order on every `fono.listen` call;
     /// the first successful `Status` round-trip flips the listen
     /// loop to "daemon present — don't spawn a second overlay".
-    /// Slice 6 of plan v7.
     pub daemon_ipc_candidates: Vec<std::path::PathBuf>,
     /// Identity of the connected MCP client, populated at the
     /// `initialize` handshake. Empty until then (and in non-MCP call

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! End-to-end integration test for the live-dictation pipeline. Plan v6
-//! R10.2.
+//! End-to-end integration test for the live-dictation pipeline.
 //!
 //! Drives [`fono::live::LiveSession`] with a synthetic [`StreamingStt`]
 //! that emits a scripted `Preview` → `Finalize` sequence per segment,

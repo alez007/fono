@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Enrolled-speaker store for Fono's local voice-biometrics feature
-//! (Slice 2 of `plans/2026-07-17-speaker-verification-v1.md`).
+//! Enrolled-speaker store for Fono's local voice-biometrics feature.
 //!
 //! Holds, per enrolled speaker, a name and a set of voice-print **embeddings**
 //! (the fixed-width `f32` vectors produced by the speaker-ID model) tagged

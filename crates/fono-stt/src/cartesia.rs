@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Cartesia STT backend — batch `POST /stt` against the `ink-whisper`
 //! family. Realtime `ink-2` over the turn-based WebSocket endpoint
-//! (`wss://api.cartesia.ai/stt/turns/websocket`) is deferred to a
-//! Phase 2 streaming slice; see
-//! `plans/2026-05-23-cartesia-stt-support-v2.md`.
+//! (`wss://api.cartesia.ai/stt/turns/websocket`) is not implemented.
 //!
 //! Differences from [`crate::groq`] that callers should know about:
 //!

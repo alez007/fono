@@ -30,7 +30,7 @@ pub struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Case {
     /// Stable identifier. Appears in the shareable report, so it must not
-    /// describe the user's house — `room_command_without_domain`, not
+    /// describe the user's house — `area_command_without_domain`, not
     /// `office_ac_stays_off`.
     pub id: String,
     /// Which failure class this defends against, for grouping in the report.
@@ -65,8 +65,8 @@ pub struct Case {
     pub expect_level: Option<u8>,
     /// What the bystander's state must **still** be afterwards.
     ///
-    /// This is the assertion the whole domain-less-room-command class rests
-    /// on, and it cannot be made by inspecting the tool call: a room-wide
+    /// This is the assertion the whole domain-less-area-command class rests
+    /// on, and it cannot be made by inspecting the tool call: an area-wide
     /// switch-on is a perfectly well-formed call that also starts the air
     /// conditioning.
     #[serde(default)]
@@ -118,13 +118,13 @@ fn yes() -> bool {
 pub enum Class {
     /// The ordinary case: switch a named thing on or off.
     PlainCommand,
-    /// A room command where the user said which kind of device they meant.
-    RoomCommand,
+    /// An area command where the user said which kind of device they meant.
+    AreaCommand,
     /// The wrong tool chosen among near-identical signatures.
     ToolChoice,
     /// A value nobody asked for, filled in because the field existed.
     InventedArgument,
-    /// A device whose name mentions a room it is not in.
+    /// A device whose name mentions an area it is not in.
     MisleadingName,
     /// A command that must never be repeated.
     NonIdempotent,
@@ -173,6 +173,15 @@ pub struct CaseReport {
     pub outcome_correct: bool,
     /// Did the bystander stay put? `None` when the case has no bystander.
     pub bystander_held: Option<bool>,
+    /// Did the turn say anything at all?
+    ///
+    /// A command carried out in silence is a failure the listener notices
+    /// before any other: the lamp obeys and nobody says so, and a request that
+    /// cannot be honoured is refused without a word. It is scored on its own
+    /// because an empty reply used to switch off the two checks below — there
+    /// is no language to judge and no claim to weigh in a reply nobody made,
+    /// so both answered "not applicable" and the case passed on silence.
+    pub spoke: bool,
     /// Did the reply describe what actually happened?
     ///
     /// The worst available failure is a fluent claim of success over a dark
@@ -250,7 +259,7 @@ mod tests {
     }
 
     /// An over-broad domain list is a different request and must be caught —
-    /// this is the recorded failure where asking for a room's lights also
+    /// this is the recorded failure where asking for an area's lights also
     /// started the air conditioning.
     #[test]
     fn an_over_broad_array_does_not_match() {
@@ -264,14 +273,14 @@ mod tests {
         assert!(args_match(&json!({"area": "office"}), &json!({"area": "Office"})));
     }
 
-    /// Only some requirements guarantee a room name, and an `{area}` slot
+    /// Only some requirements guarantee an area name, and an `{area}` slot
     /// filled from a requirement that has none renders an empty string —
     /// which turns into a command about nothing.
     fn supplies_an_area(r: &Requirement) -> bool {
         matches!(r, Requirement::AreaWithBystander { .. } | Requirement::NamedArea { .. })
     }
 
-    /// Requirements that pin a real device or room, and so belong only to a
+    /// Requirements that pin a real device or area, and so belong only to a
     /// local fixture kept outside the repository.
     fn names_a_place(r: &Requirement) -> bool {
         matches!(r, Requirement::NamedDevice { .. } | Requirement::NamedArea { .. })
@@ -332,17 +341,17 @@ mod tests {
                         c.id
                     );
                 }
-                // An area slot only means something when a room was resolved.
+                // An area slot only means something when an area was resolved.
                 for (lang, text) in &c.utterances {
                     if text.contains(AREA_SLOT) {
                         assert!(
                             supplies_an_area(&c.requires),
-                            "`{}` [{lang}] names a room but asks for no area",
+                            "`{}` [{lang}] names an area but asks for no area",
                             c.id
                         );
                     }
                 }
-                // A committed fixture must not name a device or a room: that
+                // A committed fixture must not name a device or an area: that
                 // is what makes the suite portable, and one leaked name is in
                 // the history forever.
                 assert!(

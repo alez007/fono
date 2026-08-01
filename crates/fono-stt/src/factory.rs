@@ -21,7 +21,7 @@ use crate::traits::SpeechToText;
 
 /// Best-effort: seed the global language cache for `backend_key`
 /// from the OS locale, but only if the detected code is in
-/// `allow_list`. No-ops once the cache is populated. Plan v3 task 3.
+/// `allow_list`. No-ops once the cache is populated.
 fn bootstrap_language_cache(allow_list: &[String], backend_key: &'static str) {
     if allow_list.len() < 2 {
         return; // single-language / auto: no peer set to disambiguate

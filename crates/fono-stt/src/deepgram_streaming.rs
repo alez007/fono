@@ -22,8 +22,6 @@
 //!    backend-specific code.
 //! 5. On EOF send `{"type":"CloseStream"}` so Deepgram flushes any
 //!    pending finalize before the socket closes.
-//!
-//! Slice 2 of `plans/2026-05-23-deepgram-stt-nova-3-v1.md`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Supertonic flow-matching inference engine (Slice 2, Tasks 2.5 & 2.6).
+//! Supertonic flow-matching inference engine.
 //!
 //! The back half of the Supertonic voice: four ONNX graphs run in sequence on
 //! the shared `ort` runtime (ADR 0032), ported from the sherpa reference
@@ -599,8 +599,7 @@ mod tests {
     /// Full pipeline against a real converted Supertonic pack, including `ort`
     /// inference. Ignored by default: it needs the four graphs converted to
     /// `.ort`, the pack's data files, and a linked runtime, none present in a
-    /// plain `cargo test` (Slice 3 lands the conversion + runtime rebuild). Run
-    /// with:
+    /// plain `cargo test`. Run with:
     ///
     /// ```text
     /// ORT_LIB_LOCATION=tmp/supertonic-build \

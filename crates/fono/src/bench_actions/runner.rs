@@ -5,7 +5,7 @@
 //! The order of those four is the whole design. A benchmark against a real
 //! home is worth more than one against a simulator — it has the real device
 //! names, the real catalogue size, the real latencies, the real duplicate
-//! names two rooms apart — but only if a run leaves no trace and a rerun
+//! names two areas apart — but only if a run leaves no trace and a rerun
 //! measures the same thing. Everything awkward in this file is paying for
 //! that.
 
@@ -68,7 +68,7 @@ pub struct CaseDetail {
     pub language: String,
     pub said: String,
     pub device: String,
-    /// Everything the command was expected to move. More than one for a room
+    /// Everything the command was expected to move. More than one for an area
     /// command, and worth recording separately: "two of three lamps came on"
     /// is a different diagnosis from "nothing happened".
     pub group: Vec<String>,
@@ -290,8 +290,8 @@ async fn run_one(
     // Stage. Without a known starting state, "turn off the lamp" against an
     // already-dark lamp is indistinguishable from a command that did nothing.
     if let Some(want) = &case.precondition {
-        // Every member, not just the first: a room command staged on one of
-        // three lamps starts from a half-lit room, and "turn them on" would
+        // Every member, not just the first: an area command staged on one of
+        // three lamps starts from a half-lit area, and "turn them on" would
         // then be scored against a state it was already partly in.
         for e in &target.group {
             // A device the house will not switch on our behalf costs this one
@@ -314,7 +314,7 @@ async fn run_one(
     // the model's fault.
     let before = House::read(ep).await.context("read the home before the command")?;
 
-    let obs = driver.run(said).await?;
+    let obs = driver.run(said, lang).await?;
 
     tokio::time::sleep(SETTLE).await;
     let after = House::read(ep).await.context("read the home after the command")?;
@@ -460,8 +460,8 @@ fn score_outcome(
 
     let Some(want) = &case.expect_device else { return level_ok };
 
-    // Every member has to arrive. A room with three lamps where one came on
-    // is the most common way for a room command to be half-right, and it is
+    // Every member has to arrive. An area with three lamps where one came on
+    // is the most common way for an area command to be half-right, and it is
     // exactly what a single-device check would call a pass.
     //
     // `unavailable` members are excused rather than failed: a lamp that is
@@ -560,15 +560,15 @@ fn judge(
     let routed_first_try = score_routing(case, obs, moved.as_deref(), notes);
     let outcome_correct = score_outcome(case, target, obs, after, moved.as_deref(), notes);
 
-    // Did anything else move? The room-command failure is invisible in the
-    // tool call — asking for a whole room is a well-formed request that also
+    // Did anything else move? The area-command failure is invisible in the
+    // tool call — asking for a whole area is a well-formed request that also
     // starts the air conditioning — so it can only be caught here.
     let bystander_held = case.expect_bystander_unchanged.then(|| {
         target.bystander.as_ref().is_none_or(|b| {
             let held = !changed(before, after, &b.name);
             if !held {
                 notes
-                    .push("something else in the room moved that nobody asked to move".to_string());
+                    .push("something else in the area moved that nobody asked to move".to_string());
             }
             held
         })
@@ -591,6 +591,19 @@ fn judge(
         notes.push(format!("{what} changed on its own during this case"));
     }
 
+    // Did the turn say anything at all? Every other check here reads the
+    // house; this one reads the listener's experience. A turn that acted in
+    // silence looks perfect from the switchboard and is useless from the
+    // armchair — and until this was scored, silence exempted itself from the
+    // two checks below rather than failing either.
+    //
+    // A reply cut off part way through still said something, so it counts as
+    // speech; the interruption is judged where it belongs, below.
+    let spoke = !obs.reply.trim().is_empty();
+    if !spoke {
+        notes.push("acted without saying anything — the listener hears silence".to_string());
+    }
+
     // Did the reply describe what actually happened?
     //
     // Judged against the world, not against the fixture. A reply that says it
@@ -598,22 +611,27 @@ fn judge(
     // case wanted three — the case failed, but calling that a lie would be a
     // second, false accusation. Only a claim of success over a home where
     // nothing at all moved is dishonest, and that is the failure worth naming:
-    // a confident report over a dark room.
-    let reply_truthful = if obs.reply.trim().is_empty() {
-        None
-    } else {
+    // a confident report over a dark area.
+    let reply_truthful = if spoke {
         let nothing_moved = !target.group.iter().any(|e| changed(before, after, &e.name));
         let truthful = !claims_success(&obs.reply) || !nothing_moved;
         if !truthful {
             notes.push("the reply claimed success but nothing in the home moved".to_string());
         }
         Some(truthful)
+    } else {
+        None
     };
 
     // Was the reply in the language it was asked in? A model can pick the
     // right device, move it, and then describe the result in the wrong
     // language — invisible to every other check here, and the most obvious
     // defect in the turn to the person listening.
+    //
+    // The language is now declared to the model, as production declares it, so
+    // this is no longer a test of whether the model can guess it from one
+    // sentence. It is a test of whether the model does as it is told, which is
+    // the thing a listener experiences.
     //
     // Not judged on a reply that was cut off part way through: half a sentence
     // is not evidence of the wrong language, and scoring it as such would
@@ -638,6 +656,7 @@ fn judge(
     }
 
     let all_good = outcome_correct
+        && spoke
         && bystander_held.unwrap_or(true)
         && reply_truthful.unwrap_or(true)
         && reply_language_matched.unwrap_or(true)
@@ -663,6 +682,7 @@ fn judge(
             routed_first_try,
             outcome_correct,
             bystander_held,
+            spoke,
             reply_truthful,
             reply_language_matched,
             calls: 0,
@@ -902,6 +922,7 @@ fn skipped(case: &Case, lang: &str, why: &str) -> CaseReport {
         routed_first_try: false,
         outcome_correct: false,
         bystander_held: None,
+        spoke: false,
         reply_truthful: None,
         reply_language_matched: None,
         calls: 0,
@@ -1008,6 +1029,7 @@ mod tests {
             routed_first_try: first,
             outcome_correct: verdict != Verdict::Failed,
             bystander_held: None,
+            spoke: true,
             reply_truthful: None,
             reply_language_matched: None,
             calls: 1,
@@ -1250,5 +1272,36 @@ mod tests {
             &mut notes
         ));
         assert!(notes[0].contains("on its own") || notes[0].contains("moved while"), "{notes:?}");
+    }
+
+    /// Eight of twenty-two commands in a real run were carried out without a
+    /// word, and every one of them was scored a pass: an empty reply has no
+    /// language to judge and makes no claim to weigh, so both of those checks
+    /// answered "not applicable" and the verdict read that as satisfied. The
+    /// listener hears the lamp click and nothing else.
+    #[test]
+    fn acting_in_silence_is_a_failure_not_an_exemption() {
+        let case = volume_case(70);
+        let target = speaker_target();
+        let after = speaker_at(70);
+
+        let mut spoken = asked(&["HassSetVolume"]);
+        spoken.reply = "The speaker is at seventy.".into();
+        let mut notes = Vec::new();
+        let (verdict, report) =
+            judge(&case, &target, &spoken, &speaker_at(20), &after, "en", &mut notes);
+        assert!(report.spoke);
+        assert_eq!(verdict, Verdict::Passed, "{notes:?}");
+
+        // Same call, same house, same result — and nobody said so.
+        let mut silent = asked(&["HassSetVolume"]);
+        silent.reply = "  \n".into();
+        let mut notes = Vec::new();
+        let (verdict, report) =
+            judge(&case, &target, &silent, &speaker_at(20), &after, "en", &mut notes);
+        assert!(!report.spoke);
+        assert!(report.outcome_correct, "the house still did as it was asked");
+        assert_eq!(verdict, Verdict::Failed, "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("silence")), "{notes:?}");
     }
 }

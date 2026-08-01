@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Supertonic text frontend: text → token ids (Slice 2, Task 2.3).
+//! Supertonic text frontend: text → token ids.
 //!
 //! Ported verbatim from the sherpa reference
 //! `offline-tts-supertonic-unicode-processor.cc`. Three stages:
@@ -18,7 +18,7 @@
 //! Expressive tags the model understands ([`EXPRESSIVE_TAGS`]: `<laugh>`,
 //! `<breath>`, `<sigh>`) survive preprocessing untouched, so tagged text
 //! reaches the model as-is. Everything else that looks like `<…>` markup is
-//! stripped defensively ([`strip_unknown_tags`], Slice 4 Task 4.4) so stray
+//! stripped defensively ([`strip_unknown_tags`]) so stray
 //! HTML/XML never leaks into the audio as spelled-out characters. The
 //! assistant-only *emission* policy (only the assistant path is told it may
 //! use these tags) is enforced by the caller, not here.

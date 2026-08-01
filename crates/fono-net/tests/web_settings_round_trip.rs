@@ -36,8 +36,13 @@ fn stub_hooks() -> WebSettingsHooks {
     // PATCH route flips, so the round-trip proves the wiring rather than a
     // hard-coded reply.
     let tool_enabled = Arc::new(Mutex::new(true));
+    // The learned phrases, so `/api/shortcuts` has real add → list → forget
+    // behaviour to exercise. Reported through `/api/tools`, which is the same
+    // door the page reads them from.
+    let phrases: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let list_tools = {
         let flag = Arc::clone(&tool_enabled);
+        let phrases = Arc::clone(&phrases);
         Arc::new(move || {
             Ok(serde_json::json!({
                 "servers": [{ "name": "ha", "url": "http://ha/sse", "configured": true }],
@@ -46,7 +51,22 @@ fn stub_hooks() -> WebSettingsHooks {
                     "available": true, "capability": "safe",
                     "verify_class": "post_condition",
                 }],
+                "shortcuts": phrases.lock().unwrap().iter()
+                    .map(|p| serde_json::json!({ "phrase": p }))
+                    .collect::<Vec<_>>(),
             }))
+        })
+    };
+    let edit_shortcut: fono_net::web_settings::EditShortcutFn = {
+        let phrases = Arc::clone(&phrases);
+        Arc::new(move |phrase: &str, also: Option<&str>| {
+            let mut held = phrases.lock().unwrap();
+            match also {
+                Some(also) => held.push(also.to_string()),
+                None => held.retain(|p| p != phrase),
+            }
+            drop(held);
+            Ok(())
         })
     };
     let set_tool_enabled = {
@@ -91,6 +111,7 @@ fn stub_hooks() -> WebSettingsHooks {
         discover_tools: Arc::new(|_probe| {
             Box::pin(async { Err("no MCP server reachable in test".to_string()) })
         }),
+        edit_shortcut,
         probe_llm: Arc::new(|_spec| {
             Box::pin(async { Err("no LLM server reachable in test".to_string()) })
         }),
@@ -322,6 +343,67 @@ async fn discovery_failure_is_reported() {
         .await
         .expect("send");
     assert_eq!(r.status(), 502);
+    handle.shutdown().await;
+}
+
+/// The two edits offered on a learned phrase reach the store, and are told
+/// apart by the verb.
+///
+/// Asserted through the page's own door — the phrase list comes back on
+/// `/api/tools` — because a route that returns 200 while changing nothing is
+/// exactly the failure this is here to catch. Deleting is a `DELETE`, not a
+/// `POST` with a flag, so a request that loses its body cannot be read as
+/// "forget it".
+#[tokio::test]
+async fn a_learned_phrase_can_gain_a_wording_and_be_forgotten() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+    let phrases = |body: &serde_json::Value| {
+        body["shortcuts"]
+            .as_array()
+            .expect("the page is told about phrases")
+            .iter()
+            .map(|s| s["phrase"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let r = client
+        .post(format!("{base}/api/shortcuts"))
+        .header("content-type", "application/json")
+        .body(r#"{"like":"turn on the hall lamp","phrase":"aprinde lampa"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value =
+        client.get(format!("{base}/api/tools")).send().await.expect("send").json().await.unwrap();
+    assert_eq!(phrases(&body), ["aprinde lampa"], "the added wording is listed");
+
+    let r = client
+        .delete(format!("{base}/api/shortcuts?phrase=aprinde%20lampa"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value =
+        client.get(format!("{base}/api/tools")).send().await.expect("send").json().await.unwrap();
+    assert!(phrases(&body).is_empty(), "and forgetting it removes it");
+
+    // A wording with nothing to attach it to is refused rather than stored
+    // against an empty phrase.
+    let r = client
+        .post(format!("{base}/api/shortcuts"))
+        .header("content-type", "application/json")
+        .body(r#"{"like":"turn on the hall lamp"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status(), 400);
+    // And so is a delete that names nothing.
+    let r = client.delete(format!("{base}/api/shortcuts")).send().await.expect("send");
+    assert_eq!(r.status(), 400);
+
     handle.shutdown().await;
 }
 

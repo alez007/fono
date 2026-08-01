@@ -1,5 +1,306 @@
 # Fono — Project Status
-Last updated: 2026-07-31
+Last updated: 2026-08-01
+
+## 2026-08-01 — The benchmark was passing commands nobody heard
+
+Eight of twenty-two commands are carried out without a word, and every one of them was counted
+a pass. Fixed the scorer first, because the number it produces is what everything else this week
+was judged against.
+
+Silence had not slipped past an assertion — it switched two of them off. An empty reply has no
+language to judge and no claim to weigh, so both of those checks answered "not applicable", and
+the verdict treated not-applicable as satisfied. Speech is now its own check, so the other two
+stay independent of it. **The honest score is 10 of 22, not 15**, and eight of the twelve
+failures are silence. Every pass count recorded earlier this week is inflated by the same eight.
+
+Then found the cause, which is a collision between two changes that are each right on their own.
+When a command fails, the correction is written into the model's mouth rather than asked of it:
+the prompt ends mid-command, so the only thing the model can write next is another command. And
+a second command identical to the first is refused rather than sent, since sending it buys
+nothing but the same refusal twice. Together they produce a turn whose entire output is a command
+that was never sent, held back because reading JSON out to a user is worse than saying nothing —
+except that saying nothing is what happens. There was never any prose in that pass to fall back
+on. Confirmed from the run: the two warnings fire together, ten times, and the eight silent cells
+are exactly the ones whose first command the executor judged worth another try. Reading the house
+back widened it, because "accepted, but the lights are not as you asked" is now a retryable
+outcome where before it was a success.
+
+The fix has to produce words, not a canned sentence — a canned sentence would be in the wrong
+language and would claim more than Fono knows. That is Task 43 and it is next.
+
+One measurement correction, from the user. The benchmark had been running under `nice`, competing
+for cores with whatever else the desktop was doing. At normal priority the forty-fold slow
+generation I reported yesterday disappears entirely: median 68 ms per word, maximum 112, where
+the niced run showed one at 2,848. p95 for a whole command falls 49 s → 32 s. So the doubt I
+raised about the name check costing time was an artefact of how I ran it, and the benchmark
+should never be niced again.
+
+## 2026-08-01 — The cache was deleting its own work, and half the commands are silent
+
+Yesterday I recorded that naming the language in the prompt cost a full re-read of the device
+list on every turn, called that a defect in the design, and wrote a task against it. The design
+was fine. The cache had two independent bugs and the language note only stopped them hiding.
+
+The prefix read at the start of a turn and the prefix read by the wording pass after a tool call
+were filed in the same drawer, and the second contains the first, so the insert that stores the
+second deletes the first — right for prefix matching, fatal here, since the deleted one is what
+the next turn asks for by name. And the search for a usable prefix was never told to look in the
+drawer the wording pass writes to, so within one turn the second pass could not reuse the first
+either. Filed by lifetime instead of by position, and both drawers searched:
+**22 cold reads became 2**, one per language, p50 49.2 s → 9.9 s. The two that remain are honest,
+because `en` and `ro` are genuinely different prompts.
+
+So the language can be named after all, and the benchmark now does — Romanian 5 → 6. That also
+corrects yesterday's claim that production never names the detected language: the dictation path
+has been naming the recogniser's verdict all along (`crates/fono/src/assistant.rs:678-687`), and
+only the live push-to-talk path withholds it, which it says plainly. Which means the cold prefill
+was a live latency bug that had shipped, not a benchmark artefact.
+
+The run with everything in: **15 of 22**, routing 0.955, p50 9.9 s. Two cells that passed in the
+slow run failed here on the same call, both the Balcony light — server said `action_done, success`
+and the light did not move. That is the house, not Fono, and it is the readback earning its keep:
+across the run the server's claim and the house disagreed **6 times out of 15 checks**.
+
+The find that matters more than any of the above: **8 of 22 commands are carried out in silence.**
+The tool is called, the house obeys, and the reply is the empty string — the user hears nothing.
+`an_impossible_request_is_refused_plainly` passes that way, in both languages, and its whole
+purpose is that the refusal is spoken. Present in every run on record including the ones from
+before this session, so nothing here caused it; it has simply never been measured, because the
+scorer reads the house and never asks whether anything was said. F58, Task 42, and it is next.
+
+## 2026-07-31 — One underscore, and every command written free
+
+The rails were rejected outright on every single generation, and the only thing that said so was
+a line llama.cpp prints to stderr. Home Assistant publishes a field called `device_class`; the
+label built from it put an underscore in a grammar rule name, and llama.cpp's rule names allow
+letters, digits and hyphen only. Its parser throws away every rule on any error, so 23 KB of
+correct grammar was discarded over one character in a label that exists only to be read. A run
+that had scored 15 the day before scored 12, and I came within one commit of blaming that on an
+unrelated change of my own.
+
+This is F44's shape reached by a different road. A rejected grammar samples exactly as no
+grammar does, and since the on/off switch went away yesterday there is no longer any setting
+whose position explains the difference. No test caught it because the tests build grammars from
+fixtures and read the text they produce, and the real house has a field name the fixtures do
+not — nothing had ever handed a built grammar to llama.cpp and asked whether it was accepted.
+Two tests do now, and both fail without the fix. The benchmark also refuses to let it pass
+unread: a run in which any generation reported rejected rails now says so at the end, because
+such a run measures a different thing and reads exactly like a worse model.
+
+The thing that caught it was the stamp added after F44 — the trace records whether the
+constraint was still holding anything when the model stopped, not whether it was asked for.
+Third time in this plan: a mechanism that degrades silently to the previous behaviour needs a
+test of its effect, not of its request.
+
+Also today: what the server claims and what the house shows are now both handed to the model.
+The old check knew two tool names, so a tool that sets a value was never verified and a false
+success went unopposed — Home Assistant answered `action_done, success` on a light that was
+still on, Fono's own note said nothing had moved, and the model, never told, announced the light
+was on. Now any acting call that names what it touched is read back for ~200 ms, and the model
+gets both accounts to compare. The number worth keeping: **the claim and the house disagreed in
+4 of 5 checks.** This is not belt and braces.
+
+And one correction withdrawn before it shipped. Five Romanian commands were failing on the reply
+language alone, and telling the model which language to answer in fixed three of them. It also
+took the middle turn from 10.8 s to 49.2 s, because 22 of 22 turns then cold-prefilled the whole
+device list. Any note appended to the system prompt defeats prefix matching, however short —
+which is the opposite of what that design was built to do, and `speaker_note` travels the same
+road. Reverted with the number recorded. Two things follow, in order: make a note cheap, then
+name the language. Worth stating plainly because I had it wrong twice: production does not tell
+the model the detected language at all today, only a language the user pinned. So those English
+replies are a real fault, not a quirk of the benchmark.
+
+## 2026-07-31 — The whole house, written out forty times
+
+Noticed on the actions page: every tool claimed its `area` field was held to the same 14 rooms
+and its `name` field to the same 77 devices. The page was not padding. The rails really did
+write the entire house out again for every tool and every field, and the daemon's own log put
+it at 117,430 bytes of rules built from scratch and parsed by llama.cpp before a single word of
+a command is generated. Each list is now one named rule the tool rules point at: 22,939 bytes
+for the same house, the same names, the same rules. Sampling is no faster — a rule reference
+expands to the same parse states — but a turn stops manufacturing 94 KB of text it then throws
+away, and the grammar is now short enough to read in a trace.
+
+Behind that symptom was a worse defect, dormant because there is one server here. The lists
+were keyed by field name and nothing else, and the question "which field carries a device name"
+was asked once over *every* server's tools at once — so a single `Hass*` tool anywhere made
+every connected server Home-Assistant-shaped. Add any second MCP server with a parameter called
+`name`, the commonest parameter name there is, and it would have been held to your Home
+Assistant device list: not a wrong value made writable, but the right value made **unwritable**,
+which is the exact failure the rails were built to prevent, aimed backwards. Two homes would
+have merged into one. Each server is now held to its own house, and a server Fono does not
+recognise is held to nothing — which is what that module has claimed in writing all along.
+
+The order mattered and was worth thinking about for five minutes. Shrinking the text first and
+splitting by server second is not the order the severity suggests; it is the order that does the
+work once, because a list with a name is a list that can vary per server without editing two
+hundred places. And with the lists still inlined, a second server would have *doubled* the
+grammar rather than adding three rules.
+
+Checked before anything else that the rails were even armed, since llama.cpp falls back to
+unconstrained sampling with a warning when it rejects a grammar, and 117 KB is enough text to
+make that a real question. Live traces read `grammar: "on"`. That is also why the awkward-field
+test asserts against llama.cpp itself rather than against our own idea of what GBNF accepts: a
+rejected grammar samples exactly like no grammar at all, and says so only in a log line.
+
+## 2026-07-31 — What telling the model about your home is worth
+
+Fono tells the assistant what your rooms are called, what your devices are called, and six
+rules for acting on a home. On a house with 14 rooms and 77 devices that is about 700 tokens
+of every request, and nobody had ever checked that it earns them. The documentation said
+thirty tokens, which was wrong by a factor of twenty.
+
+Four runs, same 22 spoken commands, same house, each one leaving something out.
+
+| left out | commands right | right first time | typical | slowest |
+|---|---|---|---|---|
+| nothing | **15** | 0.68 | **9.5 s** | **18.7 s** |
+| the two rules the code already enforces | 11 | 0.50 | 9.5 s | 29.6 s |
+| all six rules | 11 | 0.50 | 10.4 s | 25.2 s |
+| the device names | 8 | 0.36 | 10.5 s | 29.8 s |
+
+Every subtraction cost commands, in English and in Romanian alike, and not one of them saved
+time. Saying everything is also the *fastest*, at the typical case and at the tail. There was
+a trade to weigh here and it turns out there is none: reading 700 more tokens is cheap next to
+getting the command wrong, which costs a second attempt and a longer apology. So it all stays.
+
+The interesting run is the second. Those two rules — never invent a name, and don't narrow to
+a room when a device is named — were the ones code now enforces on its own, so dropping them
+should have been free. It cost four commands. The reason is worth writing down: the rule about
+not naming a room is not what stops the room being named, because Fono drops it either way.
+What the rule actually does is get the model to **name the device at all** — and without a
+device name there is nothing for Fono to key the correction on. Asked to switch the office air
+conditioner off, the leaner prompt produced a bare "the Office, floor 1" and no device.
+
+So a rule can be redundant with what the code says and still be the thing that lets the code
+run. This also cuts against yesterday's tidying: deleting the rails switch was right because
+its off position was never the right answer, but the same argument applied here would have
+cost seven commands. Measure first, in both directions.
+
+`docs/configuration.md` corrected while here: the real token cost, the fact that the setting
+sends devices and rules and not only room names, the one honest reason to switch it off — a
+cloud assistant gets the inventory of your house on every command, a local one never does —
+and a stale paragraph claiming the local model cannot act on anything, which it has been doing
+throughout this whole benchmark.
+
+## 2026-07-31 — The rails have no off switch any more
+
+Holding a local model to the rooms and devices your home really has was a setting. It is now
+just how Fono works.
+
+The setting existed because the effect had not been measured, and a switch is how you measure
+one. That is done: three runs on the same house, one arm each way, and no command was ever
+better with the rails off. What the switch left behind was a settings page offering a choice
+between "the rules Fono adds" and "the assistant's own judgement" — which reads like a matter
+of taste and is really a choice between a command that works and one aimed at a room that does
+not exist. Nobody should have to make it.
+
+Gone from the config file, from the settings page, from the four places on the actions page
+that changed their wording depending on it, from the benchmark's `--grammar on|off` flag, and
+from what a benchmark run records. The rails are built whenever a local model is given tools.
+Checked by running a command with no setting and no flag left anywhere: the rails bit, the
+command was right, the case passed.
+
+One cost is real and now has nowhere to hide. The rails hold the model to the names Fono read
+from the server when it connected. Rename a light and the model cannot say the new name until
+the catalogue is read again. Turning the rails off for the whole house was a poor answer to
+that; reading the catalogue again when a name is refused is the right one, and it is written
+down as the next thing (Task 34).
+
+Two honest limits recorded rather than fixed. Every number behind the rails comes from one
+local model — the case that they work for others is an argument, not a measurement (Task 35).
+And removing a config key is not free on the strict sections of the config: a leftover
+`grammar = true` makes `fono config show` fail outright, and makes the paths that shrug off a
+bad config fall back to a **default** one. The key never shipped in a release, so no tolerance
+code was added; the one config file that had it was edited.
+
+## 2026-07-31 — Saying a thing twice makes the third time fast, as it was meant to
+
+Reported from use: a command given twice was still going through the assistant. The rule was
+right and the arithmetic was off by one utterance. A run earns its place by half a minute
+passing without being contradicted, and that was only ever noticed *inside a turn* — so the run
+that had just earned its window was counted on the way into the turn after next. Two clean runs
+therefore took four utterances, not three.
+
+A closed window is now counted by whatever asks next, the fast path itself included. Nothing was
+loosened: a run still has to survive its half-minute, and a repeat inside it still resets the
+count to zero. The test that pins the rule was rewritten to apply it in the order a turn does,
+which is what the old one never did and why the arithmetic slipped through.
+
+The page was telling both halves of *learning* the same story. A phrase whose first run is still
+inside its window and one the user contradicted count the same — nothing — so neither is "one
+more run" away, and the row now says what a run has to do instead.
+
+## 2026-07-31 — Spoken commands: 15 of 22 right, up from 9, and a turn waits half as long
+
+Two changes, measured one at a time on the same house in both languages, with the rails on
+throughout.
+
+**Fono no longer passes on a room the assistant guessed.** Name a device your home has only
+one of and the name is the whole address; a room named beside it can only narrow, and on a
+guess it narrows to nothing. Home Assistant was refusing those commands outright. The room and
+the floor are now dropped in that case rather than corrected, because Fono's record of the
+house says what a device is and not where it is. Alone: 9 right to 11, and the wait for a
+command halves, 27.7 s to 17.7 s, because commands that used to fail and be tried again now
+land the first time.
+
+**A second attempt that repeats the first is not sent.** Of thirteen commands that tried twice
+in the previous run, six wrote the same request again word for word. Refusing that was meant to
+save time; it turned out to be the biggest correctness win of the three moves — 11 right to 15,
+and Romanian from 2 to 5. Sending the repeat earns a second refusal saying the same thing, and
+the assistant then words one answer against two of them; most of the cells that changed had
+nothing wrong with them but the language they answered in. Refuse the repeat and the answer
+comes out right.
+
+Trying again now earns its keep: it fires on two commands rather than thirteen, and both of
+those passed.
+
+**What is left.** Seven failures, none of them a room, a kind, or a repeat. Two are the wrong
+*tool* — asked to switch a light off, the model reaches for the brightness-and-colour tool. The
+rails hold what a command says, never which tool it uses, so nothing here helps; that is the
+model. Two are one room command the house accepts and then does not act on, which needs looking
+at the house. Three are Romanian: the command was right and the answer came back in English,
+which the benchmark provokes on purpose by withholding the language a spoken turn already
+knows.
+
+## 2026-07-31 — A command you have given twice stops going through the assistant
+
+Say something that works, say it again, and Fono writes it down. From the third time on it
+sends the same command the moment it hears the phrase: no assistant, no waiting, no chance of
+the words being read a different way. Everything else about the turn looks the same — the
+history, the page and the trace all record it exactly as before.
+
+**A phrase earns this; nothing is typed in.** A run counts as clean when the reply reported no
+error *and* the user did not come back about the same thing within thirty seconds of hearing
+the reply. Two clean runs in a row and the phrase goes fast. One bad run, or a command that has
+changed shape underneath it, and it is slow again — two to earn, one to lose, because a
+promotion that does not happen costs a couple of seconds and a wrong replay moves something in
+the room. A closed window is counted the next time anything reads the phrase — the next turn,
+or the page — so there is no timer and no background work.
+
+**What can never be replayed.** A command that asks for an *amount* — two degrees warmer — is
+refused outright, because a shortcut is by definition run again and running that twice is four
+degrees. So is anything whose name suggests it is hard to take back. The test is the shape of
+the arguments, not a list of tool names, so a server nobody has seen yet is judged by the same
+rule. If a replay does fail, the assistant is asked as usual and the phrase goes slow — and
+because only commands that *name a thing* are ever written down, being asked twice cannot do
+anything twice.
+
+**The page says which phrases these are.** *Things you can say*, above the servers on the Tools
+& actions page, lists every phrase Fono has written down with the command it stands for and one
+word for where it is up to: fast, learning, yours, paused, changed. The phrases that have
+worked but never earned the fast path are the assistant's own blind-spot list, so they are
+shown rather than hidden. Every wording of one command is grouped under the wording Fono heard
+work, with the ones the user added indented beneath it. Three buttons per row: add a wording,
+show exactly what the row sends, forget it. Rewriting which command a phrase runs is not
+offered — that pairing is won by working, and letting it be typed in would make the winning
+decorative. A wording the user adds does run at once, because the command it copies is already
+proved and only the words are new.
+
+**Nothing is spoken on the fast path.** The phrase is one the user has said before and watched
+work, so the light coming on is the answer; a fixed word in one language would be worse than
+silence. Say it again and the words come back, because a failed replay hands the turn to the
+assistant.
 
 ## 2026-07-31 — Correction: the second attempt earned almost none of the gain credited to it
 

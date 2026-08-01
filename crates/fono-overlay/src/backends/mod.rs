@@ -4,9 +4,9 @@
 //! - [`noop`] — always compiled. Terminal fallback so spawn never
 //!   aborts on hosts without a graphics environment.
 //! - [`winit_x11`] — `backend-x11` feature. Carryover of the
-//!   `winit` + `softbuffer` path. X11-only after the 2026-05-19
-//!   winit Wayland strip; also reached on Wayland sessions via
-//!   Xwayland (the GNOME / KDE-Wayland default).
+//!   `winit` + `softbuffer` path. X11-only since the workspace
+//!   `winit` dep dropped its Wayland features; also reached on
+//!   Wayland sessions via Xwayland (the GNOME / KDE-Wayland default).
 //! - [`wayland_layer_shell`] — `backend-wlr` feature. Primary
 //!   Wayland path on every compositor that implements
 //!   `zwlr_layer_shell_v1` (sway, hyprland, KDE Wayland, COSMIC, …).

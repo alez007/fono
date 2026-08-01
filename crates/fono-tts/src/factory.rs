@@ -539,7 +539,7 @@ mod tests {
         assert!(build_tts(&cfg, &secrets, &[], std::path::Path::new("")).unwrap().is_some());
     }
 
-    /// Phase F: every new cloud backend errors clearly when the key
+    /// Every cloud backend errors clearly when the key
     /// isn't configured, and builds successfully when it is.
     #[cfg(feature = "groq")]
     #[test]

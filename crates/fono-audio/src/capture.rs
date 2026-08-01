@@ -370,7 +370,7 @@ fn spawn_parec(target_rate: u32, source: Option<&str>) -> Result<Child> {
             // range.
             "--latency-msec=20",
         ])
-        // Phase I / ADR 0012: a named source is only ever supplied for the
+        // ADR 0012: a named source is only ever supplied for the
         // wake-while-speaking AEC sub-case (`fono_aec_source_<pid>`). Idle
         // capture leaves this `None`, so parec reads the default source.
         .args(source.map(|s| format!("--device={s}")).as_deref())
@@ -443,7 +443,7 @@ fn pw_cat_args(rate_arg: &str, source: Option<&str>) -> Vec<String> {
         // regardless of which backend ends up serving capture.
         "--latency=20ms".to_string(),
     ];
-    // Phase I / ADR 0012: the optional named source (the wake-while-speaking
+    // ADR 0012: the optional named source (the wake-while-speaking
     // AEC seam, `fono_aec_source_<pid>`) is inserted *before* the trailing
     // `-` output filename so pw-cat parses it as a `--target` option. Idle
     // capture passes `None`, leaving pw-cat on the default source.
@@ -773,7 +773,7 @@ mod tests {
         assert!(has(&rate), "pw-cat must carry rate arg {rate:?}: {args:?}");
     }
 
-    /// Phase I / ADR 0012: the default (idle) capture path passes no named
+    /// ADR 0012: the default (idle) capture path passes no named
     /// source, so neither `--device` (parec) nor `--target` (pw-cat) is
     /// emitted — capture reads the system default source with no AEC. The
     /// optional named source is the inert wake-while-speaking seam.
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("-"));
     }
 
-    /// Phase I / ADR 0012: when a named source *is* requested (the
+    /// ADR 0012: when a named source *is* requested (the
     /// wake-while-speaking AEC sub-case pointing at `fono_aec_source_<pid>`),
     /// pw-cat must carry `--target=<source>` and it must precede the trailing
     /// `-` output filename so it parses as an option, not the file.

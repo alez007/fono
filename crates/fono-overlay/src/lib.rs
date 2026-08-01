@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Recording-indicator and live-dictation overlay.
 //!
-//! ## Architecture (2026-05-19 split)
+//! ## Architecture
 //!
 //! The overlay is composed of two cleanly separated layers:
 //!
@@ -35,9 +35,7 @@ pub enum OverlayState {
     /// as "Pondering…" with a walking-letter highlight whose
     /// position is driven by `walk_progress` (0..=10_000, fixed-point
     /// `0.0..=1.0` mapped over `auto_stop_silence_ms` — or a default
-    /// visual window when auto-stop is off). Slice 2 of
-    /// `plans/2026-05-22-fono-auto-stop-silence-v1.md`: visual only,
-    /// no auto-stop commit yet.
+    /// visual window when auto-stop is off).
     Pondering {
         db: i8,
         walk_progress: u16,
@@ -54,8 +52,7 @@ pub enum OverlayState {
     /// for the assistant pipeline (F8 toggle). Renderer keeps the
     /// green assistant palette + waveform shape but swaps the label
     /// to "PONDERING" with the same walking-letter highlight driven
-    /// by `walk_progress` (0..=10_000). See
-    /// `plans/2026-05-22-assistant-pondering-parity-v1.md`.
+    /// by `walk_progress` (0..=10_000).
     AssistantPondering {
         db: i8,
         walk_progress: u16,
@@ -119,8 +116,7 @@ pub enum OverlayState {
     /// each rejection so the user gets a discriminable visual ack
     /// ("Fono heard you but is still waiting for a real answer")
     /// before reverting to [`Self::Recording`] for the next
-    /// utterance attempt. Slice 5 of
-    /// `plans/2026-05-26-mcp-listen-overlay-and-silence-parity-v7.md`.
+    /// utterance attempt.
     ///
     /// Renderer contract: neutral-grey accent, label `"IGNORED"`,
     /// VU bar hidden (we're not metering anything — the mic is
@@ -181,7 +177,7 @@ pub struct CortexFrame {
     /// capture strides layers — the replay engine merges).
     pub layer_norms: Vec<f32>,
     /// MoE router choices per layer; empty on dense models. Carried
-    /// through now so the Phase 3 honeycomb work is pure rendering.
+    /// through now so the honeycomb work is pure rendering.
     pub experts: Vec<CortexExperts>,
     /// Probability of the sampled token (model confidence).
     pub token_prob: Option<f32>,
@@ -398,8 +394,8 @@ mod tests {
     #[test]
     fn selection_wayland_only_falls_through_to_noop() {
         // No DISPLAY — Xwayland disabled. Layer-shell first, then
-        // noop. The xdg_toplevel fallback was retired (2026-05-20)
-        // because it could not deliver a usable panel UX on Mutter.
+        // noop. The xdg_toplevel fallback was retired because it
+        // could not deliver a usable panel UX on Mutter.
         let picks =
             backend::pick_backend_with(None, backend::HostOs::Linux, |k| k == "WAYLAND_DISPLAY");
         assert_eq!(picks, vec![BackendId::WlrLayerShell, BackendId::Noop]);

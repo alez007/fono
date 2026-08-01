@@ -1,4 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Wyoming-protocol server. Slice 3 of the network plan.
+//! Wyoming-protocol server.
 
 pub mod server;

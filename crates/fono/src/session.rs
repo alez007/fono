@@ -7,8 +7,7 @@
 //! finished (or failed).
 //!
 //! Per-stage timings are emitted at `info` level so users can diagnose
-//! latency issues without enabling debug logging — see
-//! `docs/plans/2026-04-25-fono-latency-v1.md` task L26.
+//! latency issues without enabling debug logging.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,7 +223,7 @@ fn assistant_cache_warmup(
     }
 }
 
-/// The steady *context* part of the F8 system prompt: the room and device
+/// The steady *context* part of the F8 system prompt: the area and device
 /// names, when the user has tools.
 ///
 /// Everything here changes only when the house does, so a backend that
@@ -242,8 +241,8 @@ fn assistant_cache_warmup(
 /// the `F8System` layer as `assistant_base_prefix(head)`, built from this same
 /// function at startup by [`assistant_cache_warmup`], and that checkpoint is
 /// restorable only while it remains a genuine token prefix of the live prompt.
-pub(crate) fn assistant_prompt_context(rooms: Option<&str>) -> String {
-    rooms.map(str::trim).unwrap_or_default().to_string()
+pub(crate) fn assistant_prompt_context(areas: Option<&str>) -> String {
+    areas.map(str::trim).unwrap_or_default().to_string()
 }
 
 /// The one-line identity note, when voice verification matched.
@@ -273,8 +272,9 @@ fn assistant_head_and_descriptors(
     (backend, can_act): (&str, bool),
 ) -> (String, String, Vec<serde_json::Value>) {
     // Warming a prompt is not a turn: nobody has spoken, so there is nobody to
-    // attribute a run to.
-    let built = paths.and_then(|p| crate::actions::build(config, p, None));
+    // attribute a run to and nothing to learn a phrase from.
+    let built = paths
+        .and_then(|p| crate::actions::build(config, p, None, &crate::actions::Learning::none()));
     let (actions, tools_note) = crate::actions::for_backend(built, can_act, backend);
     let context = assistant_prompt_context(tools_note.as_deref());
     let instructions = config.assistant.prompt_main.trim().to_string();
@@ -348,8 +348,7 @@ struct CaptureSession {
     stop_tx: std::sync::mpsc::Sender<()>,
     join: Option<JoinHandle<()>>,
     started_at: Instant,
-    /// Snapshot of the focused window captured at hotkey-press time
-    /// (H.1 in `plans/2026-05-25-hover-context-injection-v1.md`).
+    /// Snapshot of the focused window captured at hotkey-press time.
     /// Carried through to the pipeline so STT/LLM enrichment reflects
     /// the window the user was actually pointing at when they started
     /// dictating, not whatever wins focus by the time we tear down the
@@ -368,7 +367,7 @@ struct CaptureSession {
     level_task: Option<tokio::task::AbortHandle>,
     /// AbortHandle for the silence-watch task driving the
     /// `Recording ↔ Pondering` overlay transitions. Only spawned in
-    /// toggle dictation mode (slice 2 of the auto-stop plan). `None`
+    /// toggle dictation mode. `None`
     /// in hold-to-talk mode, when no overlay is attached, or when
     /// the waveform overlay is disabled.
     #[cfg(feature = "interactive")]
@@ -423,8 +422,7 @@ struct LiveCaptureSession {
     run_join: tokio::task::JoinHandle<anyhow::Result<crate::live::LiveTranscript>>,
     /// Silence-watch task driving Pondering overlay transitions (and,
     /// for assistant toggle sessions, the auto-stop commit). `None`
-    /// when the overlay is disabled. See
-    /// `plans/2026-05-22-assistant-pondering-parity-v1.md`.
+    /// when the overlay is disabled.
     silence_task: Option<tokio::task::AbortHandle>,
     /// Overlay handle (clone of [`SessionOrchestrator::overlay`]) — kept
     /// so we can hide the window when the session ends. The handle is
@@ -1353,7 +1351,7 @@ impl SessionOrchestrator {
     }
 
     /// Public snapshot of the active STT backend. Used by the LAN
-    /// Wyoming server (Slice 3 of the network plan) to obtain a fresh
+    /// Wyoming server to obtain a fresh
     /// `Arc` per accepted connection so `Reload`-driven backend swaps
     /// are tracked without restarting the listener.
     #[must_use]
@@ -1692,12 +1690,9 @@ impl SessionOrchestrator {
     /// "Pondering…" label's walking-letter highlight advances in
     /// step with the configured `auto_stop_silence_ms`.
     ///
-    /// Slice 2 of `plans/2026-05-22-fono-auto-stop-silence-v1.md` —
-    /// visual feedback only; the auto-stop *commit* lands in slice 4.
     /// Returns `None` when the overlay is disabled / failed to
     /// spawn — the silence watchdog has nothing to drive without an
-    /// overlay handle (slice 4 will revisit this when the commit
-    /// path lands).
+    /// overlay handle.
     #[cfg(feature = "interactive")]
     fn spawn_silence_watch_task(
         &self,
@@ -1713,8 +1708,7 @@ impl SessionOrchestrator {
     /// hold-flag, optional `TogglePressed` auto-stop) or the
     /// assistant pipeline (green `AssistantRecording`/
     /// `AssistantPondering` states, assistant hold-flag, optional
-    /// `AssistantPressed` auto-stop). See
-    /// `plans/2026-05-22-assistant-pondering-parity-v1.md`.
+    /// `AssistantPressed` auto-stop).
     #[cfg(feature = "interactive")]
     #[allow(clippy::too_many_lines)]
     fn spawn_silence_watch_task_for(
@@ -1754,7 +1748,7 @@ impl SessionOrchestrator {
         // a long release synthesises a second `TogglePressed`), so the
         // mode argument can't be trusted here — this flag is the only
         // authoritative source of "is the key currently held?". See
-        // `fono_hotkey::KeyHeldFlags` and `plans/2026-05-22-assistant-pondering-parity-v1.md`.
+        // `fono_hotkey::KeyHeldFlags`.
         let key_held = match flavor {
             SilenceWatchFlavor::Dictation => Arc::clone(&self.held_flags.dictation),
             SilenceWatchFlavor::Assistant { .. } => Arc::clone(&self.held_flags.assistant),
@@ -2148,7 +2142,7 @@ impl SessionOrchestrator {
                     // model is between phases: the cortex renderer
                     // maps the per-bin heights onto layer-glow
                     // intensity so the spine keeps "breathing"
-                    // during the TTFT gap (plan Task 2.5 idle loop).
+                    // during the TTFT gap.
                     fono_core::config::WaveformStyle::Terrain3d
                     | fono_core::config::WaveformStyle::Cortex => {
                         let n = FFT_BINS_THINKING;
@@ -2244,7 +2238,7 @@ impl SessionOrchestrator {
     /// Latency plan tasks L2 (whisper mmap), L3 (HTTP keep-alive),
     /// L5 (inject binary page-cache).
     fn spawn_warmups(&self) {
-        // Startup prewarm timeline (Phase 4). Written to its own
+        // Startup prewarm timeline. Written to its own
         // `startup-*.json` file (same `FONO_ASSISTANT_TRACE` env var) so it
         // doesn't collide with per-turn dictation/assistant traces. Each
         // warmup task records a `warmup` lane duration on a clone of the
@@ -2658,7 +2652,7 @@ impl SessionOrchestrator {
             "capture: focus snapshot at press"
         );
         // Start the per-turn trace at press time so the `keys` lane press
-        // event precedes all STT work (Phase 3). Recorded directly on the
+        // event precedes all STT work. Recorded directly on the
         // handle here; the pipeline makes it current later for the STT/polish
         // cache events. Plain F7 dictation now produces a trace file.
         let trace = TurnTrace::start_from_env_named("dictation");
@@ -2721,9 +2715,7 @@ impl SessionOrchestrator {
 
         // Silence-watch: drives the Recording ↔ Pondering overlay
         // transition + walking-letter highlight. Toggle-mode dictation
-        // only; hold-to-talk owns its own boundary. Slice 2 of the
-        // auto-stop plan — visual feedback only, no auto-stop commit
-        // yet.
+        // only; hold-to-talk owns its own boundary.
         #[cfg(feature = "interactive")]
         let silence_task = if matches!(mode, RecordingMode::Toggle) {
             self.spawn_silence_watch_task(&cfg, &buffer)
@@ -3105,8 +3097,7 @@ impl SessionOrchestrator {
         // state machine so the assistant overlay flips
         // `AssistantRecording → AssistantPondering` on long pauses.
         // The hold-flag inside the watch task suppresses both the
-        // flip and the commit while F8 is physically held — see
-        // `plans/2026-05-22-assistant-pondering-parity-v1.md`.
+        // flip and the commit while F8 is physically held.
         // Auto-stop commits whenever the held flag is false (toggle
         // / quick-tap sessions); hold-to-talk users own the release
         // boundary themselves and the held flag keeps them out of
@@ -3157,7 +3148,7 @@ impl SessionOrchestrator {
         let mut pre_transcribed: Option<String> = None;
         let mut elapsed: Option<Duration> = None;
         let mut assistant_focus_info: Option<FocusInfo> = None;
-        // Verified speaker for this turn (Slice 4 live-path wiring), used to
+        // Verified speaker for this turn, used to
         // tell the assistant who it is talking to and to annotate the turn
         // log. `None` unless verification is on and the voice matched.
         let mut assistant_speaker: Option<String> = None;
@@ -3421,12 +3412,18 @@ impl SessionOrchestrator {
         // come last — a speaker change must not cost the device list.
         // The user's own tools, when they have any switched on. Built from
         // data already on disk, so this costs no network — including the
-        // room names, which have to be in hand *before* the prompt is
+        // area names, which have to be in hand *before* the prompt is
         // composed and so cannot be fetched now.
+        // What this turn does with those tools, collected as it goes and
+        // written down once the reply is over — see `actions::Learning`.
+        let learning = self
+            .paths
+            .as_ref()
+            .map_or_else(crate::actions::Learning::none, |p| crate::actions::Learning::new(p));
         let actions = self
             .paths
             .as_ref()
-            .and_then(|p| crate::actions::build(&cfg, p, assistant_speaker.as_deref()));
+            .and_then(|p| crate::actions::build(&cfg, p, assistant_speaker.as_deref(), &learning));
         // Not every backend can invoke them. One that cannot does not error —
         // it answers fluently, having ignored the tools, and promises to
         // switch the light on. So the tools are withheld and the model told.
@@ -3457,6 +3454,7 @@ impl SessionOrchestrator {
             prefer_vision,
             screen_capture_fn,
             actions,
+            learning,
             active_window_context,
             trim_silence: cfg.audio.trim_silence,
             vocabulary: self.load_vocabulary(),
@@ -3873,8 +3871,8 @@ impl SessionOrchestrator {
             prefer_vision,
         };
         tokio::spawn(async move {
-            // Surface the hotkey-time prepare fire-and-forget on the timeline
-            // (Phase 3). Recorded directly on the handle — not via the ambient
+            // Surface the hotkey-time prepare fire-and-forget on the timeline.
+            // Recorded directly on the handle — not via the ambient
             // current-trace — to avoid racing the global slot with the pipeline.
             let prepare_started = Instant::now();
             let result = assistant.prepare_prompt_cache_for_turn(snapshot).await;
@@ -4360,9 +4358,8 @@ impl SessionOrchestrator {
             drop(pump);
         });
 
-        // Drive the silence-watch task off the shadow buffer (Slice 1
-        // of `plans/2026-05-22-assistant-pondering-parity-v1.md` for
-        // the assistant streaming path; live dictation passes `None`).
+        // Drive the silence-watch task off the shadow buffer (the
+        // assistant streaming path; live dictation passes `None`).
         let silence_task = match (silence_flavor, shadow_buffer.as_ref()) {
             (Some(flavor), Some(sb)) => self.spawn_silence_watch_task_for(&cfg, sb, flavor),
             _ => None,
@@ -4582,7 +4579,7 @@ impl SessionOrchestrator {
             // Empty-transcript microphone recovery hook (live path).
             // Mirror of the batch hook at the `raw.is_empty()` site
             // in `run_pipeline` — same dock-with-no-mic failure mode,
-            // same toast. Plan v2 Phase 1.
+            // same toast.
             crate::audio_recovery::notify_empty_capture(capture_ms);
             if let Some(o) = session.overlay.as_ref() {
                 o.set_state(fono_overlay::OverlayState::Hidden);
@@ -4613,7 +4610,7 @@ impl SessionOrchestrator {
         let mut llm_label_for_log: Option<String> = None;
         let mut live_ctx_tag = String::new();
         let trans_language: Option<String> = None; // live STT path: language not yet surfaced
-                                                   // Streaming-injection bookkeeping (plan v3), mirror of the batch path.
+                                                   // Streaming-injection bookkeeping, mirror of the batch path.
         let mut live_stream_injected = false;
         let mut live_stream_backend = String::new();
         let mut live_stream_clip = false;
@@ -4641,7 +4638,7 @@ impl SessionOrchestrator {
                 );
                 live_ctx_tag = build_ctx_tag(&ctx, app_class.as_deref());
                 llm_label_for_log = Some(polish.name().to_string());
-                // Streaming local cleanup (plan v3): same gate as the batch
+                // Streaming local cleanup: same gate as the batch
                 // path. Stream the cleaned text into the cursor word-by-word
                 // when the backend is local, the flag is on, and the injector
                 // types incrementally.
@@ -4779,7 +4776,7 @@ impl SessionOrchestrator {
         let final_chars = final_text.chars().count();
         let llm_label = llm_label_for_log.as_deref().unwrap_or("none");
 
-        // Speaker verification (Slice 4 live-path wiring): the streaming STT
+        // Speaker verification: the streaming STT
         // discards each frame after transcription, so `LiveSession` retained
         // the voiced PCM on the transcript when verification is enabled. Embed
         // the whole utterance now and reuse the matched name (never the
@@ -5037,7 +5034,7 @@ async fn run_pipeline(
         // (typically: an external dock with a passive capture
         // endpoint elected as the OS default source). Notify the
         // user and point at the tray Microphone submenu / `fono use
-        // input` CLI. Plan v2 Phase 1.
+        // input` CLI.
         crate::audio_recovery::notify_empty_capture(capture_ms);
         return PipelineOutcome::EmptyOrTooShort { duration_ms: capture_ms };
     }
@@ -5056,7 +5053,7 @@ async fn run_pipeline(
     let word_count = raw.split_whitespace().count() as u32;
     let skip_short =
         config.polish.skip_if_words_lt > 0 && word_count < config.polish.skip_if_words_lt;
-    // Streaming-injection bookkeeping (plan v3): set when the local cleanup
+    // Streaming-injection bookkeeping: set when the local cleanup
     // backend streamed its output and already typed it incrementally, so the
     // shared inject block below is skipped.
     let mut stream_injected = false;
@@ -5106,7 +5103,7 @@ async fn run_pipeline(
         );
         tracing::debug!(target: "fono::pipeline", "polish.input: {raw:?}");
         let llm_started = Instant::now();
-        // Streaming local cleanup (plan v3): when the active polish backend is
+        // Streaming local cleanup: when the active polish backend is
         // local, the flag is on, and the injector types incrementally at the
         // cursor (not the clipboard fallback), stream the cleaned text into the
         // cursor word-by-word behind a first-sentence guard gate instead of
@@ -5417,7 +5414,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// Stream the local cleanup model's output and inject it incrementally,
 /// applying the first-sentence guard gate before any text reaches the cursor.
 ///
-/// Flow (plan v3 Tasks 3–4 + 6):
+/// Flow:
 ///  1. Buffer incoming chunks until BOTH a sentence boundary is seen AND the
 ///     buffered text satisfies the translation-guard minimum, OR the stream
 ///     ends/errors.
@@ -6266,9 +6263,9 @@ mod tests {
         use fono_assistant::{compose_head, compose_system_prompt};
         let main = "You are Fono, a helpful voice assistant.";
         let head =
-            |rooms: Option<&str>| compose_head(&assistant_prompt_context(rooms), None, Some(main));
-        let compose = |rooms: Option<&str>, speaker: Option<&str>| {
-            compose_system_prompt(&head(rooms), assistant_speaker_note(speaker).as_deref())
+            |areas: Option<&str>| compose_head(&assistant_prompt_context(areas), None, Some(main));
+        let compose = |areas: Option<&str>, speaker: Option<&str>| {
+            compose_system_prompt(&head(areas), assistant_speaker_note(speaker).as_deref())
         };
 
         // No decoration at all: the live prompt is exactly what the cache pins.
@@ -6278,9 +6275,9 @@ mod tests {
         // An instruction a thousand tokens from the generation point is an
         // instruction a small model forgets — two Romanian commands in a row
         // were answered in English with `prompt_main` leading.
-        let both = compose(Some("Rooms: Kitchen."), None);
+        let both = compose(Some("Areas: Kitchen."), None);
         assert!(
-            both.find("Rooms: Kitchen.") < both.find(main),
+            both.find("Areas: Kitchen.") < both.find(main),
             "the rules must come after the house: {both:?}"
         );
 
@@ -6305,7 +6302,7 @@ mod tests {
         // prompt built on top of it — with or without a speaker. This is the
         // invariant that broke twice (F28, F31); a one-byte drift silently
         // reverts to a cold prefill on every turn.
-        let warm = head(Some("Rooms: Kitchen."));
+        let warm = head(Some("Areas: Kitchen."));
         for speaker in [None, Some("Ana"), Some("Bogdan")] {
             let live = compose_system_prompt(&warm, assistant_speaker_note(speaker).as_deref());
             assert!(live.starts_with(&warm), "warm head must lead the live prompt: {live:?}");
@@ -6317,7 +6314,7 @@ mod tests {
     ///
     /// A trace of a small local model showed what happens when they do not: the
     /// warm pinned 72 tokens of bare greeting in front of a live prompt that
-    /// opened with 1510 tokens of greeting, rooms, devices and tool
+    /// opened with 1510 tokens of greeting, areas, devices and tool
     /// descriptions, and every first command of a conversation paid thirteen
     /// seconds to re-read a device list that had not changed since boot. The
     /// cache reported a hit throughout, because 72 tokens of it did match.
@@ -6341,15 +6338,15 @@ mod tests {
         assert_eq!(mute.f8_instructions.as_deref(), Some("You are Fono."));
         assert!(mute.f8_action_descriptors.is_empty());
 
-        // With rooms, the head grows and the house comes before the rules —
+        // With areas, the head grows and the house comes before the rules —
         // the pinned checkpoint is only restorable while it is a genuine
         // prefix, and the rules are what the model must read last.
         let head = fono_assistant::compose_head(
-            &assistant_prompt_context(Some("Rooms: Kitchen.")),
+            &assistant_prompt_context(Some("Areas: Kitchen.")),
             None,
             Some(&c.assistant.prompt_main),
         );
-        assert!(head.starts_with("Rooms: Kitchen."));
+        assert!(head.starts_with("Areas: Kitchen."));
         assert!(head.ends_with("You are Fono."));
     }
 
@@ -6587,7 +6584,7 @@ mod tests {
         assert!(line.contains(" | speaker Alex"), "got: {line}");
     }
 
-    // ---- Streaming-cleanup injection (plan v3) ----------------------
+    // ---- Streaming-cleanup injection --------------------------------
 
     /// Drive a [`WordSink`] with a list of chunks, returning the ordered
     /// sequence of non-empty emissions (push results then a final flush).

@@ -6,9 +6,9 @@
 //!
 //! ## Why `UpdateLayeredWindow` and not softbuffer
 //!
-//! The Windows port plan (Task 10.1) sketched a winit + softbuffer
-//! window. softbuffer presents on Windows via a GDI `BitBlt`, which
-//! discards the alpha channel — so the renderer's premultiplied ARGB
+//! The obvious approach is a winit + softbuffer window. softbuffer
+//! presents on Windows via a GDI `BitBlt`, which discards the alpha
+//! channel — so the renderer's premultiplied ARGB
 //! output (translucent "glass" panel, anti-aliased rounded corners)
 //! would blit as an opaque rectangle. The correct Win32 technique for
 //! a per-pixel-alpha, click-through floating surface is a **layered

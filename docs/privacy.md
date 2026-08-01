@@ -26,13 +26,13 @@ when you have explicitly chosen a cloud provider.
   enabled.
 * Your smart-home inventory, on a speech-to-text request. When Fono is
   connected to a home automation server it learns the names of your
-  rooms and devices, and the assistant model is told them so it can act
+  areas and devices, and the assistant model is told them so it can act
   on "turn off the kitchen light". Those names are **never** attached to
   a speech-to-text request, even though supplying them would make the
   recogniser mishear them less often. Speech-to-text and the assistant
   are separately configured stages: the recogniser is frequently a cloud
   service you chose for *audio*, while the assistant may be running
-  on this machine, and a list of your rooms and appliances is not audio.
+  on this machine, and a list of your areas and appliances is not audio.
 * There isn't any telemetry at this point. Fono makes zero analytics calls.
 
 ## What leaves your machine (and when)

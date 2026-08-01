@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Tray-icon integration. Phase 7 Task 7.1.
+//! Tray-icon integration.
 //!
 //! When the `tray-backend` feature is enabled (default for the `fono`
 //! binary on Linux), this crate spawns a real system-tray icon as a
@@ -16,8 +16,7 @@
 //! extension, sway+waybar, hyprland+waybar, i3+i3status, xfce4-panel,
 //! lxqt-panel) — there's no reason to drag a toolkit through it.
 //! `ksni` talks SNI + `com.canonical.dbusmenu` over `zbus` directly,
-//! pure Rust, no C dependencies. Phase 2 Task 2.1 of
-//! `plans/2026-04-30-fono-single-binary-size-v1.md`.
+//! pure Rust, no C dependencies.
 //!
 //! # UX features
 //!
@@ -102,8 +101,7 @@ pub type UpdateProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 /// Provider for the "Update for GPU acceleration" menu entry —
 /// distinct from the version-bump update because it triggers a
 /// cross-variant switch (CPU build → GPU build) using the same
-/// self-update infrastructure. Slice 3 of
-/// `plans/2026-05-02-fono-cpu-gpu-variants-v1.md`.
+/// self-update infrastructure.
 ///
 /// Returns `Some(label)` only when:
 /// - the running binary is the CPU variant, AND
@@ -525,7 +523,7 @@ pub use backend_macos::{
 // menu model). A future Windows backend slots in identically as
 // `backend_windows.rs` behind `target_os = "windows"` — the `spawn`
 // dispatch above already falls through cleanly for OSes without a
-// backend (Windows port plan Task 1.1).
+// backend.
 // -------------------------------------------------------------------------
 
 #[cfg(all(feature = "tray-backend", target_os = "linux"))]
@@ -535,8 +533,7 @@ mod backend_linux;
 // Windows backend (`tray-icon` Shell_NotifyIcon over the shared menu
 // model, driven by a dedicated Win32 message-pump thread). Slots in
 // behind `target_os = "windows"` exactly as the Linux/macOS backends
-// do; the `spawn` dispatch above already routes to it (Windows port
-// plan Task 6.2).
+// do; the `spawn` dispatch above already routes to it.
 // -------------------------------------------------------------------------
 
 #[cfg(all(feature = "tray-backend", target_os = "windows"))]

@@ -121,7 +121,7 @@ impl LocalTier {
     }
 
     /// Default whisper model size for this tier. `base` was dropped
-    /// from the registry on 2026-05-19 (ADR 0026); minimum-tier hosts
+    /// from the registry (ADR 0026); minimum-tier hosts
     /// now fall back to `tiny`, and the high-end tier shoots for
     /// `large-v3-turbo` directly.
     pub fn default_whisper_model(self) -> &'static str {
@@ -140,9 +140,8 @@ impl LocalTier {
 
 /// Floor on effective batch RTF below which a model is considered
 /// unsuitable for the host: it cannot keep up with real-time audio in
-/// the wizard's data-driven walk. Raised from 1.0 to 2.0 on
-/// 2026-05-25 (plan `2026-05-25-wizard-selection-heuristics-refresh-v5`)
-/// to match the auto-select walk's gate
+/// the wizard's data-driven walk. Raised from 1.0 to 2.0 to match
+/// the auto-select walk's gate
 /// (`docs/bench/calibration/summary/auto-select.html:279, 368`).
 pub const BATCH_REALTIME_MIN: f32 = 2.0;
 
@@ -915,7 +914,7 @@ mod tests {
 
     #[test]
     fn host_gpu_multipliers_match_calibration_classes() {
-        // 1.0× / 1.3× / 2.0× / 4.0× — see ADR 0028 (amended 2026-05-25).
+        // 1.0× / 1.3× / 2.0× / 4.0× — see ADR 0028.
         assert!((HostGpu::None.multiplier() - 1.0).abs() < f32::EPSILON);
         assert!((HostGpu::Integrated.multiplier() - 1.3).abs() < f32::EPSILON);
         assert!((HostGpu::IntegratedTensor.multiplier() - 2.0).abs() < f32::EPSILON);

@@ -8,9 +8,7 @@
 //! `.cargo/config.toml` tells the GNU/musl linker to keep the first
 //! definition and discard the rest. This test exists to catch the day
 //! when an upstream bump makes the two `ggml` copies ABI-incompatible —
-//! at that point we'd fall back to the longer-term shared-`ggml`
-//! refactor outlined in
-//! `plans/2026-04-27-shared-ggml-static-binary-v1.md`.
+//! at that point we'd fall back to a shared-`ggml` refactor.
 //!
 //! It ALSO guards the shared-`LlamaBackend` invariant: `fono-polish`
 //! (cleanup) and `fono-assistant` (voice chat) both embed llama.cpp,

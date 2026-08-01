@@ -6,7 +6,7 @@
 //! named pipe under `\\.\pipe\`. Both are provided by the
 //! [`interprocess`] crate so the daemon and CLI share one code path.
 //! The wire framing (length-prefixed bincode) is identical on every
-//! platform. Phase 8 Task 8.4; cross-platform in Windows port Task 4.1.
+//! platform.
 
 use std::path::Path;
 
@@ -85,12 +85,10 @@ pub enum Request {
     Status,
     /// Re-read config + secrets and rebuild STT/LLM in-place. Used by
     /// `fono use …` and `fono keys …` so the user doesn't need to
-    /// restart the daemon to switch providers. Provider-switching plan
-    /// task S11.
+    /// restart the daemon to switch providers.
     Reload,
-    /// Snapshot the current LAN-discovery registry. Slice 4 of the
-    /// network plan — backs `fono discover` and the tray's
-    /// *Discovered on LAN* submenu.
+    /// Snapshot the current LAN-discovery registry. Backs
+    /// `fono discover` and the tray's *Discovered on LAN* submenu.
     ListDiscovered,
     /// Voice-assistant push-to-talk start. Mirrors `HoldPress` but
     /// routes to the assistant pipeline (STT → assistant chat → TTS →
@@ -122,10 +120,8 @@ pub enum Request {
     /// increments an internal depth counter and — on the 0→1
     /// transition — snapshots the current tray state and flips the
     /// tray to [`fono_tray::TrayState::Processing`] (amber). The
-    /// `phase` field is logged for observability but, per v7 of the
-    /// MCP overlay plan, all three phases map to the same amber tint
-    /// today. Slice 7 of
-    /// `plans/2026-05-26-mcp-listen-overlay-and-silence-parity-v7.md`.
+    /// `phase` field is logged for observability but all three phases
+    /// map to the same amber tint today.
     McpActivityStart { phase: McpPhase },
     /// Companion to [`Self::McpActivityStart`]. Decrements the
     /// daemon's depth counter; on the →0 transition the previously
@@ -184,7 +180,7 @@ pub enum McpPhase {
 
 /// Serializable, IPC-friendly view of one mDNS-discovered peer. Mirrors
 /// `fono_net::discovery::DiscoveredPeer` minus the `Instant`/`IpAddr`
-/// types. Slice 4.
+/// types.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredPeer {
     /// `"wyoming"` | `"fono"`.
@@ -222,7 +218,7 @@ pub enum Response {
     Ok,
     /// Textual payload (e.g. status summary, doctor report).
     Text(String),
-    /// Snapshot of the LAN-discovery registry. Slice 4.
+    /// Snapshot of the LAN-discovery registry.
     Discovered(Vec<DiscoveredPeer>),
     Error(String),
     /// Sent by the daemon over an active [`Request::McpActivityHold`]

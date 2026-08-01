@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Runtime detection of Vulkan availability on the host.
 //!
-//! Per slice 2 of `plans/2026-05-02-fono-cpu-gpu-variants-v1.md`, the
-//! CPU variant of fono needs to know whether the user could benefit
-//! from upgrading to the GPU variant. The probe answers that question
-//! by:
+//! The CPU variant of fono needs to know whether the user could
+//! benefit from upgrading to the GPU variant. The probe answers that
+//! question by:
 //!
 //! 1. Opening `libvulkan.so.1` via `ash::Entry::load()` (which uses
 //!    `libloading` under the hood — no link-time dep).

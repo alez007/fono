@@ -101,7 +101,7 @@ pub fn shared_model(path: &Path, params: &LlamaModelParams) -> Result<Arc<LlamaM
 /// Cache key for [`shared_model`]: the canonicalized path together with the
 /// load-time params that materially change the resident layout. Two loads that
 /// agree on all of these can safely share one `Arc<LlamaModel>`; any difference
-/// must load a separate copy (see the `shared_model` doc and Phase B).
+/// must load a separate copy (see the `shared_model` doc).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ModelKey {
     path: PathBuf,
@@ -171,7 +171,7 @@ pub fn streaming_decode_threads() -> i32 {
 mod tests {
     use super::*;
 
-    // Phase B regression: the shared-model cache key must fold in the load-time
+    // Regression: the shared-model cache key must fold in the load-time
     // params that change resident layout, so per-role variants of the *same*
     // file don't silently reuse the first-loaded copy. `path.canonicalize()`
     // falls back to the literal path when the file is absent, so these tests

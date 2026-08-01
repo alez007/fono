@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! mDNS / DNS-SD autodiscovery for LAN Fono and Wyoming servers.
 //!
-//! Slice 4 of `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
-//!
 //! Two service types are watched and (optionally) advertised:
 //!
 //! * `_wyoming._tcp.local.` — the de-facto Wyoming service type used by
 //!   wyoming-faster-whisper, Home Assistant satellites, Rhasspy, and
 //!   any future Fono daemon hosting `[server.wyoming]`.
-//! * `_fono._tcp.local.` — Fono-native protocol (Slice 5/6,
-//!   WebSocket-based). Reserved here so the registry can already
-//!   surface peers when Slice 6 lands; the advertiser only publishes
-//!   the kinds the daemon currently serves.
+//! * `_fono._tcp.local.` — the WebSocket-based Fono-native protocol.
+//!   Reserved here so the registry can already surface such peers; the
+//!   advertiser only publishes the kinds the daemon currently serves.
 //!
 //! All discovery state is **ephemeral** — the registry is an
 //! `Arc<RwLock<HashMap>>`. Restart Fono and the LAN is rediscovered
@@ -34,7 +31,7 @@ pub use browser::Browser;
 /// Rhasspy, and Home Assistant.
 pub const WYOMING_SERVICE_TYPE: &str = "_wyoming._tcp.local.";
 
-/// Fono-native service type (Slice 5/6 — WebSocket).
+/// Fono-native service type (WebSocket).
 pub const FONO_SERVICE_TYPE: &str = "_fono._tcp.local.";
 
 /// Local LLM inference service type. `_ollama._tcp` is the de-facto
@@ -57,7 +54,7 @@ pub enum PeerKind {
     /// TCP. Compatible with `fono-stt::wyoming::WyomingStt`.
     Wyoming,
     /// `_fono._tcp.local.` — speaks the Fono-native protocol over
-    /// WebSocket. Slice 5/6.
+    /// WebSocket.
     Fono,
     /// `_ollama._tcp.local.` — an OpenAI/Ollama-compatible local LLM
     /// inference HTTP endpoint (Fono's `[server.llm]`). See ADR 0036.

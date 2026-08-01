@@ -8,7 +8,7 @@
 //! renderer a framebuffer and gets a fully painted frame back.
 //!
 //! Extracted from the original `real.rs` event-loop file as part of
-//! the 2026-05-19 overlay backend split. No drawing logic changed in
+//! the overlay backend split. No drawing logic changed in
 //! the move — the per-style branches, the heatmap cache, the
 //! `fill_round_rect` AA path, the wrap-and-tail text rendering, all
 //! preserved verbatim.
@@ -124,8 +124,8 @@ pub fn state_label(state: OverlayState) -> &'static str {
 }
 
 /// States whose panel is fed `push_level` from the live capture pump
-/// and should render the right-side VU bar. Slice 3 expansion
-/// (2026-05-22): `Recording` and `Pondering` join `LiveDictating` /
+/// and should render the right-side VU bar. `Recording` and
+/// `Pondering` join `LiveDictating` /
 /// `AssistantRecording` so the VU bar is visible during plain
 /// toggle / push-to-talk dictation, not only during the live-
 /// transcript style.
@@ -1615,8 +1615,7 @@ pub fn draw_line_with_highlight_alpha(
 
 /// Pondering label highlight color: warm peach/amber, distinct from
 /// the polishing accent so the two states stay visually separable.
-/// Locked at `+45° hue shift` per
-/// `plans/2026-05-22-fono-auto-stop-silence-v1.md`.
+/// Locked at `+45°` hue shift from the polishing accent.
 pub const COLOR_PONDER_HIGHLIGHT: u32 = 0xCCE6_B073;
 
 /// Convert fixed-point walk progress into a character index for a
@@ -2701,7 +2700,7 @@ mod tests {
 
     #[test]
     fn ignoring_state_paints_neutral_grey() {
-        // Slice 5 of plan v7 — the relevance gate's "ignored"
+        // The relevance gate's "ignored"
         // flash must read as muted / paused so it doesn't fight
         // the Recording red for visual attention.
         let state = OverlayState::Ignoring { reason: IgnoreReason::BackgroundSpeech };

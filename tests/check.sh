@@ -122,6 +122,21 @@ if cargo tree -p fono -i alsa-sys >/dev/null 2>&1; then
     exit 5
 fi
 
+# ── Step 2.6: no planning bookkeeping in source comments ──────────────
+# Comments must explain the code, not our schedule (see AGENTS.md). Plan
+# filenames and slice/task/plan-version numbers go stale the moment the
+# work lands and tell a reader nothing they can act on. ADR references
+# (`docs/decisions/`) are permanent and deliberately NOT matched here.
+# Dates are not matched either — some legitimately timestamp the outside
+# world (an upstream API probe, the perf-pass benchmark the RTF numbers
+# are anchored to), so they need a human eye, not a regex.
+step "comment hygiene (no plan/slice/task references in source)"
+if git ls-files '*.rs' | xargs grep -n -E 'plans/[0-9]{4}-|[Ss]lice [0-9]|Task [0-9]|[Pp]lan v[0-9]' 2>/dev/null; then
+    red "FAIL: the lines above cite a plan file, slice, task or plan version."
+    red "      Describe what the code does now; cite docs/decisions/ instead."
+    exit 5
+fi
+
 # ── Step 3: clippy (skipped in --quick) ───────────────────────────────
 if [[ "$QUICK" == false ]]; then
     if [[ "$SLIM" == true ]]; then

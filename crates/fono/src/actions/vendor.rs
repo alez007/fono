@@ -10,10 +10,10 @@
 //! Two measurements shaped the interface.
 //!
 //! First, a server can answer cheerfully having done nothing at all: Home
-//! Assistant returns an error-free result for a command naming a room it does
+//! Assistant returns an error-free result for a command naming an area it does
 //! not have. So [`Vendor::admission`] exists, and "no error" is never
 //! treated as proof. It also has to tell *nothing worked* from *some of it
-//! worked*: a room-wide switch-on that started the air conditioning and left
+//! worked*: an area-wide switch-on that started the air conditioning and left
 //! the one lamp that was wanted untouched is neither a success nor a total
 //! failure, and calling it either one misinforms the reply.
 //!
@@ -43,7 +43,7 @@ pub enum Admission {
     /// Nothing was touched — typically a name that matched no device.
     NothingWorked,
     /// Some targets were acted on and others were not, named here so the reply
-    /// can say which. A room-wide command routinely lands here.
+    /// can say which. An area-wide command routinely lands here.
     PartlyWorked { failed: Vec<String> },
 }
 
@@ -78,14 +78,6 @@ pub trait Vendor: Send + Sync {
         None
     }
 
-    /// Is a post-condition check worth the extra round trip for this tool?
-    ///
-    /// False for anything that only reads, or whose intent this vendor cannot
-    /// infer — asking the house about itself is not free.
-    fn checks(&self, _tool: &str) -> bool {
-        false
-    }
-
     /// Is running this tool a second time the same request as running it once?
     ///
     /// This is what decides whether a command that did not land may be handed
@@ -113,7 +105,7 @@ pub trait Vendor: Send + Sync {
     /// This is what lets Fono say "the office lamp has worked eleven times and
     /// the bedroom blind has never once" — a per-device history rather than a
     /// per-tool one. It has to be vendor knowledge and cannot be read off the
-    /// arguments: one command naming a room reaches six devices the arguments
+    /// arguments: one command naming an area reaches six devices the arguments
     /// never mention, and the reply is the only place their names appear.
     ///
     /// Empty by default, and empty is not "nothing worked" — it is "this server
@@ -124,7 +116,29 @@ pub trait Vendor: Send + Sync {
         Vec::new()
     }
 
-    /// Which argument of a tool holds a room, which holds a device, and which
+    /// What a fresh reading of the house says about the named devices.
+    ///
+    /// Weaker than [`Self::confirms`] on purpose, and the difference is the
+    /// point. `confirms` needs to know what state was *asked for*, which Fono
+    /// only knows for a tool that names an end state — two tool names, on this
+    /// server. This one needs no such knowledge: it reports what the devices
+    /// read, and lets the model be the one to notice that "off" was asked for
+    /// and `on` came back.
+    ///
+    /// It deliberately does not judge. A reading cannot be turned into a verdict
+    /// here, because this server's readback carries a device's `state` and none
+    /// of its attributes: a lamp dimmed from full to a tenth reads `on` before
+    /// and `on` after, so "nothing changed" and "changed exactly as asked" are
+    /// the same two words. Reporting the second as the first would call a
+    /// working command broken, which is the wrong direction to be wrong in.
+    ///
+    /// Empty by default, and empty means "this server does not say" — the same
+    /// meaning it has for [`Self::targets`].
+    fn readings(&self, _readback: &str, _names: &[String]) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Which argument of a tool holds an area, which holds a device, and which
     /// holds a kind of device.
     ///
     /// This is the only vendor knowledge the rails need, and it is deliberately
@@ -170,8 +184,12 @@ pub struct Target {
 /// for it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SlotFields {
-    /// Holds a room name.
+    /// Holds an area name.
     pub place: Option<&'static str>,
+    /// Holds something an area is itself inside — a storey, a wing. Same
+    /// standing as [`Self::place`]: another way of narrowing to a device, and
+    /// so another way of narrowing to the wrong one.
+    pub wider_place: Option<&'static str>,
     /// Holds a device name.
     pub device: Option<&'static str>,
     /// Holds a kind of device.
@@ -249,8 +267,8 @@ impl Vendor for HomeAssistant {
     /// successful result: `{"data": {"success": [...], "failed": [...]}}`.
     ///
     /// An empty `success` where the field exists means no device was touched —
-    /// which is exactly what happened when a Romanian command asked for a room
-    /// named `bucătărie` in a house whose rooms are all named in English.
+    /// which is exactly what happened when a Romanian command asked for an area
+    /// named `bucătărie` in a house whose areas are all named in English.
     ///
     /// A non-empty `failed` beside a non-empty `success` is a different animal
     /// and used to be reported as the same thing. Asked to turn on the light in
@@ -270,7 +288,7 @@ impl Vendor for HomeAssistant {
             return None;
         }
         // An area is a grouping, not a device: a result whose only success is
-        // the room itself touched nothing.
+        // the area itself touched nothing.
         let switched = success.is_some_and(|a| a.iter().any(is_entity));
         let missed: Vec<String> = failed
             .map(|a| a.iter().filter(|e| is_entity(e)).filter_map(name_of).collect())
@@ -280,10 +298,6 @@ impl Vendor for HomeAssistant {
             (true, true) => Admission::Worked,
             (true, false) => Admission::PartlyWorked { failed: missed },
         })
-    }
-
-    fn checks(&self, tool: &str) -> bool {
-        desired_state(tool).is_some()
     }
 
     /// The same two intents, and for the same reason: they name a state the
@@ -321,7 +335,7 @@ impl Vendor for HomeAssistant {
     /// time instead of one verdict for the lot.
     ///
     /// Areas are skipped for the reason they are skipped everywhere else here: a
-    /// room is a grouping with no state of its own, so recording a run against
+    /// area is a grouping with no state of its own, so recording a run against
     /// it would put a history on something that cannot have one.
     fn targets(&self, result: &str) -> Vec<Target> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else { return Vec::new() };
@@ -339,6 +353,12 @@ impl Vendor for HomeAssistant {
         out
     }
 
+    /// Read the same dump [`Self::confirms`] reads, and report it instead of
+    /// judging it.
+    fn readings(&self, readback: &str, names: &[String]) -> Vec<(String, String)> {
+        observed(readback, names)
+    }
+
     /// The three words Home Assistant uses across its whole intent interface.
     ///
     /// They are part of its public API — every voice integration in existence
@@ -348,7 +368,12 @@ impl Vendor for HomeAssistant {
     /// add and rename tools freely and this stays correct, whereas a tool table
     /// would rot silently at every upgrade.
     fn slot_fields(&self) -> SlotFields {
-        SlotFields { place: Some("area"), device: Some("name"), kind: Some("domain") }
+        SlotFields {
+            place: Some("area"),
+            wider_place: Some("floor"),
+            device: Some("name"),
+            kind: Some("domain"),
+        }
     }
 
     /// Recognised by the intent-name prefix every one of its tools carries.
@@ -415,6 +440,11 @@ fn claimed_entities(result: &str) -> Vec<String> {
 /// counting that as a contradiction would call a working command broken every
 /// single time.
 fn observed_states(readback: &str, wanted: &[String]) -> Vec<String> {
+    observed(readback, wanted).into_iter().map(|(_, state)| state).collect()
+}
+
+/// Every named device the reading mentions, with the state it is in.
+fn observed(readback: &str, wanted: &[String]) -> Vec<(String, String)> {
     // `GetLiveContext` hands the dump back as a JSON string under `result`,
     // where the newlines are escaped. Read through that when it is there: the
     // block-per-device parsing below needs real line breaks, and without this
@@ -436,7 +466,7 @@ fn observed_states(readback: &str, wanted: &[String]) -> Vec<String> {
             if state == "unavailable" || state == "unknown" {
                 continue;
             }
-            out.push(state.to_string());
+            out.push((name.trim().to_string(), state.to_string()));
         }
     }
     out
@@ -462,7 +492,7 @@ mod tests {
         let v = for_result(r#"{"status":"queued","id":7}"#);
         assert_eq!(v.id(), "unknown");
         assert_eq!(v.admission(SWITCHED_A_LAMP), None, "no opinion, not a verdict");
-        assert!(!v.checks("HassTurnOn"), "no point paying for a read we cannot interpret");
+        assert!(v.readings("anything", &["Hall lamp".into()]).is_empty(), "cannot read it");
         assert_eq!(v.confirms(&call("HassTurnOn"), SWITCHED_A_LAMP, ""), None);
         // Prose, or nothing at all, is nobody's payload.
         assert_eq!(for_result("Done.").id(), "unknown");
@@ -498,8 +528,8 @@ mod tests {
     }
 
     /// A per-device history needs the names out of the *reply*, not the
-    /// arguments: the half-done office command named a room, and both device
-    /// names it actually reached appear nowhere else. The room itself is not a
+    /// arguments: the half-done office command named an area, and both device
+    /// names it actually reached appear nowhere else. The area itself is not a
     /// device and must not collect a history of its own.
     #[test]
     fn each_thing_the_house_touched_is_named_separately() {
@@ -527,12 +557,12 @@ mod tests {
     fn a_half_done_command_is_neither_a_success_nor_a_failure() {
         let ha = HomeAssistant;
         let Some(Admission::PartlyWorked { failed }) = ha.admission(HALF_DONE_ROOM) else {
-            panic!("a room with successes and failures worked in part");
+            panic!("an area with successes and failures worked in part");
         };
         assert_eq!(failed, vec!["Office TV Light".to_string()]);
     }
 
-    /// The room itself always comes back as a success, so counting it as a
+    /// The area itself always comes back as a success, so counting it as a
     /// device would report a command that matched nothing as half-done.
     #[test]
     fn a_room_on_its_own_is_not_a_device_that_was_switched() {
@@ -602,15 +632,27 @@ mod tests {
     fn what_cannot_be_judged_is_left_alone() {
         let ha = HomeAssistant;
         let lit = "- names: Hall lamp\n  domain: light\n  state: 'on'\n";
-        assert!(!ha.checks("HassLightSet"), "brightness intent is not guessed at");
-        assert_eq!(ha.confirms(&call("HassLightSet"), SWITCHED_A_LAMP, lit), None);
+        assert_eq!(
+            ha.confirms(&call("HassLightSet"), SWITCHED_A_LAMP, lit),
+            None,
+            "brightness intent is not guessed at"
+        );
+        // No verdict, and still something to say: what the lamp reads is
+        // reported even where it cannot be judged.
+        assert_eq!(
+            ha.readings(lit, &["Hall lamp".to_string()]),
+            vec![("Hall lamp".to_string(), "on".to_string())]
+        );
         assert_eq!(ha.confirms(&call("HassTurnOn"), TOUCHED_NOTHING, lit), None);
         assert_eq!(
             ha.confirms(&call("HassTurnOn"), SWITCHED_A_LAMP, "- names: Other\n  state: 'on'\n"),
             None,
             "a device the house did not mention is missing evidence, not failure"
         );
-        assert!(ha.checks("HassTurnOn") && ha.checks("HassTurnOff"));
+        assert!(
+            ha.readings(lit, &["Other".to_string()]).is_empty(),
+            "a device the house did not mention reads as nothing"
+        );
     }
 
     /// A device can be listed as switched and be offline, which a real kitchen

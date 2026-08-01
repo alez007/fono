@@ -5,8 +5,7 @@
 //! Fono can use any existing speech-to-text server in the ecosystem
 //! (`wyoming-faster-whisper`, `wyoming-whisper-cpp`, Rhasspy, Home
 //! Assistant satellites, plus future `fono serve wyoming` daemons) as a
-//! drop-in cloud STT replacement that runs on the LAN. Slice 2 of
-//! `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
+//! drop-in cloud STT replacement that runs on the LAN.
 //!
 //! Wire format is implemented in `fono-net-codec`; this module only
 //! orchestrates the event sequence and converts Fono's mono `f32` PCM
@@ -97,7 +96,7 @@ pub struct WyomingStt {
     /// to the server as `transcribe.language` when non-auto.
     languages: Vec<String>,
     /// Optional pre-shared bearer token. Reserved for the future
-    /// `fono.auth` extension event Slice 5 ships; for now Wyoming v1
+    /// `fono.auth` extension event; Wyoming v1
     /// has no in-band auth so this field is plumbed but unused. Set
     /// via `with_auth_token`; `fono doctor` can verify it's present.
     auth_token: Option<String>,

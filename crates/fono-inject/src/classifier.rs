@@ -12,8 +12,7 @@ use std::borrow::Cow;
 
 /// Identifies a known coding-agent process running inside a terminal emulator.
 ///
-/// Detection happens in Phase C (terminal deep enrichment via `/proc`).
-/// In Phase A the field is always `None`.
+/// Detected during terminal deep enrichment via `/proc`.
 ///
 /// The enum is `#[non_exhaustive]` so new agents can be added without
 /// breaking existing match arms elsewhere in the codebase.
@@ -34,7 +33,7 @@ pub enum CodingAgentKind {
 
 /// Identifies the type of project in the shell's current working directory.
 ///
-/// Populated during Phase C terminal deep enrichment.
+/// Populated during terminal deep enrichment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind {
     Shell,
@@ -60,27 +59,27 @@ pub struct ContextProfile {
     /// `None` means no enrichment (base language prompt only).
     ///
     /// `Cow` allows static strings from the built-in rule table to be used
-    /// without allocation, while still permitting owned strings when Phase C
-    /// terminal enrichment appends project-specific tokens at runtime.
+    /// without allocation, while still permitting owned strings when terminal
+    /// enrichment appends project-specific tokens at runtime.
     pub whisper_hint: Option<Cow<'static, str>>,
     /// Additional instruction appended to the LLM polish system prompt.
     /// Only set for contexts where we are confident about the right framing
     /// (currently terminal only). `None` means no enrichment.
     pub llm_suffix: Option<&'static str>,
     /// When `true`, skip writing the transcription to the SQLite history DB
-    /// and skip the `redact_secrets` pass (Phase G).
+    /// and skip the `redact_secrets` pass.
     pub suppress_history: bool,
-    /// Coding agent detected in the terminal (Phase C). Always `None` in Phase A.
+    /// Coding agent detected in the terminal, when one is running there.
     pub detected_agent: Option<CodingAgentKind>,
     /// `true` when the profile was produced by the `Terminal` built-in rule.
-    /// Used in Phase E to gate the `/proc` deep-enrichment path.
+    /// Gates the `/proc` deep-enrichment path.
     pub is_terminal: bool,
     /// `true` when the profile was produced by the `CodeEditor` built-in rule.
-    /// Used in Phase F to trigger file-extension refinement from the window title.
+    /// Triggers file-extension refinement from the window title.
     pub is_code_editor: bool,
 }
 
-/// Terminal context derived from `/proc` walking (Phase C).
+/// Terminal context derived from `/proc` walking.
 ///
 /// Bundled here alongside [`CodingAgentKind`] so the types are co-located.
 #[derive(Debug, Clone)]
@@ -132,8 +131,7 @@ const TERMINAL_SHELL_SUFFIX: &str =
 /// is dictating a natural-language *instruction to the agent*, not a shell
 /// command. The shell-syntax / force-lowercase framing actively corrupts
 /// such prose (lowercased sentence starts and proper nouns), so we swap in
-/// a prose framing the moment an agent is detected. See
-/// `plans/2026-05-29-romanian-dictation-polish-reconstruction-v2.md`.
+/// a prose framing the moment an agent is detected.
 const TERMINAL_AGENT_SUFFIX: &str =
     "The user is dictating a natural-language message to a coding agent running in this \
      terminal — prose, not a shell command. Format it as ordinary prose in the speaker's \
@@ -494,7 +492,7 @@ impl ContextClassifier {
     /// - Stores the detected coding agent in `profile.detected_agent`.
     ///
     /// Called after [`ContextClassifier::classify`] when the focused window is
-    /// a terminal emulator and `window_pid` is available (Phase C).
+    /// a terminal emulator and `window_pid` is available.
     pub fn enrich_terminal(profile: &mut ContextProfile, ctx: &TerminalContext) {
         let addition: Option<&'static str> = match ctx.project {
             ProjectKind::Rust => Some("cargo build, cargo test, cargo clippy, rustc, --release"),
@@ -556,7 +554,7 @@ impl ContextClassifier {
                 }
             }
             let mut profile = (rule.profile)();
-            // Phase F: refine CodeEditor profiles based on file extension in title.
+            // Refine CodeEditor profiles based on file extension in title.
             if profile.is_code_editor {
                 if let Some(title) = window_title {
                     refine_editor_profile(&mut profile, title);
@@ -568,8 +566,8 @@ impl ContextClassifier {
     }
 }
 
-/// Phase F: Refine a `CodeEditor` profile based on file extension detected in
-/// the window title.
+/// Refine a `CodeEditor` profile based on file extension detected in the
+/// window title.
 ///
 /// Code editors reliably expose the open file name in their window title
 /// (e.g. `main.rs — Visual Studio Code`, `kate — ~/project/src/lib.py`).
@@ -743,20 +741,20 @@ mod tests {
         assert!(p.detected_agent.is_none());
     }
 
-    // Windows executable-name rules (Windows port plan Task 9.3). The
-    // Win32 focus probe returns bare exe names like `chrome.exe`; these
-    // rules only compile into the Windows binary, so the test is gated to
+    // Windows executable-name rules. The Win32 focus probe returns bare
+    // exe names like `chrome.exe`; these rules only compile into the
+    // Windows binary, so the test is gated to
     // match (zero cost to the Linux/macOS binary).
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_exe_names_classify() {
-        // Browser (Task 9.3 reference app).
+        // Browser.
         let chrome = ContextClassifier::classify(Some("chrome.exe"), None).unwrap();
         assert_eq!(chrome.name, "Browser");
-        // Code editor (Task 9.3 reference app) — case-insensitive match.
+        // Code editor — case-insensitive match.
         let code = ContextClassifier::classify(Some("Code.exe"), None).unwrap();
         assert!(code.is_code_editor);
-        // Terminal (Task 9.3 reference app).
+        // Terminal.
         let term = ContextClassifier::classify(Some("WindowsTerminal.exe"), None).unwrap();
         assert!(term.is_terminal);
         // Private app still suppresses history on Windows.

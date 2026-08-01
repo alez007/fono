@@ -2,8 +2,7 @@
 //! Typed model-capability surface for the equivalence harness.
 //!
 //! Replaces the inline `args.stt == "local" && args.model.ends_with(".en")`
-//! boolean previously embedded in `bin/fono-bench.rs` (Wave 2 Thread A,
-//! `plans/2026-04-28-wave-2-close-out-v1.md`). Centralising the decision
+//! boolean previously embedded in `bin/fono-bench.rs`. Centralising it
 //! lets `run_fixture` short-circuit before WAV reads on incompatible
 //! fixtures, and gives the JSON report a stable place to record which
 //! model produced each row.

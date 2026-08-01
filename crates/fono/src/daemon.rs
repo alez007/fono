@@ -317,7 +317,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     };
 
     // ---------------------------------------------------------------
-    // mDNS discovery (Slice 4 of the network plan). Starts after the
+    // mDNS discovery. Starts after the
     // global hotkey grab so LAN browsing cannot delay local desktop
     // readiness. The Wyoming advertiser is managed alongside the LAN
     // listener below so both can be toggled live from the tray.
@@ -327,7 +327,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         discovery.as_ref().map(|d| d.registry.clone());
 
     // ---------------------------------------------------------------
-    // LAN Wyoming server (Slice 3 of the network plan). Off by default;
+    // LAN Wyoming server. Off by default;
     // reconciled after the hotkey grab so optional network serving does
     // not hold up local dictation readiness. Held for the daemon's
     // lifetime; dropped on exit, which closes the listener and fires
@@ -361,7 +361,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     llm_ctl.reconcile(&config, orchestrator.as_ref()).await;
 
     // ---------------------------------------------------------------
-    // Web settings UI server (plans/2026-07-02-web-config-ui-v2.md).
+    // Web settings UI server.
     // Off by default; loopback-only unless `[server.web].bind` is
     // widened. Serves the embedded browser settings page + JSON API.
     // Config writes go through the same save → orchestrator reload →
@@ -387,7 +387,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     // Refresh what the connected homes and services offer, once, at
     // startup. The catalogue is a cache on disk, and until now nothing
     // ever refreshed it outside the settings page — so renaming a lamp
-    // or adding a room left fono confidently insisting the device did
+    // or adding an area left fono confidently insisting the device did
     // not exist, indefinitely. Anything the user changed while fono was
     // not running is picked up here instead.
     //
@@ -409,7 +409,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
             let secrets = Secrets::load(&secrets_path).unwrap_or_default();
             let orch = orch_for_refresh.as_ref();
             match refresh_all_servers(&db, &config_path, &secrets, orch).await {
-                Ok(_) => info!("startup refresh: device and room lists are up to date"),
+                Ok(_) => info!("startup refresh: device and area lists are up to date"),
                 Err(e) => warn!("startup refresh: {e}"),
             }
         });
@@ -509,9 +509,6 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     // without an SNI host (sway-without-waybar, bare X11) are handled
     // inside `fono-tray` itself: the tray task logs one warning and
     // exits cleanly while dictation + overlay continue.
-    //
-    // See `plans/2026-04-30-fono-single-binary-size-v1.md` Phase 3
-    // Task 3.1 for the runtime-detection contract.
     // ---------------------------------------------------------------
     let graphical = crate::is_graphical_session();
     let (tray, mut tray_rx) = if !graphical {
@@ -1053,7 +1050,6 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     // active; >0 = inside `fono.listen` / `fono.speak` / `fono.confirm`).
     // The `TrayState` is the snapshot taken on the 0→1 transition so
     // we can restore exactly what was on screen before MCP took over.
-    // Slice 7 of plan v7.
     let mcp_activity: Arc<std::sync::Mutex<(u32, TrayState)>> =
         Arc::new(std::sync::Mutex::new((0, TrayState::Idle)));
     // Broadcast sender used to forward "Escape pressed while MCP is
@@ -1102,7 +1098,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                 tracing::debug!("hotkey: {action:?} -> {new_state:?}");
                 // Suspend/resume the wake-word listener so the mic is held
                 // only in Idle: any active/processing state drops the capture
-                // stream, returning to Idle re-opens it (Phase D).
+                // stream, returning to Idle re-opens it.
                 wake_disp.set_idle(crate::wake::should_listen(new_state));
                 if matches!(action, HotkeyAction::ProcessingDone) {
                     if let Some(t) = tray.as_ref().as_ref() {
@@ -1306,7 +1302,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                     }
                     TrayAction::SetWakeWordEnabled(v) => {
                         // Persist the toggle, then reconcile the always-on
-                        // listener live (Phase D): enabling while Idle opens
+                        // listener live: enabling while Idle opens
                         // the capture stream, disabling drops it — no daemon
                         // restart. `apply_pref_via_tray` writes to disk and
                         // reloads the orchestrator; `wake_tray.reload()` then
@@ -1428,8 +1424,8 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                     TrayAction::ActivateLeftClick => {
                         // Left-click on the tray icon: surface the same
                         // contextual hint the wizard / status notification
-                        // would. No-op for now; full handling will land
-                        // alongside the onboarding plan.
+                        // would. Not implemented; the click is accepted and
+                        // logged so the tray backend has a stable target.
                         debug!("tray: ActivateLeftClick (no-op)");
                     }
                     TrayAction::ToggleMcpServer => {
@@ -1656,9 +1652,9 @@ fn print_banner(paths: &Paths, config: &Config, verbosity: Verbosity) {
              paste it with Cmd+V"
         );
     }
-    // macOS permissions onboarding (port plan Task 9.3): CGEventPost
-    // silently drops events without the Accessibility grant, so probe
-    // instead of injecting and hoping. In a graphical session the
+    // macOS permissions onboarding: CGEventPost silently drops events
+    // without the Accessibility grant, so probe instead of injecting
+    // and hoping. In a graphical session the
     // prompting variant raises the native system dialog (deep link to
     // the right Settings pane); macOS shows it at most once per app
     // identity, so this is idempotent across daemon restarts. Headless
@@ -1872,7 +1868,7 @@ async fn handle_client(
                 Some(o) => match o.reload().await {
                     Ok(summary) => {
                         // Reconcile the wake-word listener against the freshly
-                        // reloaded `[wakeword]` config (Phase D live reload).
+                        // reloaded `[wakeword]` config (live reload).
                         wake.reload();
                         Response::Text(summary)
                     }
@@ -2045,7 +2041,6 @@ async fn handle_client(
 /// ([`TrayState::Processing`]). Nested starts only bump the counter
 /// — they do not re-snapshot, so the eventual restore picks up
 /// whatever the tray showed before the *outermost* MCP span began.
-/// Slice 7 of plan v7.
 #[allow(clippy::significant_drop_tightening)]
 fn handle_mcp_activity_start(
     state: &std::sync::Mutex<(u32, TrayState)>,
@@ -2081,11 +2076,11 @@ fn handle_mcp_activity_start(
 /// on →0 restores the tray baseline iff the tray is still showing
 /// the amber state we last set. If another writer (FSM event
 /// consumer, tray dispatcher) has moved the tray in the interim, we
-/// leave it alone — last-writer-wins per the v7 design. Calls with
+/// leave it alone — last-writer-wins by design. Calls with
 /// depth already 0 are ignored with a `debug` log; the IPC layer
 /// has no way to know whether the matching Start was lost in
 /// transit, so being lenient avoids spurious tray flips on noisy
-/// links. Slice 7 of plan v7.
+/// links.
 #[allow(clippy::significant_drop_tightening)]
 fn handle_mcp_activity_end(
     state: &std::sync::Mutex<(u32, TrayState)>,
@@ -3622,8 +3617,7 @@ fn wyoming_wake_models(config: &Config) -> Vec<fono_net::wyoming::server::Advert
 /// disabled, the orchestrator is in degraded mode, or the listener
 /// fails to bind (failures are logged at `warn!` and never abort the
 /// daemon — dictation must keep working even if the LAN server can't
-/// come up). Slice 3 of
-/// `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
+/// come up).
 async fn spawn_wyoming_server_if_enabled(
     config: &Config,
     paths: &Paths,
@@ -3703,8 +3697,8 @@ async fn spawn_wyoming_server_if_enabled(
     }
     if serve_wake {
         // Bind a wake provider that builds the *same* detector as the local
-        // listener (Phase C/D) per connection, so the LAN wake service runs
-        // on-device. fono-net's `WakeProvider` is invoked once per accepted
+        // listener, per connection, so the LAN wake service runs on-device.
+        // fono-net's `WakeProvider` is invoked once per accepted
         // connection (wake sessions are stateful).
         // Build from the *effective* config so a fresh install with no
         // `[wakeword].phrases` still serves the runtime default model.
@@ -3897,8 +3891,7 @@ type WebSettingsSlot = Arc<tokio::sync::Mutex<Option<fono_net::WebSettingsHandle
 /// Spawn the web settings UI server if `[server.web].enabled = true`.
 /// Returns `None` when disabled or when the listener fails to bind
 /// (failures are logged at `warn!` and never abort the daemon).
-/// Mirrors [`spawn_llm_server_if_enabled`]; see
-/// `plans/2026-07-02-web-config-ui-v2.md`.
+/// Mirrors [`spawn_llm_server_if_enabled`].
 ///
 /// The hook closures re-read config/secrets from disk on every request
 /// (disk is the source of truth, same as the tray preference paths) and
@@ -4154,7 +4147,8 @@ fn web_settings_hooks(
     let speak = speech_hook(config_path.clone(), secrets_path.clone(), paths.voices_dir());
     let meta = meta_hook(config_path, secrets_path, paths.polish_models_dir());
     let doctor = doctor_hook(paths);
-    let (list_tools, set_tool_enabled, discover_tools) = tool_catalog_hooks(paths, orchestrator);
+    let (list_tools, set_tool_enabled, discover_tools, edit_shortcut) =
+        tool_catalog_hooks(paths, orchestrator);
     let probe_llm = probe_llm_hook(paths);
     let (list_dictation, list_threads, get_thread, delete_history) = history_hooks(paths);
 
@@ -4181,6 +4175,7 @@ fn web_settings_hooks(
         list_tools,
         set_tool_enabled,
         discover_tools,
+        edit_shortcut,
         probe_llm,
         list_dictation,
         list_threads,
@@ -4471,6 +4466,7 @@ fn tool_catalog_hooks(
     fono_net::web_settings::ListToolsFn,
     fono_net::web_settings::SetToolEnabledFn,
     fono_net::web_settings::DiscoverToolsFn,
+    fono_net::web_settings::EditShortcutFn,
 ) {
     use fono_core::tool_catalog::ToolCatalogStore;
 
@@ -4564,8 +4560,24 @@ fn tool_catalog_hooks(
             Ok(())
         });
 
+    // Neither edit touches the prompt, so neither costs a re-warm: the phrases
+    // are Fono's own shortcut to skipping the assistant, and the assistant is
+    // never told they exist.
+    let db = paths.tool_catalog_db();
+    let edit_shortcut: fono_net::web_settings::EditShortcutFn = Arc::new(move |phrase, also| {
+        let store = ToolCatalogStore::open(&db).map_err(|e| format!("open tool catalog: {e}"))?;
+        if let Some(also) = also {
+            store.add_phrase(phrase, also).map_err(|e| format!("add phrase: {e}"))?;
+            info!("web settings: {also:?} now also stands for what {phrase:?} runs");
+        } else {
+            store.forget_phrase(phrase).map_err(|e| format!("forget phrase: {e}"))?;
+            info!("web settings: forgot the phrase {phrase:?}");
+        }
+        Ok(())
+    });
+
     let discover_tools = discover_tools_hook(paths, orchestrator);
-    (list_tools, set_tool_enabled, discover_tools)
+    (list_tools, set_tool_enabled, discover_tools, edit_shortcut)
 }
 
 /// `POST /api/tools/discover`: ask every configured MCP server what it
@@ -4657,16 +4669,16 @@ async fn refresh_all_servers(
         let mut report = store
             .reconcile(&server.name, "sse", &tools)
             .map_err(|e| format!("reconcile {}: {e}", server.name))?;
-        // Remember the rooms too. Without them the model invents a
+        // Remember the areas too. Without them the model invents a
         // name — asked in Romanian it sends "bucătărie" to a house
-        // whose rooms are all in English, and nothing happens.
+        // whose areas are all in English, and nothing happens.
         match store.set_place_names(&server.name, &found.places) {
-            // The room list is part of the prompt, so a room appearing
+            // The area list is part of the prompt, so an area appearing
             // or disappearing makes the warm prefix stale exactly as a
             // new tool does.
             Ok(changed) => report.prompt_dirty |= changed,
             Err(e) => {
-                warn!("tool discovery: cannot store room names for {}: {e}", server.name);
+                warn!("tool discovery: cannot store area names for {}: {e}", server.name);
             }
         }
         // And the devices, each with the kind of thing it is. The home only
@@ -4712,7 +4724,7 @@ async fn refresh_all_servers(
         prompt_dirty = true;
     }
     // Discovery is the biggest thing that can move the prompt: new
-    // tools, new rooms, new device names, all of which the assistant
+    // tools, new areas, new device names, all of which the assistant
     // reads before it can answer. Re-warm so the first command after
     // connecting a house does not pay for the whole catalogue — but
     // only when something actually moved. Re-warming a prefix that
@@ -5966,7 +5978,7 @@ struct DiscoveryRuntime {
 /// started here — it is owned by [`WyomingControl`] alongside the LAN
 /// listener so both can be toggled live from the tray. All failure
 /// paths log and continue — discovery is a convenience layer, not a
-/// hard dependency. Slice 4 of the network plan.
+/// hard dependency.
 async fn spawn_discovery_if_enabled() -> Option<DiscoveryRuntime> {
     let daemon = match mdns_sd::ServiceDaemon::new() {
         Ok(d) => d,
@@ -6117,7 +6129,7 @@ fn hostname() -> Option<String> {
 }
 
 /// Convert a `fono_net::discovery::Registry` snapshot into the
-/// IPC-friendly representation. Slice 4.
+/// IPC-friendly representation.
 fn snapshot_discovered(registry: &fono_net::discovery::Registry) -> Vec<fono_ipc::DiscoveredPeer> {
     let now = std::time::Instant::now();
     registry
@@ -6186,7 +6198,7 @@ mod tests {
             s.save(&paths.secrets_file()).unwrap();
         }
 
-        let (list, set_enabled, discover) = tool_catalog_hooks(&paths, None);
+        let (list, set_enabled, discover, _edit) = tool_catalog_hooks(&paths, None);
 
         // Probe mode first: a server can be tried before it is saved, and a
         // probe must never leave anything behind. This is the "Test" button.

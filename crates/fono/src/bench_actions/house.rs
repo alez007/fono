@@ -444,7 +444,7 @@ pub enum Requirement {
     /// An area containing a device in `domain` **and** at least one device in
     /// a different switchable domain.
     ///
-    /// This resolves the whole domain-less room command by itself, and it is
+    /// This resolves the whole domain-less area command by itself, and it is
     /// the reason discovery beats a hand-written map: the bystander — the
     /// thing that must **not** move when the user asks for the lights — is
     /// found automatically, and it is whatever that house actually has.
@@ -461,9 +461,9 @@ pub enum Requirement {
     NamedDevice { name: String },
     /// Every device of one domain in one named area, as a group.
     ///
-    /// A room command is not a command to one device: "turn on the light in
-    /// the master bedroom" is satisfied only when the room's lights are on,
-    /// and a harness that watched a single lamp would call a half-lit room a
+    /// An area command is not a command to one device: "turn on the light in
+    /// the master bedroom" is satisfied only when the area's lights are on,
+    /// and a harness that watched a single lamp would call a half-lit area a
     /// pass. The group is what gets staged, scored and restored together.
     NamedArea { area: String, domain: String },
 }
@@ -477,12 +477,12 @@ pub struct Target {
     pub device: Entity,
     /// Every entity the command is expected to move.
     ///
-    /// Usually just `device`. For a room command it is all the room's lights,
+    /// Usually just `device`. For an area command it is all the area's lights,
     /// because "turn on the light in the bedroom" is not satisfied by one of
     /// three lamps coming on — and a harness watching a single lamp would
-    /// score a half-lit room as a pass.
+    /// score a half-lit area as a pass.
     pub group: Vec<Entity>,
-    /// The area to use when the utterance names a room.
+    /// The area to use when the utterance names an area.
     pub area: Option<String>,
     /// The entity that must be unaffected, for requirements that have one.
     pub bystander: Option<Entity>,
@@ -508,7 +508,7 @@ impl Target {
 }
 
 /// Domains that are switchable and therefore make a meaningful bystander —
-/// something a room-wide command would wrongly reach.
+/// something an area-wide command would wrongly reach.
 const SWITCHABLE: &[&str] = &["light", "switch", "climate", "fan", "media_player", "cover"];
 
 /// Words that make an entity *read* as belonging to a domain, whatever the
@@ -732,7 +732,7 @@ mod tests {
         assert!(!h.targetable(couch));
 
         // Every requirement routes around it, including the one that asks by
-        // name and the one that stages a whole room.
+        // name and the one that stages a whole area.
         for req in [
             Requirement::Device { domain: "light".into() },
             Requirement::DimmableDevice { domain: "light".into() },
@@ -767,7 +767,7 @@ mod tests {
     }
 
     /// The bystander is found without anyone naming it: the office has a lamp
-    /// and an air conditioner, which is exactly the domain-less room command.
+    /// and an air conditioner, which is exactly the domain-less area command.
     #[test]
     fn finds_a_room_with_a_bystander() {
         let h = House::parse(DUMP);
@@ -778,7 +778,7 @@ mod tests {
     }
 
     /// The hallway has a lamp and a cover, but the cover is a garage door and
-    /// is excluded, so the hallway must not be chosen as the bystander room.
+    /// is excluded, so the hallway must not be chosen as the bystander area.
     #[test]
     fn an_excluded_device_cannot_serve_as_the_bystander() {
         let dump = "\
@@ -808,7 +808,7 @@ mod tests {
     /// exists. "Basement lights" is a `switch`, so by domain alone it looked
     /// like a fine bystander for "turn on the lights in the Basement" — but
     /// asserting it must **not** move would fail a model for doing what the
-    /// user plainly meant. The room must be rejected instead.
+    /// user plainly meant. The area must be rejected instead.
     #[test]
     fn a_switch_named_lights_is_not_a_bystander_for_a_light_command() {
         let dump = "\
@@ -823,7 +823,7 @@ mod tests {
         assert!(Requirement::AreaWithBystander { domain: "light".into() }.resolve(&h).is_err());
     }
 
-    /// The exclusion must not be so eager that ordinary rooms stop resolving:
+    /// The exclusion must not be so eager that ordinary areas stop resolving:
     /// an air conditioner is a perfectly fair bystander for a light command.
     #[test]
     fn an_unrelated_device_is_still_a_valid_bystander() {
@@ -859,7 +859,7 @@ mod tests {
         assert!(h.entities.is_empty());
     }
 
-    /// Aliases share a line and must be split, or a Romanian room name in an
+    /// Aliases share a line and must be split, or a Romanian area name in an
     /// English house is never found.
     #[test]
     fn area_aliases_are_split() {

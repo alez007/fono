@@ -6,8 +6,7 @@
 //! unregisters and exits. Useful for answering "can this session grab
 //! global hotkeys at all?" without starting the daemon — e.g. over
 //! headless SSH on macOS, where Carbon `RegisterEventHotKey` behaviour
-//! outside a WindowServer session is the question itself (macOS port
-//! plan, Phase 5 headless gate).
+//! outside a WindowServer session is the question itself.
 //!
 //! Usage: `cargo run -p fono-hotkey --example probe [key ...]`
 

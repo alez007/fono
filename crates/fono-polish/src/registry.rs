@@ -25,8 +25,8 @@ pub struct LocalLlmModelInfo {
 /// breaks first-run downloads for every user with a hard-fail
 /// `sha256 mismatch` (the downloader deletes the file and gives up — see
 /// `fono-download`). This bit us on `gemma-4-e2b`: Google re-uploaded
-/// `gemma-4-E2B_q4_0-it.gguf` twice (2026-07-15 and 2026-07-17) under a
-/// moving `main`, so a pin that was correct when written started rejecting
+/// `gemma-4-E2B_q4_0-it.gguf` twice under a moving `main`, so a pin that
+/// was correct when written started rejecting
 /// a perfectly good download. Pinning the revision makes the URL content-
 /// stable, so a pin only ever changes when WE deliberately bump it.
 ///

@@ -35,7 +35,7 @@ pub struct AssistantPromptCacheWarmup {
     /// model's tool template — must warm the prompt it will actually use. A
     /// trace of a small local model showed the cost of not doing so: the warm
     /// pinned 72 tokens of bare greeting while the live prompt opened with 1510
-    /// tokens of greeting, rooms, devices and tool descriptions, so every first
+    /// tokens of greeting, areas, devices and tool descriptions, so every first
     /// command of a conversation paid thirteen seconds to read a device list
     /// that had not changed since boot.
     ///
@@ -71,7 +71,7 @@ pub struct AssistantPromptCacheSnapshot {
 
 /// Assemble the steady head, in the order that survives a weak model.
 ///
-/// `context` — who the assistant is, the rooms, the device names — then the
+/// `context` — who the assistant is, the areas, the device names — then the
 /// tool block, then `instructions`: how to behave. Everything here changes
 /// only when the house does, so the whole string stays checkpointable.
 ///
@@ -106,7 +106,7 @@ pub fn compose_head(context: &str, tool_block: Option<&str>, instructions: Optio
 /// Compose the system block a backend will actually send: the steady head
 /// first, the volatile per-turn notes last.
 ///
-/// The head — greeting, rooms, devices, tool descriptions — changes only when
+/// The head — greeting, areas, devices, tool descriptions — changes only when
 /// the house does, so a backend that checkpoints its prompt can keep it for
 /// days. The notes change from one turn to the next. Putting them last is what
 /// lets a change of speaker cost a handful of tokens instead of throwing away
@@ -266,21 +266,21 @@ pub struct ActionTools {
     /// the user left switched on.
     pub descriptors: Vec<serde_json::Value>,
     pub execute: ToolExecFn,
-    /// A line to append to the system prompt naming the real rooms, so the
+    /// A line to append to the system prompt naming the real areas, so the
     /// model picks one instead of translating and inventing. `None` when
     /// nothing is known or the user switched it off.
     pub hint: Option<String>,
     /// Rails for a model writing a command on this machine: the only text it
     /// is allowed to sample once it starts one.
     ///
-    /// Built from the tools offered this turn and the rooms and devices the
+    /// Built from the tools offered this turn and the areas and devices the
     /// house reported, so it can only ever describe things that exist. `None`
     /// when the user has not switched it on, when nothing could be derived, or
     /// on any backend that is not running the model here — a service enforces
     /// its own schema and needs no help.
     ///
     /// A hint asks; this decides. Both are kept because they answer different
-    /// halves of the same failure: the hint tells the model which room to pick,
+    /// halves of the same failure: the hint tells the model which area to pick,
     /// the rails stop it writing one that does not exist.
     pub grammar: Option<String>,
 }
@@ -306,7 +306,7 @@ pub struct AssistantContext {
     /// Carried apart from [`system_prompt`] because it is the most volatile
     /// thing in the prompt — it appears, disappears and changes identity from
     /// one turn to the next — while everything around it (the greeting, the
-    /// rooms, the devices, the tool descriptions) changes only when the house
+    /// areas, the devices, the tool descriptions) changes only when the house
     /// does. A backend that caches its prompt must put the steady part first
     /// and this last, or a change of speaker throws away nine hundred tokens
     /// of device list that was perfectly good.
@@ -614,13 +614,13 @@ mod tests {
         // The whole point of composing them separately: a change of language or
         // speaker must cost the notes, never the device list in front of them.
         let ctx = AssistantContext {
-            system_prompt: "You are Fono.\n\nRooms: Kitchen, Office.".into(),
+            system_prompt: "You are Fono.\n\nAreas: Kitchen, Office.".into(),
             instructions: Some("Keep replies short.".into()),
             language: Some("ro".into()),
             ..Default::default()
         };
         let block = ctx.system_block();
-        assert!(block.starts_with("You are Fono.\n\nRooms: Kitchen, Office."), "{block}");
+        assert!(block.starts_with("You are Fono.\n\nAreas: Kitchen, Office."), "{block}");
         assert!(block.ends_with("Reply in Romanian."), "{block}");
         // Rules after the context, notes after the rules.
         let rules = block.find("Keep replies short.").expect("instructions present");
@@ -632,7 +632,7 @@ mod tests {
     fn a_turn_with_no_notes_leaves_the_head_byte_identical() {
         // A pinned prefix is only reusable while it stays a *byte* prefix of the
         // live prompt, so the no-notes path must not so much as trim.
-        let head = "You are Fono.\n\nRooms: Kitchen.\n";
+        let head = "You are Fono.\n\nAreas: Kitchen.\n";
         assert_eq!(compose_system_prompt(head, None), head);
         assert_eq!(compose_system_prompt(head, Some("   ")), head);
     }

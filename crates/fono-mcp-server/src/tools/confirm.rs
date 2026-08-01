@@ -164,7 +164,6 @@ impl Tool for ConfirmTool {
         // listen-and-match span. listen_once itself adds a nested
         // Listening guard; the daemon's depth counter keeps the tray
         // amber throughout and only restores on the outermost Drop.
-        // Slice 7 of plan v7.
         let _confirm_guard =
             McpActivityGuard::new(McpPhase::Confirming, &self.daemon_ipc_candidates);
 

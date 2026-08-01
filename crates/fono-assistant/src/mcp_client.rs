@@ -49,7 +49,7 @@ pub struct RawTool {
 pub struct Discovery {
     pub server: ServerInfo,
     pub tools: Vec<RawTool>,
-    /// The rooms this server knows about, when it can say. Empty otherwise.
+    /// The areas this server knows about, when it can say. Empty otherwise.
     pub places: Vec<String>,
     /// The names of things that can actually be operated — lights, switches,
     /// blinds and so on, each with the kind of thing it is. Sensors are left
@@ -209,7 +209,7 @@ async fn discover_inner(ep: &McpEndpoint) -> Result<Discovery> {
     let listed = s.request("tools/list", json!({})).await?;
     let mut tools = parse_tools(&listed)?;
     tools.sort_by(|a, b| a.name.cmp(&b.name));
-    // While we are here, ask the server what rooms it has. Doing it now
+    // While we are here, ask the server what areas it has. Doing it now
     // rather than per command is the whole point: the model can be told the
     // real names without anybody waiting for a round-trip to find them.
     let mut places = Vec::new();
@@ -222,7 +222,7 @@ async fn discover_inner(ep: &McpEndpoint) -> Result<Discovery> {
                 devices = parse_devices(&text);
             }
             // A server that will not describe itself is not a broken server.
-            // Discovery still succeeded; we simply have no room names.
+            // Discovery still succeeded; we simply have no area names.
             Err(e) => tracing::debug!(target: "fono.assistant", "no place names: {e}"),
         }
     }
@@ -232,7 +232,7 @@ async fn discover_inner(ep: &McpEndpoint) -> Result<Discovery> {
 /// The tool a Home Assistant offers for describing itself.
 const LIVE_CONTEXT: &str = "GetLiveContext";
 
-/// Pull room names out of a Home Assistant live-context dump.
+/// Pull area names out of a Home Assistant live-context dump.
 ///
 /// Deliberately a text scrape rather than a schema: the dump is prose-ish
 /// YAML meant for a model to read, and every entity carries the area it is
@@ -244,7 +244,7 @@ fn parse_places(text: &str) -> Vec<String> {
     let mut names: Vec<String> = inner
         .lines()
         .filter_map(|l| l.trim().strip_prefix("areas:").map(str::trim))
-        // An entity in a room with aliases lists them all on one line
+        // An entity in an area with aliases lists them all on one line
         // ("areas: Kitchen, bucătărie"), so each has to be split out — kept
         // whole it would be offered to the model as a single unusable name.
         .flat_map(|l| l.split(','))
@@ -501,9 +501,9 @@ mod tests {
     }
 
     /// The real dump shape: JSON envelope, prose-ish YAML inside, one
-    /// `areas:` line per entity — so the same room appears many times.
+    /// `areas:` line per entity — so the same area appears many times.
     #[test]
-    fn scrapes_room_names_from_a_live_context_dump() {
+    fn scrapes_area_names_from_a_live_context_dump() {
         let dump = "Live Context:\n- names: Kitchen lights\n  domain: light\n  \
                     areas: Kitchen\n  state: 'off'\n- names: Kitchen lights (2)\n  \
                     domain: light\n  areas: Kitchen\n- names: Hall lamp\n  \
@@ -517,21 +517,21 @@ mod tests {
         assert_eq!(parse_places(dump), vec!["Hall", "Kitchen", "Yard"]);
     }
 
-    /// A room with aliases lists them all on one line. Each is a name the
+    /// An area with aliases lists them all on one line. Each is a name the
     /// house will answer to, so each must reach the model separately —
-    /// offered whole, "Kitchen, bucătărie" is a room that does not exist.
+    /// offered whole, "Kitchen, bucătărie" is an area that does not exist.
     #[test]
-    fn a_room_with_aliases_yields_each_name_separately() {
+    fn an_area_with_aliases_yields_each_name_separately() {
         let dump = "- names: Kitchen lights\n  domain: light\n  areas: Kitchen, bucătărie\n\
                     - names: Hall light\n  domain: light\n  areas: 'Hallway , hol'\n";
         assert_eq!(parse_places(dump), vec!["Hallway", "Kitchen", "bucătărie", "hol"]);
     }
 
     /// Anything we do not recognise must yield no names at all. Telling the
-    /// model a wrong room name is worse than telling it none: it would aim
+    /// model a wrong area name is worse than telling it none: it would aim
     /// confidently at something that does not exist.
     #[test]
-    fn an_unrecognised_dump_yields_no_room_names() {
+    fn an_unrecognised_dump_yields_no_area_names() {
         assert!(parse_places("").is_empty());
         assert!(parse_places("{\"result\": \"nothing useful here\"}").is_empty());
         assert!(parse_places("areas:").is_empty());
@@ -557,11 +557,11 @@ mod tests {
     }
 
     /// The exact shape that failed against a real house: the lamp is named
-    /// after the room it lights, not the one it sits in. Its name must reach
+    /// after the area it lights, not the one it sits in. Its name must reach
     /// the model verbatim, because the house matches names exactly — neither
     /// "outdoor light" nor "outdoor office light" finds it.
     #[test]
-    fn keeps_a_device_name_that_disagrees_with_its_room() {
+    fn keeps_a_device_name_that_disagrees_with_its_area() {
         let dump = "- names: Office outdoor light\n  domain: light\n  areas: Yard\n";
         assert_eq!(parse_devices(dump), vec![Device::new("Office outdoor light", "light")]);
     }

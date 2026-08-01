@@ -9,9 +9,7 @@
 //! * Ollama `GET /api/tags`, `POST /api/chat` (stream + non-stream),
 //! * auth (401) + not-found (404) fallbacks.
 //!
-//! This is the "real client ↔ real server ↔ mock assistant" gate for
-//! Phase 1 of
-//! `plans/2026-07-01-local-llm-openai-ollama-server-v1.md`.
+//! This is the "real client ↔ real server ↔ mock assistant" gate.
 
 #![cfg(feature = "llm-server")]
 

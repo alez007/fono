@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Brain-tap overhead benchmark — Task 1.4 of
-//! `plans/2026-07-05-brain-visualization-v1.md`.
+//! Brain-tap overhead benchmark.
 //!
 //! Measures per-token decode cost on a real GGUF model in three
 //! configurations, interleaved round-robin to cancel thermal drift:
@@ -17,7 +16,7 @@
 //! against the < 1 % budget (`OVERHEAD_BUDGET`). The wall-clock A/B
 //! medians are printed as a secondary sanity signal only. Also
 //! validates that active keyframes carry a nonzero norm for **every**
-//! model layer (the Task 1.3 tensor-name desk-check, on real data).
+//! model layer (the tensor-name desk-check, on real data).
 //!
 //! Run (release build is mandatory — debug decode speed is meaningless):
 //!
@@ -172,7 +171,7 @@ fn main() -> Result<()> {
         tap.interval()
     );
 
-    // Keyframe validation (Task 1.3 on real data): merged across the
+    // Keyframe validation on real data: merged across the
     // trailing LAYER_STRIDE keyframes (each frame observes one rotating
     // residue class of layers), every layer of a dense model must have
     // produced a nonzero l_out norm, and the sampler-side stats must be

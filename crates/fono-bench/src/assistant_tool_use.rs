@@ -616,7 +616,7 @@ fn system_prompt(language: &str, manifest: &AssistantToolUseManifest) -> String 
             "Fono voice assistant. Folosește unealta numai pentru comenzi clare de aprindere/stingere lumini. Dacă lipsește camera/lampa, întreabă scurt; nu apela unealta. Confirmă scurt după rezultat."
         }
         _ => {
-            "Fono voice assistant. Use the tool only for clear light on/off commands. If the room/light is missing, ask briefly; do not call the tool. Confirm briefly after the result."
+            "Fono voice assistant. Use the tool only for clear light on/off commands. If the area/light is missing, ask briefly; do not call the tool. Confirm briefly after the result."
         }
     };
     let mut s = String::from(intro);

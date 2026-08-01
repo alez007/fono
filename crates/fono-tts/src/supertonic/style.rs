@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Supertonic `voice.bin` style-pack parser (Slice 2, Task 2.2).
+//! Supertonic `voice.bin` style-pack parser.
 //!
 //! `voice.bin` is a small binary holding every speaker's style vectors for
 //! the two style-conditioned graphs: a 6×`i64` little-endian header giving the

@@ -14,9 +14,7 @@
 //!
 //! This crate is transport-agnostic: it knows how to serialise and
 //! parse a [`Frame`] over any [`AsyncRead`]/[`AsyncWrite`] pair. The
-//! WebSocket and TCP I/O glue lives in the `fono-net` crate (Slice 2+).
-//!
-//! See `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
+//! WebSocket and TCP I/O glue lives in the `fono-net` crate.
 
 pub mod arm;
 pub mod fono;

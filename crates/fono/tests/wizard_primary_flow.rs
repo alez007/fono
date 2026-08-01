@@ -155,7 +155,7 @@ fn primary_cartesia_covers_stt_and_tts_with_one_key() {
 
     // STT — Cartesia batch (`POST /stt`) only accepts the
     // `ink-whisper` family; `ink-2` is realtime-only and lives
-    // behind a Phase 2 WebSocket slice. If this assertion fails,
+    // behind a WebSocket endpoint we do not wire. If this assertion fails,
     // `crates/fono-core/src/provider_catalog.rs` has drifted.
     assert_eq!(cfg.stt.backend, SttBackend::Cartesia);
     let stt_cloud = cfg.stt.cloud.as_ref().expect("cartesia stt.cloud set");
@@ -243,8 +243,8 @@ fn local_assistant_fills_local_tts_when_none_selected() {
 /// `[stt].backend = "groq"`, `[polish].backend = "anthropic"`, and
 /// `[tts].backend = "wyoming"` must survive (de)serialisation and
 /// the catalogue helpers without anything flipping the TTS backend
-/// to OpenAI/Groq/whatever. Phase B already added a seed
-/// round-trip test in `wizard.rs`; this is the broader Customize-mix
+/// to OpenAI/Groq/whatever. `wizard.rs` has a seed round-trip test
+/// already; this is the broader Customize-mix
 /// version.
 #[test]
 fn customize_groq_stt_anthropic_llm_wyoming_tts_round_trip() {

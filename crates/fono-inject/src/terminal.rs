@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Terminal deep-enrichment via `/proc` walking (Phase C).
+//! Terminal deep-enrichment via `/proc` walking.
 //!
 //! [`terminal_context`] reads the process tree rooted at the terminal-emulator
 //! PID to determine the shell's current working directory and any coding agent

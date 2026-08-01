@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Local `whisper-rs` backend. Compiled only with the `whisper-local` feature
 //! since it vendors whisper.cpp (C++ build) and materially increases build
-//! time. See Phase 4 Task 4.2.
+//! time.
 //
 // We hold the context mutex for the whole `transcribe` call (and
 // likewise inside `prewarm`) by design: whisper.cpp inference borrows
@@ -23,9 +23,8 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 /// inference call must materialise a large set of compute pipelines
 /// (Vulkan `VkPipeline`, CUDA / HIP kernels, Metal pipeline state). On those
 /// builds, `prewarm()` runs an extra silent-decode pass so the user does
-/// not pay 5–10 s of pipeline-create cost on their first dictation —
-/// see `plans/2026-05-03-whisper-vulkan-prewarm-v1.md`. CPU-only builds
-/// keep `prewarm()` as a cheap mmap.
+/// not pay 5–10 s of pipeline-create cost on their first dictation.
+/// CPU-only builds keep `prewarm()` as a cheap mmap.
 #[cfg(any(
     feature = "accel-cuda",
     feature = "accel-metal",
@@ -123,7 +122,7 @@ impl WhisperLocal {
 
     /// Resolve the initial prompt for a given language and optional context hint.
     ///
-    /// Merging rules (Phase D.2):
+    /// Merging rules:
     /// - If both a language prompt and a `context_hint` are present, concatenate
     ///   them: `"{lang_prompt} {hint}"`.
     /// - If only a `context_hint` is present (language is auto-detect / unknown),
@@ -353,10 +352,9 @@ impl SpeechToText for WhisperLocal {
         // `VkPipeline` / CUDA kernel / Metal PSO it needs, allocates
         // the KV cache on-device, and primes the driver shader cache.
         // Without this, the first real dictation pays a 5–10 s
-        // pipeline-create cost — see fixture #1 in
-        // `plans/2026-05-03-whisper-vulkan-prewarm-v1.md`. CPU-only
-        // builds skip the silent decode (`GPU_PREWARM = false`) since
-        // CPU TTFF is already in the 100 ms range.
+        // pipeline-create cost. CPU-only builds skip the silent decode
+        // (`GPU_PREWARM = false`) since CPU TTFF is already in the
+        // 100 ms range.
         let path = self.model_path.clone();
         let ctx = Arc::clone(&self.ctx);
         let threads = self.threads;

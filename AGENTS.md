@@ -140,6 +140,16 @@ section is the durable backup in case the skill is unavailable.
   desktop. This covers both gates below and every ad-hoc build in a
   session. No exceptions.
 
+- **Never `nice` a timed measurement.** `fono bench-actions`, and any
+  other run whose numbers you intend to report, runs at normal priority.
+  A benchmark competes with the model for the same cores, so lowering its
+  priority does not spare the desktop — it hands the desktop the cores the
+  thing being measured needs, and the timings come back wrong. A niced run
+  produced one generation at 2,848 ms per word against a median of 92; at
+  normal priority the median was 68 ms and the maximum 112, and the 40×
+  outlier was nearly written up as a defect in the constrained sampler.
+  Builds and tests stay niced; measurements do not.
+
 - **Pre-commit gate (run, in order, before EVERY `git commit` and EVERY
   `git push`):**
   1. `nice -n 10 cargo fmt --all -- --check` — must exit 0. If it fails,
@@ -186,6 +196,18 @@ section is the durable backup in case the skill is unavailable.
   formatter codebase-wide.
 
 - All commits **MUST** be signed off (`git commit -s`) — DCO enforced by CI.
+- **Comments explain the code, not the schedule.** Cite `docs/decisions/`
+  freely — ADRs are permanent and maintained. Never cite `docs/plans/`: a plan
+  is a snapshot of what we intended on one day, so a comment pointing at one
+  tells a reader nothing they can act on and goes stale the moment the work
+  lands. Same for slice, phase, task and plan-version numbers ("Slice 4 will
+  fire auto-stop", "Phase A intentionally pre-declares…") — describe what the
+  code does now, and if something genuinely isn't built yet say so without the
+  bookkeeping. A date is allowed only when it timestamps the **outside world**
+  — an upstream API's observed behaviour, a benchmark run the numbers are
+  anchored to, an upstream artifact we converted once — never our own
+  schedule. This applies to user-facing strings too: never point a user at a
+  plan file they don't have.
 - **NEVER** add a `Co-authored-by: Forge <forge@noreply.local>` trailer (or any
   agent / assistant co-author trailer) to commit messages — not on new commits,
   not when rewording, not when squashing. The agent is a tool, not an author.
@@ -199,6 +221,29 @@ section is the durable backup in case the skill is unavailable.
   "Replace score smoother with sliding-window activation gate". Keep jargon,
   type/function names, and implementation detail out of the subject line; if
   such detail is useful, put it lower in the body. This rule is permanent.
+- **Commit messages MUST be to the point.** Length is not the rule — a commit
+  that does several things needs the lines to say so, and most of ours do. The
+  rule is that every line must be pulling. Write the body to Orwell's six rules
+  (*Politics and the English Language*, 1946):
+  1. Never use a metaphor, simile or other figure of speech you are used to
+     seeing in print.
+  2. Never use a long word where a short one will do.
+  3. **If it is possible to cut a word out, always cut it out.** This is the one
+     that does the work here.
+  4. Never use the passive where you can use the active.
+  5. Never use a foreign phrase, a scientific word or a jargon word if you can
+     think of an everyday English equivalent.
+  6. Break any of these rules sooner than say anything outright barbarous.
+
+  Rule 3 applies to whole paragraphs, not only words. What is nearly always
+  cuttable: the reasoning that led to the design, rejected alternatives,
+  measurements, findings, file lists, and a walk through the mechanics. All of
+  that already lives in the plan and in `docs/status.md`, which are the right
+  places for it; a commit body that repeats them is a third copy nobody
+  maintains. Say what changed and why it matters, once, and stop. One thing
+  always worth a line: if the change alters behaviour a user could mistake for a
+  bug, say so plainly. Calibration — the messages written before this rule
+  averaged ~35 lines and one reached 84, almost all of it rule-3 waste.
 - Every Rust source file **MUST** start with `// SPDX-License-Identifier: GPL-3.0-only`
   on line 1.
 - Do **NOT** add dependencies without updating `deny.toml` and verifying the licenses

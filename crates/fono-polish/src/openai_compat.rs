@@ -46,7 +46,7 @@ impl OpenAiCompat {
         }
     }
 
-    /// Convenience constructor for Cerebras (Phase 5 Task 5.3 — fastest latency).
+    /// Convenience constructor for Cerebras (fastest latency).
     pub fn cerebras(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new("https://api.cerebras.ai/v1/chat/completions", api_key, model, "cerebras")
     }
@@ -137,8 +137,7 @@ struct ChatReq<'a> {
     // / garbled non-English" bug). Pinning the effort to `low` keeps
     // reasoning short and predictable so the visible answer fits the
     // budget. Omitted for non-reasoning models — Cerebras Llama,
-    // Ollama, … reject the field with a 400. See
-    // `plans/2026-05-29-romanian-dictation-polish-reconstruction-v2.md`.
+    // Ollama, … reject the field with a 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     // Local OpenAI-compatible servers default thinking-capable models
@@ -395,8 +394,7 @@ impl TextFormatter for OpenAiCompat {
             // occasionally respond to short / ambiguous push-to-talk
             // captures with a clarification question instead of a
             // cleaned transcript. Reject so the caller falls back to
-            // the raw STT text. See
-            // `plans/2026-04-28-polish-cleanup-clarification-refusal-fix-v1.md`.
+            // the raw STT text.
             anyhow::bail!(
                 "{} LLM returned a clarification reply instead of a cleaned transcript; \
                  falling back to raw text. response: {out:?}",

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Text injection + focus detection. Phase 6 of
-//! `docs/plans/2026-04-24-fono-design-v1.md`.
+//! Text injection + focus detection.
 //!
 //! The default backend chain (Linux):
 //! 1. `enigo` (X11 via libxdo) — compiled only with the `enigo-backend`

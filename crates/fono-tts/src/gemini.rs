@@ -89,8 +89,7 @@ impl GeminiTts {
     /// Streaming endpoint — `:streamGenerateContent?alt=sse` returns the audio
     /// incrementally as a Server-Sent Events stream of `GenerateResponse`
     /// objects, each carrying a slice of the utterance's PCM in an
-    /// `inlineData` part. Cuts time-to-first-audio (ADR 0034 / cloud-streaming
-    /// plan v2).
+    /// `inlineData` part. Cuts time-to-first-audio (ADR 0034).
     fn stream_endpoint(&self) -> String {
         format!("{BASE_URL}/models/{}:streamGenerateContent?alt=sse", self.model)
     }

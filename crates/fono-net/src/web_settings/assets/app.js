@@ -1849,17 +1849,6 @@ function toolsHtml() {
       : '')
     + '<span class="hint">Save &amp; connect checks the address before saving anything.</span></div>';
 
-  // Above the tool list, and above every early return below it, because the
-  // switch has to be reachable even when the list cannot be shown — a server
-  // that is failing to answer is exactly when someone wants to change this.
-  out += row('Hold commands to what your home reported',
-    'While the assistant is writing a command it can only pick rooms, devices and kinds of device '
-    + 'your home actually has \u2014 so it cannot invent a room that is not there, or leave out '
-    + 'something the server needs. Talking, stories and explanations are untouched. '
-    + 'Off by default, so you can turn it on and compare. '
-    + 'Only affects a model running on this machine; a cloud service already does this itself.',
-    toggle('assistant.tools.grammar', false));
-
   if (toolsErr) return out + '<p class="privacy-note">Could not load tools: ' + esc(toolsErr) + '</p>';
   if (!toolsData) return out + '<p class="hint">Loading\u2026</p>';
   const tools = toolsData.tools || [];
@@ -2285,7 +2274,7 @@ async function saveAll() {
       orig = clone(cfg);
       summary = res.summary || 'Saved';
       // The tools payload is derived from the config the daemon just wrote —
-      // the master switch, the grammar switch, which servers exist, and the
+      // the master switch, which servers exist, and the
       // exact words the assistant is given. Re-read it so the summary here
       // and the list it links to describe the config that is now live.
       loadTools();
@@ -2343,7 +2332,7 @@ function showView() {
   if (v === 'actions') {
     // Render what we already have so the page never flashes empty, then
     // always re-fetch. Arriving here is exactly when a stale copy hurts: the
-    // master switch, the grammar switch and the server list all live in the
+    // master switch and the server list both live in the
     // settings editor, so anything changed there must be re-read on the way
     // in, or the page shows a state the daemon has already left behind.
     renderActions();
@@ -2640,6 +2629,8 @@ function renderHistory() {
 let actQuery = '';
 const actOpen = new Set();     // "source\u0000tool" of the expanded rows
 const actCollapsed = new Set(); // servers the user folded away
+const sayJson = new Set();      // phrases whose exact command is showing
+const actSecOpen = {};          // which folding sections the reader left open
 let actBulkBusy = false;
 
 const actKey = (src, name) => src + '\u0000' + name;
@@ -2700,19 +2691,57 @@ function schemaType(p) {
   if (t === 'object') return 'a structure';
   return t ? String(t) : 'anything';
 }
-// What Fono narrows a field to while the model is writing a command, when
-// that is switched on. The three house-shaped fields are named by the vendor
-// code daemon-side and arrive in `slots`, so a server Fono has no specific
-// knowledge of shows nothing here rather than a guess.
-function heldTo(field, p) {
-  const s = toolsData.slots || {}, h = toolsData.house || {};
-  if (field === s.place) return (h.places || []).length + ' rooms in this home';
-  if (field === s.device) return (h.devices || []).length + ' devices in this home';
-  if (field === s.kind) {
-    return (h.kinds || []).length + ' kinds of device here, or everything in the room';
+// What Fono narrows a field to while the model writes a command — asked per
+// server, because on a second server these are a different house.
+//
+// The three house-shaped field names are named by the vendor code daemon-side
+// and arrive in `rails`, so a server Fono has no specific knowledge of shows
+// nothing here rather than a guess.
+function railsOf(source) {
+  return (toolsData.rails || {})[source] || {};
+}
+// Whether a slot value can reach this field at all. The rails only narrow a
+// field the server left as text — a field typed as a number is not silently
+// turned into a word — and an array is narrowed item by item.
+function narrowable(p) {
+  const t = Array.isArray(p.type) ? p.type.filter((x) => x !== 'null')[0] : p.type;
+  if (t === 'array') return narrowable(p.items && typeof p.items === 'object' ? p.items : {});
+  return t === undefined || t === 'string';
+}
+// The one thing worth saying beside a field: how it *departs* from what the
+// server card already said.
+//
+// Only two ways it can. The server published its own list, which beats anything
+// Fono would supply; or the field is one of the three and the schema's type puts
+// it out of reach, so nothing is held after all — worth a word, because that is
+// the case where the sentence on the server card does not apply. A field held
+// like the rest says nothing here: that sentence is true once, on the card,
+// instead of twenty-three times down the page.
+//
+// The badge carries its own verb, so a new case cannot be bolted on with the
+// wrong one.
+function heldTo(field, p, source) {
+  if (Array.isArray(p.enum)) return 'held to the ' + p.enum.length + ' the server listed';
+  const r = railsOf(source);
+  const slot = field === r.place || field === r.device || field === r.kind;
+  if (slot && !narrowable(p)) {
+    return 'not held to your home \u2014 the server wants ' + schemaType(p) + ' here';
   }
-  if (Array.isArray(p.enum)) return 'the ' + p.enum.length + ' the server listed';
   return '';
+}
+// The sentence the field badges used to repeat on every row.
+function railsSentence(source) {
+  const r = railsOf(source), bits = [];
+  const mono = (s) => '<span class="mono">' + esc(s) + '</span>';
+  if (r.place && r.areas) bits.push(mono(r.place) + ' to your ' + r.areas + ' areas');
+  if (r.device && r.devices) bits.push(mono(r.device) + ' to your ' + r.devices + ' devices');
+  if (r.kind && r.kinds) {
+    bits.push(mono(r.kind) + ' to the ' + r.kinds
+      + ' kinds of device here, or everything in the area');
+  }
+  if (!bits.length) return '';
+  return 'While a command is being written, Fono holds ' + bits.join(', ')
+    + ' \u2014 so an area or a device this home does not have cannot be asked for.';
 }
 // How the last run ended, in the terms a person would use. Deliberately not
 // the stored word: "accepted" and "sent" look interchangeable until you are
@@ -2798,7 +2827,7 @@ function fmtMs(ms) {
 // a tool *could* be sent; this tells you what it *was* sent and what came back
 // — which is where the bugs are. Reading one of these rows is how you see at a
 // glance that "turn off the office light" became {"area":"Office light"}: a
-// device name routed into the room field. That took a manual dump of the
+// device name routed into the area field. That took a manual dump of the
 // server's schemas and an afternoon of trace-reading to find the first time.
 //
 // Read back out of the ordinary conversation history, so it is here only while
@@ -2827,7 +2856,7 @@ function actUses(t) {
     // more thing to read on every attempt, saying nothing until opened; the
     // request already names what the reply would be about, so it can carry the
     // reply itself. What was asked and what was sent stay visible, because that
-    // pair is what catches a misrouted room name; the server's answer is a long
+    // pair is what catches a misrouted area name; the server's answer is a long
     // line of punctuation and is one click away, for when the arguments look
     // right and it still went wrong. Attempts with no recorded reply are a plain
     // line rather than a fold that opens onto nothing.
@@ -2861,17 +2890,16 @@ function actFields(t) {
   if (!names.length) {
     return '<p class="hint">The server publishes no fields for this, so the assistant sends it empty.</p>';
   }
-  const held = !!toolsData.grammar;
   let out = '<ul class="act-fields">';
   for (const f of names) {
     const p = props[f] && typeof props[f] === 'object' ? props[f] : {};
     const listed = Array.isArray(p.enum) ? p.enum.join(', ') : '';
-    const h = held ? heldTo(f, p) : '';
+    const h = heldTo(f, p, t.source);
     out += '<li' + (listed ? ' title="' + esc(listed) + '"' : '') + '>'
       + '<span class="f mono">' + esc(f) + '</span>'
       + (required.includes(f) ? '<span class="req">must</span>' : '')
       + '<span class="ty">' + esc(schemaType(p)) + '</span>'
-      + (h ? '<span class="held">held to ' + esc(h) + '</span>' : '')
+      + (h ? '<span class="held">' + esc(h) + '</span>' : '')
       + '</li>';
   }
   return out + '</ul>';
@@ -2915,11 +2943,6 @@ function actDetail(t, saidAtServer) {
         ? ' Checked with <span class="mono">' + esc(t.readback_tool) + '</span>.' : '')
       + '</p>';
   }
-  if (!toolsData.grammar) {
-    out += '<p class="hint">Nothing is narrowing these values. Switch on '
-      + '<a href="#/settings">Hold commands to what your home reported</a> to keep the '
-      + 'assistant to the rooms and devices you actually have.</p>';
-  }
   out += actRaw(t);
   return out + '</div>';
 }
@@ -2928,9 +2951,10 @@ function actDetail(t, saidAtServer) {
 //
 // On a stock Home Assistant this block was identical across all twenty-three
 // rows — same verification story, same "no field is required", often the very
-// same schema fingerprint. Twenty-three copies of a sentence do not inform
-// anyone; they train the eye to skip the region where the differences live.
-function actServerFacts(tools) {
+// same schema fingerprint, and the same three fields held to the same house.
+// Twenty-three copies of a sentence do not inform anyone; they train the eye to
+// skip the region where the differences live.
+function actServerFacts(name, tools) {
   const bits = [];
   const proofs = new Set(tools.map((t) => t.verify_class || 'none'));
   if (proofs.size === 1) {
@@ -2948,8 +2972,7 @@ function actServerFacts(tools) {
     && withFields.every((t) => !(Array.isArray(t.schema.required) && t.schema.required.length));
   if (noneRequired) {
     bits.push('Not one of these declares a required field, so nothing but '
-      + (toolsData.grammar ? 'the rules Fono adds' : 'the assistant\u2019s own judgement')
-      + ' stops the deciding one being left out.');
+      + 'the rules Fono adds stops the deciding one being left out.');
   }
   const shapes = new Set(tools.map((t) => t.schema_hash || ''));
   if (shapes.size === 1 && tools.length > 1) {
@@ -2957,6 +2980,10 @@ function actServerFacts(tools) {
       + '<span class="mono">' + esc((tools[0].schema_hash || '').slice(0, 12)) + '</span>. '
       + 'The assistant is choosing between them on their names alone.');
   }
+  // Said once for the server, because it is one fact about this server and not
+  // twenty-three facts about its tools.
+  const rails = railsSentence(name);
+  if (rails) bits.push(rails);
   if (!bits.length) return '';
   return '<p class="act-srv-facts">' + bits.join(' ') + '</p>';
 }
@@ -3009,13 +3036,13 @@ function actServerCard(name, tools) {
       + '</div>' + (open ? actDetail(t, uniformProof) : '');
   }).join('');
   return '<div class="act-srv">' + head + '<div class="act-rows">' + rows + '</div>'
-    + actServerFacts(tools) + '</div>';
+    + actServerFacts(name, tools) + '</div>';
 }
 // What one device's own history says, on the chip itself.
 //
 // Per device rather than per command, because that is the unit people notice —
 // "the office lamp never comes on" is what gets reported, and a per-tool count
-// cannot answer it: a single instruction naming a room reaches six things and
+// cannot answer it: a single instruction naming an area reaches six things and
 // routinely fails on one of them. Only servers that name what they touched can
 // fill this in, so a device with no history reads as plain rather than as zero.
 function deviceChip(d) {
@@ -3055,7 +3082,7 @@ function actHousePanel() {
   const used = devices.filter((d) => (d.runs || 0) > 0);
   const failing = used.filter((d) => d.last_ok === false);
   let body = places.length
-    ? '<div class="chips"><div class="chips-lbl">Rooms</div>'
+    ? '<div class="chips"><div class="chips-lbl">Areas</div>'
       + places.map((p) => chip(p)).join('') + '</div>'
     : '';
   for (const [k, list] of byKind) {
@@ -3085,14 +3112,14 @@ function actHousePanel() {
     body += '<p class="hint">This server did not say what kind each device is, so a command '
       + 'cannot be narrowed to \u201cjust the lights\u201d.</p>';
   }
-  const sum = [places.length + (places.length === 1 ? ' room' : ' rooms'),
+  const sum = [places.length + (places.length === 1 ? ' area' : ' areas'),
     devices.length + (devices.length === 1 ? ' device' : ' devices'),
     used.length ? used.length + ' ever reached' : 'none ever reached'].join(' \u00b7 ');
-  return '<details class="sec dsec"><summary><span class="chev">\u25b6</span>'
+  return '<details class="sec dsec" id="d-house"><summary><span class="chev">\u25b6</span>'
     + '<span class="t">What your home told Fono</span><span class="sum">' + esc(sum) + '</span>'
     + '</summary><div class="body">'
     + '<p class="hint">Learned when each server was connected, and re-read on every refresh '
-    + '\u2014 so naming a room costs nothing while you are waiting. These names go to the '
+    + '\u2014 so naming an area costs nothing while you are waiting. These names go to the '
     + 'assistant and nowhere else.</p>' + body + '</div></details>';
 }
 function actPromptPanel() {
@@ -3102,7 +3129,7 @@ function actPromptPanel() {
   let body = '<p class="hint">Every turn, the assistant is given '
     + esc(n + (n === 1 ? ' thing' : ' things')) + ' it can do'
     + (hint ? ', and these words about your home. Read them exactly as the assistant does.'
-      : '. It is told nothing about your rooms or devices.') + '</p>';
+      : '. It is told nothing about your areas or devices.') + '</p>';
   if (hint) {
     body += '<pre class="act-prompt mono">' + esc(hint) + '</pre>'
       + '<div class="enroll-row"><button class="btn" type="button" id="actcopy">Copy</button>'
@@ -3110,12 +3137,181 @@ function actPromptPanel() {
       + esc((toolsData.catalogue_hash || '').slice(0, 12))
       + '</span> \u2014 changes exactly when these instructions would.</span></div>';
   } else {
-    body += '<p class="hint">Switch on <a href="#/settings">Tell the assistant your room '
-      + 'names</a> so a command in another language can still find the right room.</p>';
+    body += '<p class="hint">Switch on <a href="#/settings">Tell the assistant your area '
+      + 'names</a> so a command in another language can still find the right area.</p>';
   }
-  return '<details class="sec dsec"><summary><span class="chev">\u25b6</span>'
+  return '<details class="sec dsec" id="d-prompt"><summary><span class="chev">\u25b6</span>'
     + '<span class="t">The exact words the assistant is given</span>'
     + '<span class="sum">' + esc(sum) + '</span></summary><div class="body">' + body + '</div></details>';
+}
+// The phrases Fono has written down, and which of them it can run on its own.
+//
+// Above the servers because it is the one section about *you* rather than about
+// them: what you actually say, and whether saying it still costs a round trip
+// through the assistant. The list of phrases that have worked but never earned
+// the fast path is the assistant's own blind-spot list, so it is shown rather
+// than hidden — those are the sentences worth turning into test cases.
+function actPhrasesPanel() {
+  const rows = toolsData.shortcuts || [];
+  const fast = rows.filter((s) => s.state === 'fast').length;
+  const sum = rows.length
+    ? rows.length + (rows.length === 1 ? ' phrase' : ' phrases') + ' \u00b7 '
+      + (fast ? fast + ' run without the assistant' : 'none earned yet')
+    : 'nothing yet';
+  let body = '<p class="hint">Say something that works twice and Fono writes it down. From then '
+    + 'on it runs the same command the moment it hears the phrase \u2014 the assistant is not '
+    + 'asked at all, so there is nothing to wait for. No command here was typed in: a phrase '
+    + 'earns its place by working. Give one that has earned it another wording with '
+    + '<b>+</b> and that wording works straight away.</p>';
+  if (!rows.length) {
+    body += '<p class="hint">No phrase has earned this yet. It takes the same words twice, '
+      + 'each time with no error and no correction from you.</p>';
+  } else {
+    body += '<div class="act-rows">' + phraseGroups(rows).map(phraseGroup).join('') + '</div>';
+  }
+  return '<details class="sec dsec" id="d-say"><summary><span class="chev">\u25b6</span>'
+    + '<span class="t">Things you can say</span><span class="sum">' + esc(sum) + '</span>'
+    + '</summary><div class="body">' + body + '</div></details>';
+}
+// Every wording of one command, gathered under the wording that earned it.
+//
+// Grouped by the command rather than by which row was typed in, because two
+// phrases that send the identical thing to the identical server *are* one entry
+// in a person's head. Ungrouped, an added wording sorted to the far end of the
+// list by its own empty record, which is the last place anyone would look for
+// it. The head of a group is the wording Fono heard work, most-said first; the
+// rest hang under it and can be removed one at a time.
+function phraseGroups(rows) {
+  const by = new Map();
+  for (const s of rows) {
+    const k = JSON.stringify([s.source, s.tool, s.args]);
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(s);
+  }
+  const heard = (s) => (s.origin === 'written' ? 1 : 0);
+  return [...by.values()].map((g) => g.slice().sort((a, b) =>
+    heard(a) - heard(b) || (b.runs || 0) - (a.runs || 0) || (b.last_run || 0) - (a.last_run || 0)));
+}
+function phraseGroup(g) {
+  const head = g[0];
+  return '<div class="say-group">' + phraseRow(head) + g.slice(1).map(aliasRow).join('')
+    + (sayJson.has(head.phrase) ? sayJsonBlock(head) : '') + '</div>';
+}
+// One state word per phrase, never two \u2014 and the row's own record beside it.
+//
+// Only a state that wants something from you is coloured. "learning" is the
+// ordinary life of a phrase that is working perfectly well, and colouring it
+// made a page of healthy rows read as a page of faults.
+const SAY_STATE = {
+  fast: ['fast', 'good', 'Fono runs this the moment it hears it. The assistant is not asked.'],
+  learning: ['learning', '', 'This has worked. One more clean run and Fono will stop asking the assistant about it.'],
+  written: ['yours', '', 'You added this wording. It runs as readily as the phrase you copied it from \u2014 the command is the same one, already proven.'],
+  paused: ['paused', 'weak', 'The command behind it is switched off, or its server has stopped offering it. It resumes when the tool does \u2014 nothing has to be learned again.'],
+  changed: ['changed', 'weak', 'The command has changed shape since this was written down, so replaying it would no longer be what worked. Say it again and Fono will learn the new shape.'],
+};
+// Three small square buttons, one glyph each. Text buttons for "Another way"
+// and "Forget" took more width than the phrase they belonged to and shouted for
+// attention the phrase deserved. Written out one by one rather than built from
+// an argument, so the check that every button has a handler can still read them.
+function sayAlsoBtn(p) {
+  const t = 'Add another way of saying this. It runs the same command.';
+  return '<button class="ibtn" type="button" data-say-also="' + esc(p)
+    + '" title="' + t + '" aria-label="' + t + '">+</button>';
+}
+function sayJsonBtn(p) {
+  const t = (sayJson.has(p) ? 'Hide' : 'Show') + ' exactly what this sends';
+  return '<button class="ibtn" type="button" data-say-json="' + esc(p)
+    + '" title="' + t + '" aria-label="' + t + '">{ }</button>';
+}
+function sayForgetBtn(p, t) {
+  return '<button class="ibtn" type="button" data-say-forget="' + esc(p)
+    + '" title="' + t + '" aria-label="' + t + '">\u00d7</button>';
+}
+// Exactly what would be sent, on request. Every row now reads as prose \u2014 the
+// tool and the thing it touches \u2014 so the arguments no longer leak into rows
+// whose server does not name its fields, and are one click away for all of them.
+function sayJsonBlock(s) {
+  let args = s.args;
+  try { args = JSON.stringify(JSON.parse(s.args), null, 2); } catch (err) { /* as stored */ }
+  return '<pre class="say-json mono">' + esc(s.source + ' \u00b7 ' + s.tool + '\n' + args) + '</pre>';
+}
+function phraseRow(s) {
+  const st = SAY_STATE[s.state] || SAY_STATE.learning;
+  // Two situations wear the same word: a run whose half-minute is still open,
+  // and one the user contradicted. Both count nothing yet, and saying "one more
+  // run" about either would be wrong \u2014 so say what a run has to do.
+  const tip = s.state === 'learning' && !s.clean
+    ? 'This has worked, but no run counts yet. A run counts once half a minute goes by '
+      + 'without you saying the same thing again \u2014 asking twice straight away reads as '
+      + '\u201cthat was wrong\u201d. Two counted runs earn the fast path.'
+    : st[2];
+  // What it does is the footnote; what you say is the row. The thing in the
+  // house is pulled out when the server names its fields; when it does not, the
+  // tool stands alone rather than the row turning into a line of JSON.
+  const does = s.tool + (s.target ? ' \u00b7 ' + s.target : '');
+  const why = [tip];
+  why.push(s.runs === 1 ? 'Said once.' : 'Said ' + s.runs + ' times.');
+  if (typeof s.last_ms === 'number' && s.last_ms > 0) {
+    why.push('Last time the command itself took ' + fmtMs(s.last_ms) + '.');
+  }
+  const word = s.last_ok === true ? 'worked' : s.last_ok === false ? 'did not' : 'never run';
+  const cls = s.last_ok === true ? ' good' : s.last_ok === false ? ' bad' : '';
+  return '<div class="act-row act-say' + (s.state === 'paused' ? ' act-dim' : '') + '">'
+    + '<span class="info"><span class="lbl">\u201c' + esc(s.phrase) + '\u201d</span>'
+    + '<span class="desc"><span class="mono">' + esc(does) + '</span> '
+    + pill(st[0], st[1], tip) + '</span></span>'
+    + '<span class="act-ran' + cls + '" title="' + esc(why.join(' ')) + '">'
+    + '<span class="w">' + esc(word) + '</span>'
+    + '<span class="a">' + esc(s.last_run ? fmtAgo(s.last_run) : '') + '</span></span>'
+    + '<div class="ctl">'
+    + sayAlsoBtn(s.phrase) + sayJsonBtn(s.phrase)
+    + sayForgetBtn(s.phrase, 'Forget this phrase')
+    + '</div></div>';
+}
+// Another wording of the same command, indented under the one above it. Some
+// are copies the user made and some are simply a second thing Fono heard work;
+// either way it is the same command said differently rather than a second thing
+// Fono knows, so it carries only what differs — the words, how it is faring,
+// and when it last ran.
+function aliasRow(s) {
+  const st = SAY_STATE[s.state] || SAY_STATE.written;
+  const why = s.runs === 1 ? 'Said once.' : 'Said ' + s.runs + ' times.';
+  return '<div class="say-alias' + (s.state === 'paused' ? ' act-dim' : '') + '">'
+    + '<span class="arr">\u21b3</span>'
+    + '<span class="lbl">\u201c' + esc(s.phrase) + '\u201d</span>'
+    + pill(st[0], st[1], st[2])
+    + '<span class="ago" title="' + esc(why) + '">'
+    + esc(s.last_run ? fmtAgo(s.last_run) : 'never run') + '</span>'
+    + sayForgetBtn(s.phrase, 'Forget this wording. The others stay.')
+    + '</div>';
+}
+// Editing which command a phrase runs is deliberately not offered: that mapping
+// is won by working twice, and letting it be typed in would make the winning
+// decorative. Adding a wording and forgetting one are the two edits that cannot
+// lie about what has been verified.
+async function addPhrase(like) {
+  const said = prompt('Another way to say \u201c' + like + '\u201d:', '');
+  if (!said || !said.trim()) return;
+  try {
+    await api('/api/shortcuts', { method: 'POST', body: JSON.stringify({ like, phrase: said.trim() }) });
+    toast('Added');
+    await loadTools();
+    renderActions();
+  } catch (err) { toast('Could not add that: ' + err.message, true); }
+}
+// One button forgets one wording, never its neighbours. A group holds wordings
+// the user copied *and* wordings Fono heard work in their own right, and there
+// is no way to tell from a row which it is — so taking the others down with it
+// would sometimes throw away something earned.
+async function forgetPhrase(phrase) {
+  if (!confirm('Forget \u201c' + phrase + '\u201d? Fono will ask the assistant again next time.')) return;
+  try {
+    await api('/api/shortcuts?phrase=' + encodeURIComponent(phrase), { method: 'DELETE' });
+    sayJson.delete(phrase);
+    toast('Forgotten');
+    await loadTools();
+    renderActions();
+  } catch (err) { toast('Could not forget that: ' + err.message, true); }
 }
 function actBody() {
   if (toolsErr) return '<p class="privacy-note">Could not load what the assistant can do: ' + esc(toolsErr) + '</p>';
@@ -3144,15 +3340,14 @@ function actBody() {
       ? ' A real command has reached <b>' + everRan + '</b> of them \u2014 those rows say when '
         + 'and how it went.'
       : ' None of them has been used yet.')
-    + (toolsData.grammar
-      ? ' While it writes a command it can only name rooms and devices you actually have.'
-      : ' It is free to write any command it likes \u2014 nothing is holding it to your home.')
+    + ' While it writes a command it can only name areas and devices you actually have.'
     + ' <b>Open any row</b> to see the commands that have actually reached it \u2014 what was '
     + 'said, what was sent, and what came back.'
     + '</p>';
   out += '<div class="search"><span style="color:var(--ink-dim)">\u2315</span>'
     + '<input id="actq" placeholder="Filter what it can do\u2026" autocomplete="off" value="'
     + esc(actQuery) + '" /><span class="kbd">/</span></div>';
+  out += actPhrasesPanel();
 
   if (!shown.length) {
     out += '<p class="hint">Nothing matches \u201c' + esc(actQuery) + '\u201d.</p>';
@@ -3171,6 +3366,11 @@ function actBody() {
 }
 function renderActions() {
   const el = document.getElementById('view-actions');
+  // Every button on this page redraws the whole of it, and a redrawn <details>
+  // has forgotten it was open. Remember it across the redraw: asking to see one
+  // phrase's exact command used to fold the entire section away under the
+  // reader, which is worse than not offering the button at all.
+  el.querySelectorAll('details.sec').forEach((d) => { actSecOpen[d.id] = d.open; });
   const bar = '<div class="doctor-bar">'
     + '<a class="btn ghost" href="#/settings">\u2190 Settings</a>'
     + '<span class="hint" style="margin-left:auto">'
@@ -3178,6 +3378,7 @@ function renderActions() {
     + '<button class="btn" type="button" id="actrefresh"' + (toolsBusy ? ' disabled' : '') + '>Refresh</button>'
     + '</div>';
   el.innerHTML = bar + actBody();
+  el.querySelectorAll('details.sec').forEach((d) => { d.open = !!actSecOpen[d.id]; });
 
   el.querySelector('#actrefresh').addEventListener('click', discoverTools);
   // Keyed by two attributes rather than one, because the key contains a NUL
@@ -3197,6 +3398,15 @@ function renderActions() {
   }));
   el.querySelectorAll('[data-act-solo]').forEach((b) =>
     b.addEventListener('click', () => setServerTools(b.dataset.actSolo, true, true)));
+  el.querySelectorAll('[data-say-also]').forEach((b) =>
+    b.addEventListener('click', () => addPhrase(b.dataset.sayAlso)));
+  el.querySelectorAll('[data-say-json]').forEach((b) => b.addEventListener('click', () => {
+    const p = b.dataset.sayJson;
+    if (sayJson.has(p)) sayJson.delete(p); else sayJson.add(p);
+    renderActions();
+  }));
+  el.querySelectorAll('[data-say-forget]').forEach((b) =>
+    b.addEventListener('click', () => forgetPhrase(b.dataset.sayForget)));
   const copy = el.querySelector('#actcopy');
   if (copy) copy.addEventListener('click', async () => {
     try {

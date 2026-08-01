@@ -18,9 +18,6 @@
 //! `pactl get-default-source`) or, on the cpal branch, cpal's
 //! default input device — Fono no longer keeps an `input_device`
 //! override.
-//!
-//! Plan: `plans/2026-04-29-empty-transcript-microphone-recovery-v2.md`,
-//! refined by `plans/2026-04-29-pulseaudio-first-microphone-enumeration-v1.md`.
 
 use fono_audio::devices::{is_likely_microphone, list_input_devices};
 

@@ -245,7 +245,7 @@ pub const WHISPER_MODELS: &[ModelInfo] = &[
             ("ja", 34.0),
         ],
         url_dir: GGERGANOV_DIR,
-        // q8_0 default per ADR 0027 acceptance rule (2026-05-25 amendment):
+        // q8_0 default per the ADR 0027 acceptance rule:
         // universal q8_0 selected for consistency across the registry;
         // q5_1 reachable via `[stt.local].quantization = "q5_1"`.
         default_quantization: Quantization::Q8_0,
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn defaults_match_acceptance_rule() {
         // Locks in the per-model quantization defaults from the
-        // 2026-05-19 perf pass (see plans/2026-05-19-stt-perf-pass-v1.md).
+        // 2026-05-19 perf pass.
         let cases = [
             ("tiny", Quantization::Q8_0),
             ("tiny.en", Quantization::Q8_0),
@@ -767,13 +767,12 @@ mod tests {
         // wizard's host-pick policy never selects this model on this
         // host, so the slower RTF is unreachable in practice.
         const EXCEPTIONS: &[(&str, &str, &str)] = &[
-            // i7-7500u CPU: wizard picks small.en, never tiny. Per plan
-            // 2026-05-25-wizard-selection-heuristics-refresh-v5.md.
+            // i7-7500u CPU: wizard picks small.en, never tiny.
             ("i7-7500u", "cpu", "tiny"),
             // small.en on Vulkan iGPUs: every host strong enough to
             // run Vulkan lands large-v3-turbo Comfortable, which
             // outranks small.en on accuracy → small.en/Vulkan is
-            // unreachable. See plan v5 §"Alternative Approaches" #1.
+            // unreachable.
             ("i7-1255u", "vulkan", "small.en"),
             ("i7-7500u", "vulkan", "small.en"),
             ("i7-8550u", "vulkan", "small.en"),

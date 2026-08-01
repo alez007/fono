@@ -73,10 +73,10 @@ impl Injector {
     /// Accessibility permission (TCC); denial degrades to the
     /// clipboard fallback in [`type_text_with_outcome`].
     ///
-    /// Windows (port plan Phase 7) and other OSes: enigo is likewise
+    /// Windows and other OSes: enigo is likewise
     /// the only keystroke backend (Win32 `SendInput`), so the same
     /// short-circuit applies — the Linux display-server cascade is
-    /// never compiled there (Windows port plan Task 1.3).
+    /// never compiled there.
     fn detect_auto() -> Self {
         #[cfg(target_os = "linux")]
         {

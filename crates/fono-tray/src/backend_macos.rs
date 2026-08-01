@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! macOS menu-bar backend: renders the shared [`crate::menu`] model as
-//! a native `NSStatusItem`. Phase 7 Task 7.3 of
-//! `plans/2026-07-03-macos-port-v1.md`.
+//! a native `NSStatusItem`.
 //!
 //! # Architecture: one pump, two threads
 //!

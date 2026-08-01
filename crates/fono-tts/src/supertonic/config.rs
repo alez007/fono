@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Supertonic `tts.json` runtime config (Slice 2, Task 2.1).
+//! Supertonic `tts.json` runtime config.
 //!
 //! Deserializes only the handful of fields the inference pipeline actually
 //! needs (ported from `ParseConfig` in the sherpa reference

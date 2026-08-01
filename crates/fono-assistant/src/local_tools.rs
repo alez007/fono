@@ -227,6 +227,29 @@ pub fn parse_call(text: &str) -> Option<(String, String)> {
     Some((name, args))
 }
 
+/// Is this the same request as the one that just failed?
+///
+/// A second attempt that writes the first attempt again, word for word, is not
+/// an attempt. It is a second wait for the same refusal, and the user pays for
+/// it in silence.
+///
+/// It is the common case rather than a corner: of thirteen commands that tried
+/// twice in one benchmark run, six repeated themselves exactly, and none of the
+/// thirteen was rescued by trying again. A model handed the same refusal it has
+/// already read has nothing new to go on, so it writes the same thing.
+///
+/// Compared as JSON where both sides parse, so the same request spelled with
+/// its fields in another order, or with different spacing, still counts as the
+/// same request. Where either side is not JSON, the text is compared as it
+/// stands — being wrong here may only cost one extra attempt, never a command.
+#[must_use]
+pub fn same_request(a: &str, b: &str) -> bool {
+    match (serde_json::from_str::<Value>(a), serde_json::from_str::<Value>(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.trim() == b.trim(),
+    }
+}
+
 /// Drops a model's own channel or thinking header from the front of a reply.
 ///
 /// `gemma-4-26b` opens even a one-line answer with `<|channel>thought
@@ -393,5 +416,20 @@ mod tests {
         assert!(!could_be_call("I"));
         assert!(!could_be_call("Sure,"));
         assert!(!could_be_call("The kitchen light is on."));
+    }
+
+    /// Verbatim from a benchmark run: the second attempt was the first attempt.
+    /// The same request written another way is still the same request, and two
+    /// genuinely different requests must still be tried.
+    #[test]
+    fn the_same_request_is_recognised_however_it_is_spelled() {
+        let first = r##"{"area":"Living room","brightness":10,"color":"#4285F4"}"##;
+        assert!(same_request(first, first));
+        let reordered = r##"{ "color": "#4285F4", "brightness": 10, "area": "Living room" }"##;
+        assert!(same_request(first, reordered));
+        assert!(!same_request(first, r#"{"area":"Living room","brightness":30}"#));
+        // Neither side is JSON: compared as it stands, whitespace aside.
+        assert!(same_request("not json", " not json "));
+        assert!(!same_request("not json", "something else"));
     }
 }

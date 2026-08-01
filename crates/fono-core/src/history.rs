@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! SQLite-backed transcription history with FTS5 search, retention cleanup,
-//! and optional secret redaction. Schema matches Phase 1 Task 1.4.
+//! and optional secret redaction.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

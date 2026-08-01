@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Supertonic 3 local TTS engine (feature `tts-local`).
 //!
-//! Slice 1 of `plans/2026-07-12-supertonic3-local-tts-engine-v1.md`: model
-//! distribution. This module owns the pack descriptor + on-demand
-//! fetch/verify/cache; the engine core (config/style/frontend/chunker/engine)
-//! lands in later slices under this same directory.
+//! This module owns the pack descriptor + on-demand fetch/verify/cache; the
+//! engine core lives alongside it in `config` / `style` / `frontend` /
+//! `chunker` / `engine`.
 //!
 //! Supertonic is **one shared pack** — four graphs plus three data files —
 //! that serves all 31 languages and 10 speakers from a single download
@@ -21,7 +20,7 @@
 //! four `*.int8.onnx` graphs; Fono converts them to `.ort` via
 //! `scripts/gen-ort-models.sh` (the same pipeline as Piper/Kokoro/wake) and
 //! hosts the conversions on its own mirror. That conversion step also emits
-//! the operator/type union feeding the minimal-runtime rebuild (Slice 3).
+//! the operator/type union feeding the minimal-runtime rebuild.
 //!
 //! **The graph pins must come from the *uploaded* artifacts, not a reproduced
 //! conversion.** Verified 2026-07-14: `convert_onnx_models_to_ort` is **not**
@@ -29,7 +28,7 @@
 //! 1.24.2, same flags, same inputs) produce different `.ort` bytes each time,
 //! so their SHA-256 differs run to run. (The operator/type *config* it emits
 //! **is** stable, since that is a semantic property of the graph, not its byte
-//! layout — which is why the Slice 3 `ops.config` can be pinned but these
+//! layout — which is why the `ops.config` can be pinned but these
 //! graphs cannot.) The four graphs were therefore converted **once**
 //! (2026-07-14) and uploaded to the `ort-1.24.2` release, and each pin below is
 //! the SHA-256 of that hosted artifact — the same "convert-and-host-once"
@@ -37,7 +36,7 @@
 //! (`tts.json`, `voice.bin`, `unicode_indexer.bin`) are byte-identical before
 //! and after conversion, so they carry the upstream pack's own digests.
 //!
-//! **License (ADR 0004, amended 2026-07-12):** Supertonic's code is MIT and
+//! **License (ADR 0004):** Supertonic's code is MIT and
 //! its weights are **OpenRAIL-M** — a RAIL-class behavioral-restriction
 //! license, which the amended policy makes *default-eligible* provided the
 //! restrictions are behavioral-only and the download names + links the

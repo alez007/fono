@@ -3,8 +3,7 @@
 //!
 //! * `bench` — legacy latency + WER benchmark over the multilingual
 //!   fixture set; emits a JSON `Report`.
-//! * `equivalence` — streaming↔batch equivalence harness (plan v6 R18
-//!   Slice A foundation).
+//! * `equivalence` — streaming↔batch equivalence harness.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -95,7 +94,7 @@ enum Cmd {
     AssistantToolUse(AssistantToolUseArgs),
     /// Extract the first captured assistant prompt from a trace JSON.
     ExtractTracePrompt(ExtractTracePromptArgs),
-    /// Streaming↔batch equivalence harness (plan v6 R18).
+    /// Streaming↔batch equivalence harness.
     Equivalence(EquivalenceArgs),
     /// Local TTS backend benchmark (Piper / Kokoro / Supertonic), EN + RO.
     Tts(TtsArgs),

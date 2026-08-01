@@ -7,9 +7,6 @@
 //! and assert that the wizard's shortlist builder picks the expected
 //! model. They exercise the pure data path only — no whisper.cpp is
 //! spawned, no TTY is touched.
-//!
-//! See `docs/bench/calibration/summary/plans/2026-05-25-wizard-selection-heuristics-refresh-v5.md`
-//! task E3.
 
 use fono::wizard::{build_local_stt_shortlist, ShortlistEntry};
 use fono_core::hwcheck::{CpuFeatures, HostGpu};
@@ -49,9 +46,9 @@ fn legacy_integrated_host_picks_english_only_variant() {
     // (7.15 × core_scale 0.25 = 1.79) is still below the floor, so the
     // shortlist tops at tiny.en. The English-only filter is preserved.
     //
-    // Note: the plan v5 outcome table aspires to small.en on this class;
-    // the gap is documented in the post-implementation report and is a
-    // future tuning item for the RTF anchors / `BATCH_REALTIME_MIN`.
+    // Note: small.en would be the nicer pick on this class; closing the
+    // gap is a future tuning item for the RTF anchors /
+    // `BATCH_REALTIME_MIN`.
     let s =
         snap(2, 4, 8, CpuFeatures { avx2: true, fma: true, ..Default::default() }, HostGpu::None);
     let entries = build_local_stt_shortlist(true, &["en".to_string()], &s);

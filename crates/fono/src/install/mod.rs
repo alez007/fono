@@ -3,10 +3,9 @@
 //!
 //! The public surface (`run_install`, `run_uninstall`, `doctor_state`,
 //! [`InstallModeArg`]) is platform-neutral; each OS provides its own
-//! implementation module (the "Installer trait split" of the Windows
-//! port plan Task 1.6 / macOS port plan Task 9.1 — realised as
-//! cfg-dispatched modules with an identical fn signature rather than a
-//! literal trait, since exactly one implementation ever exists per
+//! implementation module (an "Installer trait split" realised as
+//! cfg-dispatched modules with an identical fn signature rather than
+//! a literal trait, since exactly one implementation ever exists per
 //! compiled binary and a trait object would add ceremony without a
 //! seam):
 //!

@@ -3,7 +3,7 @@
 //!
 //! CGEvent posting silently drops events when the process lacks the
 //! Accessibility grant, so callers must *probe* rather than inject and
-//! hope (macOS port plan Task 9.3). Two entry points:
+//! hope. Two entry points:
 //!
 //! - [`accessibility_trusted`] — silent check, safe to call anywhere
 //!   (doctor, periodic status).

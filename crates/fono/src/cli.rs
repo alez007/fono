@@ -234,14 +234,6 @@ pub enum Cmd {
         /// Use a different model, without changing your config.
         #[arg(long)]
         model: Option<String>,
-        /// Hold the model to this home's rooms and devices while it writes a
-        /// command (`on`), or leave it free (`off`), without changing your
-        /// config.
-        ///
-        /// Use this to measure what the rails are worth: the same fixtures,
-        /// once each way. Defaults to whatever your config says.
-        #[arg(long, value_parser = ["on", "off"])]
-        grammar: Option<String>,
         /// List every device the home reports, and stop.
         ///
         /// Use this to write a fixture that names one particular device.
@@ -901,7 +893,6 @@ pub async fn run(cli: Cli) -> Result<()> {
             only,
             backend,
             model,
-            grammar,
             show_house,
             no_trace,
             out,
@@ -916,7 +907,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 only,
                 backend,
                 model,
-                grammar: grammar.map(|g| g == "on"),
                 show_house,
                 trace: !no_trace,
                 out,
@@ -1418,7 +1408,6 @@ async fn voices_discover(paths: &Paths, cfg: &Config, backend: &str, json: bool)
 }
 
 /// `fono discover [--json]` — print the daemon's live mDNS registry.
-/// Slice 4 of the network plan.
 async fn discover_cmd(paths: &Paths, json: bool) -> Result<()> {
     let resp = fono_ipc::request_any(
         &paths.client_ipc_socket_candidates(),
@@ -2520,11 +2509,10 @@ async fn server_keys_cmd(paths: &Paths, action: ServerKeysCmd) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// `fono speaker …` — manage enrolled speakers for local voice biometrics
-// (Slice 3.3 of plans/2026-07-17-speaker-verification-v1.md). Voice prints
-// live in `speakers.sqlite` (mode 0600) beside history.sqlite and never
-// leave the machine. Enrollment/identification from audio (`enroll`,
-// `test`, `identify`) land with the hosted model pack in Slice 1; the
+// `fono speaker …` — manage enrolled speakers for local voice biometrics.
+// Voice prints live in `speakers.sqlite` (mode 0600) beside history.sqlite
+// and never leave the machine. Enrollment/identification from audio
+// (`enroll`, `test`, `identify`) land with the hosted model pack; the
 // metadata verbs below (list/rename/remove) work today against the store.
 // ---------------------------------------------------------------------
 
@@ -3086,7 +3074,6 @@ async fn update_cmd(
 // `fono record --live` and `fono test-overlay`. Both are only fully
 // functional when the binary was built with `--features interactive`;
 // the slim build provides stubs that print a helpful hint.
-// Plan v6 / Slice A.
 // ---------------------------------------------------------------------
 
 #[cfg(not(feature = "interactive"))]
@@ -3099,7 +3086,7 @@ async fn record_cmd_live(
 ) -> Result<()> {
     Err(anyhow::anyhow!(
         "live mode requires the `interactive` cargo feature; rebuild with \
-         `cargo build --features interactive` (Slice A — see plans/2026-04-27-fono-interactive-v6.md)"
+         `cargo build --features interactive`"
     ))
 }
 
@@ -3108,7 +3095,7 @@ fn test_overlay_cmd() {
     println!(
         "test-overlay: this binary was built without the `interactive` cargo feature.\n\
          Rebuild with `cargo build --features interactive` to exercise the real \
-         winit+softbuffer overlay (plan v6 / Slice A)."
+         winit+softbuffer overlay."
     );
 }
 
@@ -3131,12 +3118,12 @@ async fn record_cmd_live(
 
     use crate::live::{LiveSession, Pump};
 
-    // Slice A is local-first. Cloud streaming lands in Slice B.
+    // `fono record --live` is local-only: it needs the `StreamingStt` impl,
+    // which only the embedded whisper backend provides.
     if !matches!(config.stt.backend, SttBackend::Local) {
         return Err(anyhow::anyhow!(
-            "live mode in Slice A only supports the local whisper backend; \
-             active backend is {:?}. Run `fono use stt local` first, or wait for Slice B \
-             cloud streaming.",
+            "`fono record --live` only supports the local whisper backend; \
+             active backend is {:?}. Run `fono use stt local` first.",
             config.stt.backend
         ));
     }
@@ -3185,10 +3172,9 @@ async fn record_cmd_live(
         cap_cfg.target_sample_rate
     );
 
-    // Slice A capture loop: record-then-replay-through-streaming.
-    // True real-time push (cpal callback -> AudioFrameStream) lands in
-    // Slice B alongside the cpal-callback refactor; the streaming code
-    // path is still fully exercised below.
+    // Capture loop: record, then replay through the streaming pipeline.
+    // Not a true real-time push (that is the daemon's `live` path), but it
+    // exercises the full streaming code path below.
     let started = Instant::now();
     let max = if max_seconds == 0 {
         Duration::from_secs(60 * 60)

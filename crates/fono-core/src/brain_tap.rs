@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Brain tap — sparse, near-zero-cost capture of per-token forward-pass
 //! signals from the embedded llama.cpp backends, feeding the "Glass
-//! Cortex" overlay visualization (see
-//! `plans/2026-07-05-brain-visualization-v1.md`).
+//! Cortex" overlay visualization.
 //!
 //! ## How it works
 //!

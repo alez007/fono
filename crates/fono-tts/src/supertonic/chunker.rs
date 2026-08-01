@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Supertonic text chunker: long text → synthesis-sized chunks (Slice 2,
-//! Task 2.4).
+//! Supertonic text chunker: long text → synthesis-sized chunks.
 //!
 //! Ported from the sherpa reference `ChunkText` (in `text-utils.cc`) plus the
 //! per-language `max_len` selection in `offline-tts-supertonic-impl.cc`. The

@@ -80,6 +80,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of action nothing can check afterwards — an announcement, say — it will only
   tell you the request was sent, never that it is done. One action per request,
   so a single sentence can never set off a chain of them.
+- **A command you give often stops waiting for the assistant.** Say the same
+  thing twice and have it work both times, and from then on those words switch
+  the light straight away — no thinking, no pause. Fono only takes that shortcut
+  when the words match exactly and nothing went wrong: if a command fails, or
+  you come straight back about the same thing, the phrase goes back to being
+  thought about. Amounts are never shortcut, because "two degrees warmer" twice
+  is four degrees. Settings shows what has been learned under Things you can
+  say, where you can add another wording for the same command or forget one.
 - Connecting a tool server now switches tool use on for you. Previously you
   could add a server, watch it list everything it could do, and still have
   nothing happen, because a separate switch had quietly stayed off.

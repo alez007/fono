@@ -27,7 +27,7 @@ pub struct EnvelopeConfig {
     pub voiced_attack_ms: u32,
     /// Release time constant for `voiced_rms` — used when the current
     /// frame is quieter than the running estimate. Slow (~3 s) so the
-    /// reference holds across natural pauses; slice 2's `Pondering`
+    /// reference holds across natural pauses; the `Pondering`
     /// indicator depends on this hold to stay engaged.
     pub voiced_release_ms: u32,
     pub voice_floor_dbfs: f32,

@@ -5,7 +5,7 @@
 //! actually use: STT (audio + describe/info + transcribe + transcript,
 //! with optional streaming variants), TTS (synthesize + audio-* on
 //! the response side), and **wake** (detect + detection on the wake
-//! side — Phase H of the wake-word plan, letting Fono expose its local
+//! side, letting Fono expose its local
 //! detector as a Wyoming wake service). VAD / intent / handle /
 //! satellite / mic / snd events live one upstream version away and will
 //! land in follow-up slices.

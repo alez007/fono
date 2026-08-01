@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Shared types, config loader, XDG path resolver, and SQLite schema for Fono.
-//!
-//! Implemented per Phase 1 of `docs/plans/2026-04-24-fono-design-v1.md`.
 
 pub mod api_keys;
 pub mod config;
@@ -52,7 +50,6 @@ pub mod vulkan_probe;
 // compiled whenever *either* the whisper (`fono-stt`) or llama
 // (`fono-polish`/`fono-assistant`) Vulkan backend is active. Lets the
 // GPU build launch on hosts without the Vulkan loader and fall back to
-// CPU. See `plans/2026-07-12-vulkan-soft-load-single-build-v1.md`.
 #[cfg(all(feature = "accel-vulkan", any(target_os = "linux", target_os = "windows")))]
 pub mod vk_loader_shim;
 

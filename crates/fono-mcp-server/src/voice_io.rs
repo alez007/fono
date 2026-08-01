@@ -206,8 +206,6 @@ impl Drop for OverlayGuard {
 /// skipped; the daemon's depth counter will still re-balance when the
 /// next Start lands on the 0→1 transition because the guard's
 /// invariant ("Start before End") was upheld up to runtime tear-down.
-///
-/// Slice 7 of plan v7.
 pub(crate) struct McpActivityGuard {
     candidates: Vec<std::path::PathBuf>,
 }
@@ -572,7 +570,7 @@ pub struct SpeakTimings {
 /// of the listed sockets accepts an IPC connection, the daemon flips
 /// its tray to amber for the duration of playback. The guard is
 /// gated on synthesised audio length ≥ 1 s so trivially short
-/// prompts (e.g. "yes?") don't flash the tray. Slice 7 of plan v7.
+/// prompts (e.g. "yes?") don't flash the tray.
 pub async fn speak_text(
     cfg: &Config,
     secrets: &Secrets,
@@ -688,7 +686,7 @@ pub struct ListenOutcome {
     pub transcript: String,
     /// Wall-clock duration of the capture in milliseconds (capture only,
     /// not STT inference). Cumulative across rejected utterances in the
-    /// multi-utterance loop (Slice 3 of plan v7).
+    /// multi-utterance loop.
     pub duration_ms: u64,
     /// Why the capture loop ended.
     pub reason: ListenStopReason,
@@ -733,13 +731,12 @@ pub enum ListenStopReason {
 /// Each iteration captures PCM until either the caller's
 /// `max_seconds` per-utterance budget elapses or the silence-watch
 /// state machine commits; the buffered audio is transcribed; the
-/// relevance heuristic (Slice 3 of plan v7) decides whether to
-/// return it or drop it and re-arm.
+/// relevance heuristic decides whether to return it or drop it and re-arm.
 ///
 /// `prompt` is the agent-supplied prompt text (used only for the
-/// echo check); `context` is reserved for the LLM classifier added
-/// in Slice 4. The overlay handle is held across iterations so the
-/// panel stays visible while we wait for a real answer.
+/// echo check); `context` is used by the optional LLM classifier. The
+/// overlay handle is held across iterations so the panel stays visible
+/// while we wait for a real answer.
 ///
 /// This function spends most of its time in the asynchronous polling
 /// loop; the capture thread itself is owned by the platform backend
@@ -775,7 +772,6 @@ pub async fn listen_once(
     // the daemon's EOF handler decrements the depth counter. The guard
     // also carries the `cancelled` flag that flips to `true` when the
     // daemon forwards a `Response::McpListenCancelled` (Escape key).
-    // Slice 7 of plan v7; upgraded to hold-based in the cancel-fix pass.
     let hold_guard =
         McpActivityHoldGuard::acquire(McpPhase::Listening, daemon_ipc_candidates).await;
     let cancelled = Arc::clone(&hold_guard.cancelled);
@@ -784,26 +780,24 @@ pub async fn listen_once(
     // utterance) listen loop. RAII-managed: dropped at the end of
     // this function (or on panic / early return) which flips the
     // panel to `Hidden`. Spawned only while the microphone is open —
-    // Slice 1 of plan v7 deliberately keeps the prompt-TTS phase
-    // silent overlay-wise.
+    // the prompt-TTS phase is deliberately silent overlay-wise.
     //
-    // The Slice 6 "skip when a daemon is detected" branch has been
-    // removed: the daemon only renders its overlay during F7
-    // dictation / F8 assistant turns, so deferring to it during an
-    // MCP listen left the user with no panel at all. Two overlapping
-    // panels are a worse-case-theoretical concern; the practical
-    // case is zero panels, which is what the probe produced. A
-    // proper fix would be a new IPC channel asking the daemon to
-    // paint on the MCP server's behalf — deferred until the
-    // double-paint actually shows up as a complaint in practice.
+    // There is deliberately no "skip when a daemon is detected" branch:
+    // the daemon only renders its overlay during F7 dictation / F8
+    // assistant turns, so deferring to it during an MCP listen leaves
+    // the user with no panel at all. Two overlapping panels are a
+    // worse-case-theoretical concern; the practical case is zero
+    // panels, which is what probing produced. A proper fix would be a
+    // new IPC channel asking the daemon to paint on the MCP server's
+    // behalf — deferred until the double-paint actually shows up as a
+    // complaint in practice.
     let overlay = OverlayGuard::spawn(cfg);
     overlay.set_state(OverlayState::Recording { db: 0 });
 
     let max_rejections = cfg.mcp.relevance_max_rejections;
     let filter_enabled = cfg.mcp.relevance_filter.as_str() != "off";
-    // Cumulative wall-clock ceiling across iterations. `max_seconds
-    // × 1.5` matches the spec in Slice 3 of plan v7 — gives the
-    // loop one full retry budget on top of a single-shot capture.
+    // Cumulative wall-clock ceiling across iterations. `max_seconds × 1.5`
+    // gives the loop one full retry budget on top of a single-shot capture.
     let wall_clock_budget = Duration::from_secs((max_seconds.max(1) as u64 * 3).div_ceil(2));
     let loop_started = Instant::now();
 
@@ -977,7 +971,7 @@ pub async fn listen_once(
                 // the user gets a discriminable visual ack ("Fono
                 // heard you but is still waiting for a real answer")
                 // before the next iteration re-arms the panel into
-                // `Recording`. Slice 5 of plan v7.
+                // `Recording`.
                 overlay.set_state(OverlayState::Ignoring { reason: map_ignore_reason(why) });
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 overlay.set_state(OverlayState::Recording { db: 0 });

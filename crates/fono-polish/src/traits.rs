@@ -121,8 +121,7 @@ the original transcript unchanged.",
 /// models — cloud or local — cannot mistake the user turn for a
 /// conversational message addressed to them. The matching `<<<` / `>>>`
 /// markers are referenced by `default_prompt_main` and must stay in sync
-/// with it. Applied identically by every `TextFormatter` impl. See
-/// `plans/2026-04-28-polish-cleanup-clarification-refusal-fix-v1.md` Task 2.
+/// with it. Applied identically by every `TextFormatter` impl.
 #[must_use]
 pub fn user_prompt(raw: &str) -> String {
     format!(

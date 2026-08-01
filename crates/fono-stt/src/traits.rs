@@ -13,7 +13,7 @@ pub struct Transcription {
 
 /// Per-call transcription options. Passed to [`SpeechToText::transcribe_with_opts`].
 ///
-/// Added in Phase D (hover-context injection). The default value produces
+/// Used by hover-context injection. The default value produces
 /// identical behaviour to calling [`SpeechToText::transcribe`] directly, so
 /// backends that don't override `transcribe_with_opts` are unaffected.
 #[derive(Debug, Clone, Default)]

@@ -58,7 +58,7 @@ const MIN_CTX: u32 = 512;
 struct GenParams {
     /// Cap on generated tokens (already clamped to [`MAX_NEW_TOKENS`]).
     max_new_tokens: i32,
-    /// This request's cached prefix is the *static head* — system prompt, room
+    /// This request's cached prefix is the *static head* — system prompt, area
     /// and device names, tool catalogue — with no conversation in front of it,
     /// so it is byte-identical on every later turn and in every later
     /// conversation. True for a turn with empty history and for the
@@ -69,6 +69,24 @@ struct GenParams {
     /// [`Self::generate_with_prefix_cache`] — but only the static head is
     /// **pinned**, because only it is worth protecting from eviction forever.
     pin_prefix: bool,
+    /// Whether this request's cached prefix is still worth having once the turn
+    /// is over.
+    ///
+    /// True for the prefix that ends where the user's words begin: the next turn
+    /// starts with the same system prompt and the same history, so a checkpoint
+    /// of it saves that turn the whole read. False for the wording pass after a
+    /// tool call, whose prefix contains this turn's own request, call and result
+    /// — text no later turn reproduces.
+    ///
+    /// The distinction has to be made because the two are filed together
+    /// otherwise, and the longer one deletes the shorter: an insert drops any
+    /// same-layer entry it strictly contains, which is right for prefix
+    /// matching and wrong here, because the shorter entry is the one the next
+    /// turn asks for by name. Measured cost of getting this wrong: every turn
+    /// of a 22-command run re-read 1592 tokens it had read moments before, 40 s
+    /// each, while the surviving checkpoint was a mid-turn one nothing could
+    /// use.
+    prefix_outlives_turn: bool,
     /// Whether this turn may drive the Glas Cortex tap. Carried from
     /// [`AssistantContext::allow_brain_capture`]; `false` for network turns
     /// so a remote client sharing this backend never lights the local
@@ -323,7 +341,7 @@ impl LlamaLocalAssistant {
         // instead of being copied resident — the mechanism behind Win #1. For
         // the small dense default this is behaviourally identical to
         // `default()`; the differing params also key a *separate* shared-model
-        // entry from polish's `default()` load of the same file (Phase B), which
+        // entry from polish's `default()` load of the same file, which
         // is correct — the two roles want different residency for big MoEs.
         let model = shared_model(&self.model_path, &streaming_model_params())?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -364,7 +382,7 @@ impl LlamaLocalAssistant {
         Ok(())
     }
 
-    /// Task 8 generation-time prefix cache. Restores a cached prefix checkpoint
+    /// Generation-time prefix cache. Restores a cached prefix checkpoint
     /// when one exists (building it on first use), then prefills only the
     /// per-turn suffix before generating. Returns `Ok(None)` — having emitted
     /// nothing — whenever the split cannot be reused safely (empty prefix/suffix,
@@ -431,13 +449,26 @@ impl LlamaLocalAssistant {
         let head_key = self
             .prompt_state_cache_key(PromptStateCacheLayer::F8System, prefix, &prefix_tokens)
             .ok();
+        // And where an *unpinned* checkpoint of the same prefix lives. A prompt
+        // carrying a per-turn note is never pinned — the note is the wrong
+        // occupant for the one pinned slot — so its checkpoint is filed under
+        // `HistoryPrefix`, and it is subject to the identical equal-length
+        // blindness. Without this second exemption, a note appended to the
+        // system prompt made every turn a cold read of the whole device list:
+        // measured on the command benchmark, 22 of 22 turns cold and the middle
+        // turn 4.5× slower, for a note that never changed between turns.
+        let stored_key = self
+            .prompt_state_cache_key(PromptStateCacheLayer::HistoryPrefix, prefix, &prefix_tokens)
+            .ok();
         let cached = {
             let mut cache = self
                 .prompt_state_cache
                 .lock()
                 .map_err(|_| anyhow!("llama-local prompt-state cache mutex poisoned"))?;
-            let entry =
-                cache.get(&key).or_else(|| head_key.as_ref().and_then(|head| cache.get(head)));
+            let entry = cache
+                .get(&key)
+                .or_else(|| head_key.as_ref().and_then(|head| cache.get(head)))
+                .or_else(|| stored_key.as_ref().and_then(|stored| cache.get(stored)));
             current_instant(
                 "llm.prompt_cache_lookup",
                 "cache",
@@ -509,6 +540,11 @@ impl LlamaLocalAssistant {
                     &[
                         PromptStateCacheLayer::F8ChatPrefix,
                         PromptStateCacheLayer::HistoryPrefix,
+                        // Where a prefix that dies with the turn is filed. Of
+                        // no use to a later turn, but the wording pass after a
+                        // tool call has the pass before it as a strict prefix,
+                        // so within one turn it is the deepest thing there is.
+                        PromptStateCacheLayer::ExactPrompt,
                         PromptStateCacheLayer::F8System,
                     ],
                     &token_ids(&prefix_tokens),
@@ -569,7 +605,7 @@ impl LlamaLocalAssistant {
                 )?;
             }
             // Checkpoint the prefix whenever we just paid to read it. Measured
-            // on gemma-4-e2b: 966 tokens of system prompt, room and device
+            // on gemma-4-e2b: 966 tokens of system prompt, area and device
             // names and tool catalogue cost 13.2 s to read, and were then
             // thrown away — the next conversation paid 16.5 s to read the same
             // thing again, because the only pinned entry was the 72-token bare
@@ -600,12 +636,21 @@ impl LlamaLocalAssistant {
             // Only the static head is PINNED (`params.pin_prefix`): it is the
             // one entry worth protecting from eviction forever, being identical
             // in every later conversation.
+            //
+            // And a prefix that does not outlive the turn is filed apart from
+            // the ones that do (`params.prefix_outlives_turn`), because the
+            // pruning described above happens *within* `HistoryPrefix` too: the
+            // wording pass after a tool call has a longer prefix that contains
+            // the turn-start one, so filing both together deleted the useful
+            // half seconds after it was written.
             if start < prefix_tokens.len() {
                 let store_key = if params.pin_prefix {
                     head_key
+                } else if params.prefix_outlives_turn {
+                    stored_key
                 } else {
                     self.prompt_state_cache_key(
-                        PromptStateCacheLayer::HistoryPrefix,
+                        PromptStateCacheLayer::ExactPrompt,
                         prefix,
                         &prefix_tokens,
                     )
@@ -662,7 +707,7 @@ impl LlamaLocalAssistant {
         // restore the completed exchange (system + history + this user + reply)
         // instead of re-prefilling user_N + reply_N.
         //
-        // Subtlety (proven empirically, 2026-06-09): the KV cache holds the
+        // Subtlety (proven empirically): the KV cache holds the
         // *sampled* token ids, but next turn the same reply text re-tokenizes as
         // part of a longer prompt. BPE merges the final reply token with the
         // following turn-closer (`<end_of_turn>` / `<|im_end|>`), so the raw
@@ -840,7 +885,7 @@ impl LlamaLocalAssistant {
         self.run_inference_with_model(model, prompt, MAX_NEW_TOKENS, None, on_delta)
     }
 
-    /// Reply generation with the Task 8 prefix cache. Only attempts the cached
+    /// Reply generation with the prefix cache. Only attempts the cached
     /// path when the split reproduces the full prompt byte-for-byte; on any
     /// incompatibility it falls back to a full prefill having emitted nothing.
     fn run_inference_with_prefix_cache<F>(
@@ -1680,7 +1725,7 @@ impl LlamaLocalAssistant {
         // The F8 system base is framed into the chat template so it is a true
         // token prefix of the live F8ChatPrefix prompt (mirrors the F7 base).
         if let Some(system) = warmup.f8_system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
-            // Warm the head the reply path will actually send — greeting, rooms,
+            // Warm the head the reply path will actually send — greeting, areas,
             // devices and tool descriptions — rendered by the same code, so the
             // checkpoint is a genuine token prefix of the live prompt. Warming
             // the bare greeting instead pinned 72 tokens in front of 1510 and
@@ -1790,8 +1835,7 @@ struct GenerationResult {
     /// stop token is excluded — it breaks before being decoded). Lets the
     /// prefix-cache path checkpoint the *post-generation* state (system +
     /// history + this turn's user + reply) so the next turn can restore the
-    /// completed exchange instead of re-prefilling it. See Option C in
-    /// `plans/2026-06-09-f8-current-turn-double-count-cache-fix-v1.md`.
+    /// completed exchange instead of re-prefilling it.
     tokens: Vec<llama_cpp_2::token::LlamaToken>,
 }
 
@@ -1947,7 +1991,7 @@ where
         (start_pos.max(0) as u32).saturating_add(generated_tokens),
         ctx.n_ctx(),
     );
-    // Task 16d: stamp whether the rails were armed for this generation, so an
+    // Stamp whether the rails were armed for this generation, so an
     // A/B pair of traces is self-describing — you can tell from the artefact
     // alone which arm produced it instead of trusting the run log.
     let mut gen_args = generation_span_args(
@@ -2008,7 +2052,7 @@ fn push_gemma_turn(buf: &mut String, role: &str, content: &str, markers: TurnMar
 }
 
 /// Split the reply prompt into a stable prefix and a per-turn suffix for the
-/// Task 8 prefix cache. The stable prefix is everything up to (but not
+/// prefix cache. The stable prefix is everything up to (but not
 /// including) the variable user text; the suffix carries the user text plus the
 /// closing template. By construction `format!("{prefix}{suffix}")` reproduces
 /// [`build_prompt`] for the same inputs (asserted in tests), and the runtime
@@ -2204,7 +2248,7 @@ impl Assistant for LlamaLocalAssistant {
         // block is *appended*, never prepended, so the pinned system checkpoint
         // stays a genuine token prefix and the turn is not cold-prefilled.
         //
-        // Order is load-bearing: greeting, rooms, devices, tools — everything
+        // Order is load-bearing: greeting, areas, devices, tools — everything
         // that changes only when the house does — and the speaker note last,
         // because it changes every turn. Composed here rather than by the
         // caller so that the head this backend sends is byte-identical to the
@@ -2257,7 +2301,7 @@ impl Assistant for LlamaLocalAssistant {
             .and_then(|n| i32::try_from(n).ok())
             .map_or(MAX_NEW_TOKENS, |n| n.clamp(1, MAX_NEW_TOKENS));
         // Pin this request's prefix only when it genuinely IS the static head —
-        // system prompt, rooms, devices, tool catalogue and nothing else.
+        // system prompt, areas, devices, tool catalogue and nothing else.
         //
         // The warm paths pin that head deliberately and by name, so this is now
         // only a safety net for the window before the warm has finished (or a
@@ -2271,6 +2315,9 @@ impl Assistant for LlamaLocalAssistant {
         let gen_params = GenParams {
             max_new_tokens,
             pin_prefix: ctx.history.is_empty() && ctx.turn_notes().is_none(),
+            // This prefix ends where the user's words begin, so the next turn
+            // asks for exactly it.
+            prefix_outlives_turn: true,
             allow_capture: ctx.allow_brain_capture,
             // Rails only when tools are offered this turn AND the setting is on.
             // `ActionTools::grammar` is already `None` when the switch is off,
@@ -2378,8 +2425,14 @@ impl Assistant for LlamaLocalAssistant {
                         // Never pinned: this pass's prefix carries this turn's
                         // own words, so pinning it would evict the static head
                         // pin — the one entry every later conversation depends
-                        // on.
-                        GenParams { pin_prefix: false, ..gen_params.clone() },
+                        // on. Nor does it outlive the turn, for the same
+                        // reason: it contains this turn's request, tool call
+                        // and tool result, which no later turn reproduces.
+                        GenParams {
+                            pin_prefix: false,
+                            prefix_outlives_turn: false,
+                            ..gen_params.clone()
+                        },
                         |delta| {
                             buf.push_str(delta.trim_start_matches('\u{feff}'));
                             if !header_done {
@@ -2476,6 +2529,22 @@ impl Assistant for LlamaLocalAssistant {
                                 arguments,
                             }
                         });
+                    // A repeat of the request that just failed is not a second
+                    // attempt; it is a second wait for the same answer. Sending
+                    // it is the only way the correction can waste the user's
+                    // time, so it is not sent.
+                    let retry = retry.filter(|next| {
+                        let repeat = next.name == call.name
+                            && local_tools::same_request(&next.arguments, &call.arguments);
+                        if repeat {
+                            warn!(
+                                "{} was written again unchanged after it failed; not sending it a \
+                                 second time",
+                                call.name
+                            );
+                        }
+                        !repeat
+                    });
                     let Some(next) = retry else {
                         // Nothing more to run. Whatever was held back is either
                         // prose — say it, swallowing it would leave the user
@@ -2974,7 +3043,7 @@ mod tests {
     /// bare greeting behind it (F28, F30, F31).
     #[test]
     fn warm_head_leads_every_live_prompt() {
-        let prompt_main = "You are Fono, a terse assistant.\n\nRooms: Kitchen, Office.";
+        let prompt_main = "You are Fono, a terse assistant.\n\nAreas: Kitchen, Office.";
         let instructions = "Reply in 1-4 sentences. Match the user's language.";
         let descriptors = vec![serde_json::json!({
             "type": "function",
@@ -3110,7 +3179,7 @@ mod tests {
                     }}
                 }
             })],
-            hint: Some("Rooms in this home: Kitchen, Office.".into()),
+            hint: Some("Areas in this home: Kitchen, Office.".into()),
             grammar: None,
             execute: Arc::new(move |call: ToolCall| {
                 let recorder = Arc::clone(&recorder);
@@ -3148,7 +3217,7 @@ mod tests {
         assert_eq!(calls[0].name, "HassTurnOn", "wrong tool: {calls:?}");
         assert!(
             calls[0].arguments.to_lowercase().contains("kitchen"),
-            "the room did not survive into the arguments: {:?}",
+            "the area did not survive into the arguments: {:?}",
             calls[0].arguments
         );
         // The user must hear words, not the raw tool answer.
@@ -3219,7 +3288,7 @@ mod tests {
                     "parameters": {"type": "object", "properties": {"area": {"type": "string"}}}
                 }
             })],
-            hint: Some("Rooms in this home: Kitchen, Office.".into()),
+            hint: Some("Areas in this home: Kitchen, Office.".into()),
             grammar: None,
             execute: Arc::new(move |call: ToolCall| {
                 let recorder = Arc::clone(&recorder);
@@ -3426,7 +3495,7 @@ mod tests {
 
     #[test]
     fn cached_prefix_nests_across_turns_under_daemon_flow() {
-        // Regression for the current-turn double-count bug (2026-06-09): the
+        // Regression for the current-turn double-count bug: the
         // daemon snapshots COMPLETED history (excluding the in-flight user turn)
         // and passes the current turn as `user_text`
         // (`crates/fono/src/assistant.rs`). Under that contract every turn's
@@ -3693,6 +3762,79 @@ mod tests {
             !events.iter().any(|e| e["name"] == "llm.prompt_cache_cold_prefill"
                 && e["args"]["reason"] == "no_prefix_match"),
             "turn cold-prefilled despite the pinned F8System base — D2 regression"
+        );
+    }
+
+    /// A note in the system prompt must not cost a cold read of the whole
+    /// device list on every turn.
+    ///
+    /// A prompt carrying a per-turn note is deliberately never pinned, so its
+    /// checkpoint is filed under `history_prefix` — and the longest-prefix
+    /// search skips an entry exactly as long as the prefix it is looking for,
+    /// because for a whole prompt that would leave nothing to decode. Between
+    /// those two rules a repeated note fell through every lookup: turn after
+    /// turn re-read a prefix it had already read. Measured on the command
+    /// benchmark, every one of 22 turns was cold and the middle turn took 4.5×
+    /// as long, for a note identical on all of them.
+    ///
+    /// Deliberately warms nothing: the pinned base is the path the sibling test
+    /// covers, and its presence would mask this one by matching first.
+    ///
+    /// Run with `--test-threads=1` (see the sibling live-cache tests).
+    #[tokio::test]
+    #[ignore = "requires FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf"]
+    async fn a_repeated_note_is_read_once_not_once_per_turn() {
+        use fono_core::turn_trace::TurnTrace;
+        use futures::StreamExt;
+
+        let model_path = std::env::var_os("FONO_TEST_ASSISTANT_GGUF")
+            .expect("set FONO_TEST_ASSISTANT_GGUF=/path/to/chat-model.gguf");
+        let context = std::env::var("FONO_TEST_ASSISTANT_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let assistant = LlamaLocalAssistant::new(model_path, context);
+
+        let ctx = AssistantContext {
+            system_prompt: "You are Fono, a terse voice assistant. Reply with one short \
+                            sentence.\n\nReply in English."
+                .into(),
+            max_new_tokens: Some(24),
+            ..AssistantContext::default()
+        };
+        let say = |text: &'static str| {
+            let assistant = &assistant;
+            let ctx = ctx.clone();
+            async move {
+                let mut stream =
+                    assistant.reply_stream(text, &ctx).await.expect("reply_stream").boxed();
+                let mut out = String::new();
+                while let Some(delta) = stream.next().await {
+                    out.push_str(&delta.expect("token delta").text);
+                }
+                assert!(!out.trim().is_empty(), "empty reply");
+            }
+        };
+
+        // Turn one pays for the prefix and checkpoints it.
+        say("turn on the kitchen lights").await;
+
+        // Only turn two is traced, so the assertion sees its cache decision.
+        let trace_dir =
+            std::env::temp_dir().join(format!("fono-note-cache-{}", std::process::id()));
+        let trace = TurnTrace::start_in(&trace_dir);
+        let guard = trace.make_current();
+        say("turn off the kitchen lights").await;
+        guard.clear();
+        trace.finish(serde_json::json!({}));
+
+        let raw = std::fs::read_to_string(trace.path()).expect("read trace file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse trace JSON");
+        let events = parsed["traceEvents"].as_array().expect("traceEvents array");
+        assert!(
+            !events.iter().any(|e| e["name"] == "llm.prompt_cache_cold_prefill"
+                && e["args"]["reason"] == "no_prefix_match"),
+            "a turn whose note was unchanged still cold-read its whole prefix"
         );
     }
 

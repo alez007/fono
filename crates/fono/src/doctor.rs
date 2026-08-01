@@ -307,8 +307,7 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
     writeln!(out)?;
 
     // Compute backends — what's compiled into this variant + what the
-    // host's Vulkan loader reports. Slice 2 of
-    // `plans/2026-05-02-fono-cpu-gpu-variants-v1.md`.
+    // host's Vulkan loader reports.
     {
         use crate::variant::{Variant, VARIANT};
         use fono_core::vulkan_probe::probe;
@@ -526,8 +525,10 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
             let head = fono_assistant::compose_head(
                 &crate::session::assistant_prompt_context(
                     // Nobody is speaking during a health check, so no run is
-                    // attributed to anyone.
-                    crate::actions::build(c, paths, None).as_ref().and_then(|a| a.hint.as_deref()),
+                    // attributed to anyone and there is nothing to learn.
+                    crate::actions::build(c, paths, None, &crate::actions::Learning::none())
+                        .as_ref()
+                        .and_then(|a| a.hint.as_deref()),
                 ),
                 None,
                 Some(&c.assistant.prompt_main),
@@ -885,7 +886,7 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
     col.push(S::Info, "injector", &format!("{injector:?}"));
     // macOS: injection is gated by the Accessibility TCC grant, and
     // CGEventPost drops events *silently* when it's missing — so the
-    // probe is the only honest signal (macOS port plan Task 9.3).
+    // probe is the only honest signal.
     if let Some(trusted) = fono_inject::accessibility_trusted() {
         if trusted {
             writeln!(out, "{} {}", head("Accessibility:"), ok("granted (fono can type for you)"))?;
@@ -1160,8 +1161,7 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
     }
 
     // ----------------------------------------------------------------
-    // Wake word — always-on "hey fono" activation (Phase J of
-    // plans/2026-06-23-wake-word-openwakeword-v2.md). Honest field
+    // Wake word — always-on "hey fono" activation. Honest field
     // reporting: enabled?, the detector backend that WOULD run, each
     // phrase's target + license badge + cache state, the clean default
     // model's cache state, NonCommercial consent, and the loud Wyoming
@@ -1376,8 +1376,7 @@ pub fn gather(paths: &Paths, probes_source: impl FnOnce() -> KeyProbes) -> Resul
         writeln!(out)?;
     }
     // ----------------------------------------------------------------
-    // Speaker verification — local voice biometrics (Slice 3 of
-    // plans/2026-07-17-speaker-verification-v1.md). Honest field
+    // Speaker verification — local voice biometrics. Honest field
     // reporting: enabled?, the selected registry model (and whether it
     // resolves), the enrolled-speaker count, and the threshold source.
     // Loudly warns when enabled with zero enrolled speakers (nothing

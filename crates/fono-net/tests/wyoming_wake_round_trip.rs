@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! End-to-end integration test for the Wyoming **wake** server path
-//! (Phase H of `plans/2026-06-23-wake-word-openwakeword-v2.md`).
+//! End-to-end integration test for the Wyoming **wake** server path.
 //!
 //! Stands up a real `WyomingServer` on a loopback ephemeral port with a
 //! mock STT plus a bound wake detector (the deterministic `EnergyWakeStub`

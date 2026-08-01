@@ -90,6 +90,13 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
 `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`. The
 first line should be ≤ 72 characters. Body (optional) explains *why*.
 
+Keep the body to the point rather than to a length. Write it to
+[Orwell's six rules](https://www.orwellfoundation.com/the-orwell-foundation/orwell/essays-and-other-works/politics-and-the-english-language/),
+above all the third: *if it is possible to cut a word out, always cut it out*.
+It applies to paragraphs too. Design reasoning, rejected alternatives,
+measurements and file lists belong in the plan under `plans/` and in
+`docs/status.md`, not in the commit. Say what changed and why it matters, once.
+
 ## Pull requests
 
 - Keep PRs focused. Splitting a large change into a chain of smaller PRs is

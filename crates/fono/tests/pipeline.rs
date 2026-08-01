@@ -419,9 +419,9 @@ async fn pipeline_adds_source_language_contract_when_stt_reports_language() {
     );
 }
 
-// ---- Personal vocabulary (ADR 0037, plan v3 Task 2.2) ----------------
+// ---- Personal vocabulary (ADR 0037) ----------------------------------
 //
-// The four-way matrix from the plan is {batch, live} × {polish on, off}.
+// The four-way matrix is {batch, live} × {polish on, off}.
 // The batch half plus the v0.10 word-by-word streaming-cleanup path are
 // exercised end-to-end here through `run_oneshot`. The live half shares
 // the identical one-line hook (`load_vocabulary()` + `apply`) in
@@ -616,7 +616,7 @@ async fn pipeline_vocabulary_reaches_streaming_cleanup_inject_path() {
     }
 }
 
-// ---- Speaker verification (plan v3 Task 4.3) -------------------------
+// ---- Speaker verification ---------------------------------------------
 //
 // The biometric-leak guarantee: turning speaker verification on must
 // never change, augment, or biometrically pollute the payload handed to
@@ -665,7 +665,7 @@ impl SpeechToText for RecordingStt {
     }
 }
 
-/// Plan Task 4.3 — with `[speaker].enabled = true` and a real `Paths`
+/// With `[speaker].enabled = true` and a real `Paths`
 /// root (so the verification path actually executes and opens the
 /// speakers DB), the STT backend must receive byte-for-byte the same
 /// dictation PCM it would get with verification off, and a

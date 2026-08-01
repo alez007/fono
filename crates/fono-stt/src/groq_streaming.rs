@@ -5,11 +5,9 @@
 //! batch endpoint every ~700 ms, piping each decode through
 //! [`LocalAgreement`] to produce a stable token-prefix preview.
 //!
-//! Plan: `plans/2026-04-28-wave-3-slice-b1-v1.md` Thread B (R4.2 of
-//! `plans/2026-04-27-fono-interactive-v1.md`). ADR
-//! `docs/decisions/0020-groq-pseudo-stream.md` captures the
-//! design trade-offs (pseudo-stream vs WebSocket, 700 ms cadence,
-//! in-flight cap = 1).
+//! ADR `docs/decisions/0020-groq-pseudo-stream.md` captures the design
+//! trade-offs (pseudo-stream vs WebSocket, 700 ms cadence, in-flight
+//! cap = 1).
 
 use std::future::Future;
 use std::pin::Pin;

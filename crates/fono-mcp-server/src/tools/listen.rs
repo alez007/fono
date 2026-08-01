@@ -141,12 +141,10 @@ impl Tool for ListenTool {
         if let Some(text) = prompt.as_deref() {
             if !text.trim().is_empty() {
                 // The overlay is intentionally **not** shown during
-                // prompt TTS — Slice 1 of
-                // `plans/2026-05-26-mcp-listen-overlay-and-silence-parity-v7.md`
-                // scopes the visual indicator to the actual
-                // microphone-open phase. If the user can already hear
-                // the agent speaking, painting a "RECORDING" panel on
-                // top of that is just noise.
+                // prompt TTS: the visual indicator is scoped to the
+                // actual microphone-open phase. If the user can already
+                // hear the agent speaking, painting a "RECORDING" panel
+                // on top of that is just noise.
                 if let Err(e) = speak_text(
                     &self.cfg,
                     &self.secrets,

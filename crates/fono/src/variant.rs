@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Build-time identifier for which release variant this binary is.
 //!
-//! Per `plans/2026-05-02-fono-cpu-gpu-variants-v1.md`, fono ships in
-//! two variants: a compact CPU-only build (~18 MB) and a Vulkan-enabled
-//! build (~60 MB). The two share source; the only difference is whether
+//! fono ships in two variants: a compact CPU-only build (~18 MB) and
+//! a Vulkan-enabled build (~60 MB). The two share source; the only
+//! difference is whether
 //! `accel-vulkan` was on at build time.
 //!
 //! Used by `fono doctor`, the daemon startup log, the (future) wizard

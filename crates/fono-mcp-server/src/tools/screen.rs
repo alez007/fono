@@ -102,7 +102,6 @@ impl Tool for ScreenTool {
                     "tool": img.tool,
                     "mode": mode_str_owned,
                 });
-                // Phase 6 fast-path removed — vision model reads the screenshot directly.
                 let content_blocks = vec![
                     crate::protocol::ContentBlock::image(b64, "image/png".to_string()),
                     crate::protocol::ContentBlock::text(meta.to_string()),

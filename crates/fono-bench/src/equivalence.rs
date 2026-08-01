@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Streaming↔batch equivalence harness. Plan v6 R18.
+//! Streaming↔batch equivalence harness.
 //!
 //! Compares the text emitted by `SpeechToText::transcribe` (batch lane)
 //! against the concatenated `Finalize` text emitted by
 //! `StreamingStt::stream_transcribe` (streaming lane) for the same
 //! input PCM, and reports a normalized Levenshtein distance plus
-//! latency ratios (TTFF, TTC). The harness is the headline Slice A
+//! latency ratios (TTFF, TTC). The harness is the headline
 //! acceptance gate; once all 12 curated fixtures are landed it gets
 //! tightened to the strict v6 thresholds (R18.1).
 //!

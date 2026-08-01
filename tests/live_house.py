@@ -6,7 +6,7 @@ back and check it.
 
 Everything else in the test suite scores against fixtures, which cannot catch
 the failures that actually bite: a model that picks the brightness tool when
-asked simply to switch a light on, a room name that exists in the prompt but
+asked simply to switch a light on, an area name that exists in the prompt but
 not in the house, an argument the server rejects. Those need a real house.
 
 This is deliberately *not* wired into `tests/check.sh` — it needs a Home
@@ -20,7 +20,7 @@ Usage
     python3 tests/live_house.py http://127.0.0.1:18099/v1/chat/completions \\
             --model my-model --area kitchen
 
-    --area NAME    room to test in (default: kitchen)
+    --area NAME    area to test in (default: kitchen)
     --lang en|ro   run only one language (default: both)
     --reasoning    leave the model's thinking on (default: off, as Fono ships)
 
@@ -49,7 +49,7 @@ MAX_STEPS = 5
 SYS = {
     "en": (
         "Fono voice assistant. Use the tool only for clear light on/off commands. "
-        "If the room/light is missing, ask briefly; do not call the tool. "
+        "If the area/light is missing, ask briefly; do not call the tool. "
         "Confirm briefly after the result."
     ),
     "ro": (

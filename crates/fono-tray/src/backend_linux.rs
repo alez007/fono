@@ -2,7 +2,7 @@
 //! Linux tray backend: pure-Rust StatusNotifierItem (SNI) over
 //! D-Bus via `ksni`, interpreting the platform-neutral
 //! [`crate::menu::MenuNode`] tree. Moved verbatim out of `lib.rs`
-//! per Windows port plan Task 1.1 so each OS backend lives in its
+//! so each OS backend lives in its
 //! own file (`backend_linux.rs` / `backend_macos.rs` / a future
 //! `backend_windows.rs`).
 

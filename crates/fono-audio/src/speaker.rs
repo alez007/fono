@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Speaker-verification back-end scoring (the cheap, model-independent half
-//! of the "who is speaking" engine — Slice 2 of
-//! `plans/2026-07-17-speaker-verification-v1.md`).
+//! of the "who is speaking" engine).
 //!
 //! An embedding model (a separate, feature-gated `ort` session — added in a
 //! later slice) turns an utterance into a fixed-width `f32` vector. Everything
@@ -617,8 +616,8 @@ pub fn latency_stats(samples_ms: &[f32]) -> LatencyStats {
 }
 
 /// Front-end filterbank configuration a speaker-embedding model expects. The
-/// engine (feature `speaker-onnx`, a later slice) turns 16 kHz mono PCM into
-/// these features before the `ort` session runs.
+/// engine (feature `speaker-onnx`) turns 16 kHz mono PCM into these features
+/// before the `ort` session runs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FbankConfig {
     pub sample_rate: u32,
@@ -901,7 +900,7 @@ fn hann_window(n: usize) -> Vec<f32> {
 /// Reconciled to ReDimNet2's `feat_type='tf'` front-end: symmetric Hann
 /// window, 0.97 pre-emphasis, HTK mel (`2595·log10(1+f/700)`), **power**
 /// spectrum (`real²+imag²`, no sqrt), natural log, CMN. Two residual quirks of
-/// the upstream graph are deferred to the Slice 5 Python-oracle cross-check
+/// the upstream graph are deferred to the Python-oracle cross-check
 /// before they matter: it frames the DFT over `nfft/2` (256) truncated bins
 /// with `linspace(0, sr/2, 256)` mel spacing (vs the standard `nfft/2+1`
 /// rfft bins here), and applies a per-signal mean/std normalisation upstream
@@ -1057,9 +1056,9 @@ fn apply_cmn(feats: &mut [Vec<f32>], n_mels: usize) {
 /// for [`cosine`] / [`Cohort::as_norm`] scoring.
 ///
 /// The graph itself (a ReDimNet-family `.ort` export) and its impostor cohort
-/// ship in the model pack wired up in Slice 1; this type is the generic
+/// ship in the model pack; this type is the generic
 /// runtime around whatever pack is loaded. Exact numerical parity with the
-/// Python oracle is asserted in Slice 5.
+/// Python oracle is asserted separately.
 #[cfg(feature = "speaker-onnx")]
 pub mod engine {
     use std::path::Path;
@@ -1120,7 +1119,7 @@ pub mod engine {
         ///
         /// The graph's input is the **raw waveform** shaped `[1, T]` (rank 2);
         /// the mel front-end runs inside the model. Exact numerical parity with
-        /// the Python oracle is asserted in Slice 5.
+        /// the Python oracle is asserted separately.
         pub fn embed(&mut self, samples: &[f32]) -> Result<Option<Vec<f32>>> {
             // Need at least one 25 ms frame (400 samples at 16 kHz).
             if samples.len() < 400 {

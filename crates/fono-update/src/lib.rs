@@ -169,16 +169,14 @@ pub fn asset_name_for(tag: &str, prefix: &str) -> Option<String> {
     } else if cfg!(target_os = "macos") {
         // Full target triple: distinguishes the darwin asset from the
         // bare-arch Linux ones published in the same release. One
-        // Metal-accelerated variant only (macOS port plan, Phase 3
-        // artefact-shape decision), so no `fono-gpu` sibling exists.
+        // Metal-accelerated variant only, so no `fono-gpu` sibling exists.
         Some(format!("{prefix}-{tag}-{arch}-apple-darwin"))
     } else if cfg!(target_os = "windows") {
         // Single Windows artefact: a bare `.exe` under the base `fono`
         // prefix (there is no `fono-gpu` sibling). It is a single
         // Vulkan-accelerated build that soft-loads `vulkan-1.dll` and
         // falls back to CPU when the loader is absent, so one download
-        // serves every Windows host — see
-        // `plans/2026-07-12-vulkan-soft-load-single-build-v1.md`, Phase 2.
+        // serves every Windows host.
         Some(format!("{prefix}-{tag}-{arch}.exe"))
     } else {
         None
@@ -188,10 +186,9 @@ pub fn asset_name_for(tag: &str, prefix: &str) -> Option<String> {
 /// Pick the right release-asset prefix for this host: GPU-enabled
 /// (`fono-gpu`) when Vulkan is available, CPU-only (`fono`) otherwise.
 ///
-/// Per slice 3 of `plans/2026-05-02-fono-cpu-gpu-variants-v1.md`, the
-/// update flow is automatic — `fono update` always fetches the variant
-/// that matches the host's hardware. If the user is currently on the
-/// CPU build but has a GPU + libvulkan installed, the next update
+/// The update flow is automatic — `fono update` always fetches the
+/// variant that matches the host's hardware. If the user is currently
+/// on the CPU build but has a GPU + libvulkan installed, the next update
 /// switches them to the GPU build. If they later move to a GPU-less
 /// machine, the next update switches back to CPU. No explicit flag,
 /// no wizard prompt; one decision in one place.
@@ -205,9 +202,7 @@ pub fn desired_asset_prefix() -> &'static str {
     // split), so the base prefix is always right and the Vulkan probe
     // is meaningless there. Windows likewise ships a single
     // Vulkan-with-CPU-fallback artefact under the base `fono` prefix
-    // (one binary runs everywhere — see
-    // `plans/2026-07-12-vulkan-soft-load-single-build-v1.md`, Phase 2),
-    // so the same short-circuit applies.
+    // (one binary runs everywhere), so the same short-circuit applies.
     if cfg!(any(target_os = "macos", target_os = "windows")) {
         return CPU_ASSET_PREFIX;
     }

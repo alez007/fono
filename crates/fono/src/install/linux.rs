@@ -17,8 +17,6 @@
 //! desktop / autostart / icon files, systemd unit, and shell
 //! completions, all at fixed canonical paths. Uninstall (and `fono
 //! doctor`) infer state from those paths directly.
-//!
-//! Plan: `plans/2026-05-02-fono-install-subcommand-v3.md`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2440,7 +2438,7 @@ mod tests {
         // is run headless — no DISPLAY, no graphical loginctl
         // session, no DM active, no sockets. Must classify as
         // headless: get-default describes what *would* boot, not
-        // what's running. Regression for the 2026-05-22 .74 bug.
+        // what's running. Regression guard.
         let p = FakeProbes::default().with_run(
             "systemctl",
             &["get-default"],

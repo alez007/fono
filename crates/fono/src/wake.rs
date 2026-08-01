@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Always-on wake-word listener lifecycle (Phase D) and trigger synthesis
-//! (Phase E) of `plans/2026-06-23-wake-word-openwakeword-v2.md`.
+//! Always-on wake-word listener lifecycle and trigger synthesis.
 //!
 //! The daemon owns exactly one [`WakeHandle`]. While `[wakeword].enabled` is
 //! true *and* the recording FSM is in [`FsmState::Idle`], the controller holds
@@ -53,7 +52,7 @@ pub fn should_listen(state: FsmState) -> bool {
     matches!(state, FsmState::Idle)
 }
 
-/// Which capture source the wake detector should open (Phase I; ADR 0012:45-68).
+/// Which capture source the wake detector should open (ADR 0012:45-68).
 ///
 /// Returns `None` for the **idle** always-on path — the headline feature, where
 /// Fono is silent and nothing is playing. Idle wake-word MUST read the
@@ -71,8 +70,7 @@ pub fn should_listen(state: FsmState) -> bool {
 /// to the default when it disappears (ADR 0012:53-68).
 ///
 /// **This is an inert seam today.** No code in the tree creates an AEC source
-/// yet (it lands with the double-talk barge-in slice,
-/// `plans/2026-05-25-double-talk-barge-in-pipewire-aec-v1.md:434-444`), and the
+/// yet (it lands with double-talk barge-in), and the
 /// listener only runs while the FSM is [`FsmState::Idle`] (see
 /// [`should_listen`]) — i.e. never while speaking — so both inputs are
 /// currently `false`/`None` and this always returns `None`. The decision lives
@@ -239,7 +237,7 @@ pub fn spawn(
 /// mode streams idle mic audio over the LAN, breaking the
 /// audio-never-leaves-the-machine-while-idle guarantee, so we shout about it
 /// in the daemon log. (`fono doctor` repeats the warning via the same
-/// [`WakeWyoming::CLIENT_PRIVACY_WARNING`] string — Phase J.)
+/// [`WakeWyoming::CLIENT_PRIVACY_WARNING`] string.)
 ///
 /// NOTE (follow-up seam): the actual full-duplex streaming client that would
 /// delegate Fono's own activation to the external `wyoming-openwakeword`
@@ -384,7 +382,7 @@ impl WakeRuntime {
 
         // Cheap forwarder: copy the slice and `try_send`, dropping on overflow.
         //
-        // Phase I / ADR 0012:45-68 — the always-on listener only ever runs
+        // ADR 0012:45-68 — the always-on listener only ever runs
         // while the FSM is Idle (see `should_listen`), i.e. Fono is NOT
         // speaking, so it reads the DEFAULT source with NO AEC on every
         // platform. `wake_capture_source(false, None)` therefore resolves to
@@ -543,9 +541,9 @@ pub(crate) fn effective_wake_config(cfg: &WakeWordCfg) -> WakeWordCfg {
 /// `wakeword-onnx` feature is compiled in **and** the model files resolve does
 /// it build the real [`fono_audio::wakeword::OnnxWakeWord`], otherwise falls
 /// back to the stub and logs at debug. Keeping the stub as the default keeps
-/// the daemon functional before any model is fetched (Phase G).
+/// the daemon functional before any model is fetched.
 ///
-/// Shared with the Wyoming wake **server** path (Phase H): the daemon binds a
+/// Shared with the Wyoming wake **server** path: the daemon binds a
 /// [`fono_net::wyoming::server::WakeProvider`] that calls this to construct a
 /// fresh per-connection detector, so the LAN wake service runs the *same*
 /// detector as the local listener (audio stays on the machine).
@@ -585,8 +583,8 @@ pub(crate) fn build_detector(cfg: &WakeWordCfg, paths: &Paths) -> Box<dyn WakeWo
 /// Resolve the three-stage openWakeWord graphs from the on-disk model cache and
 /// load every configured phrase classifier. Returns an error reason (caller
 /// falls back to the stub) if any required `.ort` graph is missing or load
-/// fails. Model fetch/registration is Phase G; this only consumes what is
-/// already present.
+/// fails. This only consumes models already present; fetching and
+/// registering them happens elsewhere.
 #[cfg(feature = "wakeword-onnx")]
 fn try_load_onnx(
     cfg: &WakeWordCfg,
@@ -656,7 +654,7 @@ mod tests {
         assert_eq!(action_for_target(WakeTarget::Assistant), HotkeyAction::AssistantPressed);
     }
 
-    /// Phase I / ADR 0012:45-68. The idle always-on path (the only path that
+    /// ADR 0012:45-68. The idle always-on path (the only path that
     /// runs today) must read the default source with NO AEC: `None` here.
     /// Only the wake-while-speaking sub-case — speaking AND an AEC source
     /// present — selects the `fono_aec_source_<pid>` echo-cancel source.

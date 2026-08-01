@@ -36,7 +36,7 @@ pub struct Config {
     /// Wake-word activation ("hey fono, …"). Off by default; when enabled
     /// the daemon runs an always-on detector that fires the configured
     /// `HotkeyAction`. `#[serde(default)]` keeps existing configs loading
-    /// unchanged. Phase F of the wake-word plan.
+    /// unchanged.
     #[serde(default)]
     pub wakeword: WakeWord,
 
@@ -77,7 +77,7 @@ pub struct Config {
     #[serde(default)]
     pub interactive: Interactive,
 
-    /// LAN-server settings. Slice 3 of the network plan. When
+    /// LAN-server settings. When
     /// `[server.wyoming].enabled = true`, the daemon hosts a
     /// Wyoming-protocol STT server on the LAN bound to the active
     /// `Arc<dyn SpeechToText>`. Off by default — Fono is a desktop
@@ -98,8 +98,7 @@ pub struct Config {
     pub mcp: McpServer,
 
     /// Local speaker-verification ("who is speaking") settings. Off by
-    /// default; everything runs on-device. See
-    /// `plans/2026-07-17-speaker-verification-v1.md`.
+    /// default; everything runs on-device.
     #[serde(default, skip_serializing_if = "Speaker::is_default")]
     pub speaker: Speaker,
 }
@@ -176,7 +175,7 @@ pub struct General {
     /// observed peer code for this backend, re-issue the request
     /// with that code forced. Cold-start (empty cache) accepts the
     /// unforced response and lets the cache populate from the next
-    /// correct detection. Default `true` (plan v3); set to `false`
+    /// correct detection. Default `true`; set to `false`
     /// to skip the rerun unconditionally for cost-sensitive setups.
     pub cloud_rerun_on_language_mismatch: bool,
 }
@@ -294,8 +293,8 @@ impl Default for Audio {
 /// Always-on wake-word activation ("hey fono, …"). Disabled by default;
 /// when enabled the daemon runs the `fono-audio` `WakeWord` detector over the
 /// idle mic and synthesizes the configured `HotkeyAction` on a confirmed
-/// detection. Phase F of `plans/2026-06-23-wake-word-openwakeword-v2.md` —
-/// this is the config surface only; the listener lifecycle is Phase D.
+/// detection. This is the config surface only; the listener lifecycle
+/// lives in the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WakeWord {
@@ -308,7 +307,7 @@ pub struct WakeWord {
     /// Post-fire refractory window in milliseconds. After a confirmed
     /// detection the listener ignores further fires for this long so one
     /// utterance can't double-trigger and the suspend-on-session transition
-    /// (Phase D) races cleanly with the new session. Phase E.
+    /// races cleanly with the new session.
     pub refractory_ms: u64,
     /// Optional Wyoming wake **client** integration (opt-in; streams idle
     /// mic audio off-box — see [`WakeWyoming`]). The privacy-preserving
@@ -354,8 +353,7 @@ pub enum WakeTarget {
     Assistant,
 }
 
-/// Wyoming wake-word integration (Phase H of
-/// `plans/2026-06-23-wake-word-openwakeword-v2.md`).
+/// Wyoming wake-word integration.
 ///
 /// The **server** direction (Fono exposing its local detector over the
 /// Wyoming `Detection` protocol) is **automatic** and needs no config
@@ -394,7 +392,7 @@ pub struct WakeWyoming {
 impl WakeWyoming {
     /// The loud, explicit privacy warning surfaced anywhere the opt-in
     /// **client** direction is enabled (config comments, daemon logs, and
-    /// the Phase J `fono doctor` hook). Stated once here so every surface
+    /// the `fono doctor` hook). Stated once here so every surface
     /// shows the same wording.
     pub const CLIENT_PRIVACY_WARNING: &'static str =
         "Wyoming wake CLIENT mode is enabled: Fono is STREAMING IDLE MIC AUDIO OVER THE LAN \
@@ -411,8 +409,7 @@ impl WakeWyoming {
     }
 }
 
-/// Local speaker-verification settings (Slice 3.1 of
-/// `plans/2026-07-17-speaker-verification-v1.md`). Off by default; when
+/// Local speaker-verification settings. Off by default; when
 /// enabled the daemon embeds each utterance on the local ONNX voice stack
 /// and tags transcripts/turns with a `{ name, confidence }` decision.
 ///
@@ -519,7 +516,7 @@ pub struct Stt {
     /// LAN Wyoming server (e.g. `wyoming-faster-whisper`, another
     /// `fono serve wyoming` instance, Rhasspy). Optional — populated
     /// either by `fono use stt wyoming --uri …` or by clicking a
-    /// discovered peer in the tray menu (Slice 4).
+    /// discovered peer in the tray menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wyoming: Option<SttWyoming>,
     /// Optional initial prompts keyed by BCP-47 alpha-2 language code
@@ -604,9 +601,8 @@ pub struct SttCloud {
 }
 
 /// `[stt.wyoming]` — coordinates of a Wyoming-protocol STT server on
-/// the LAN. Slice 2 of the network plan. The URI accepts
-/// `tcp://host:port`, bare `host:port`, or just `host` (default port
-/// 10300).
+/// the LAN. The URI accepts `tcp://host:port`, bare `host:port`, or
+/// just `host` (default port 10300).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SttWyoming {
@@ -617,8 +613,9 @@ pub struct SttWyoming {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     /// Optional pre-shared bearer token reference (resolved through
-    /// `secrets.toml` / env). Empty = no auth (Wyoming v1 has no
-    /// in-band auth; Fono will gain an extension event in Slice 5).
+    /// `secrets.toml` / env). Empty = no auth. Wyoming v1 has no
+    /// in-band auth, so a token here is sent as an out-of-band
+    /// extension the server may ignore.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_token_ref: String,
 }
@@ -1193,7 +1190,7 @@ impl Default for Prompt {
     }
 }
 
-/// Baked-in default main prompt (Phase 5 Task 5.5).
+/// Baked-in default main prompt.
 ///
 /// The hard rules at the top exist to stop chat-trained LLMs (cloud or
 /// local: Cerebras / Groq Llama-3.3-70B, gpt-4o-mini, Claude Haiku, the
@@ -1201,9 +1198,7 @@ impl Default for Prompt {
 /// questions like *"Could you provide the full text you're referring
 /// to?"* on short or ambiguous captures. The failure mode is a property
 /// of chat fine-tuning, not of any specific provider, so this prompt is
-/// applied identically across every `TextFormatter` impl. Tested
-/// against the bug report in
-/// `plans/2026-04-28-polish-cleanup-clarification-refusal-fix-v1.md`.
+/// applied identically across every `TextFormatter` impl.
 pub const fn default_prompt_main() -> &'static str {
     "You are a transcription cleanup post-processor, not a chat assistant. The user message \
 between the <<< and >>> markers is a raw speech-to-text transcript. Your job is to return that \
@@ -1226,7 +1221,7 @@ verbatim (with at most punctuation/capitalization/diacritic fixes).\n\
 - Do not include the <<< or >>> markers in your output."
 }
 
-/// Baked-in default advanced prompt (Phase 5 Task 5.5).
+/// Baked-in default advanced prompt.
 pub const fn default_prompt_advanced() -> &'static str {
     "If the speaker self-corrects (\"scratch that\", \"I mean\", \"no wait\"), apply the \
 correction and drop the discarded fragment. If the speaker dictates a list (\"first\", \
@@ -1344,42 +1339,22 @@ pub struct AssistantTools {
     /// `[[assistant.tools.mcp]]` — the servers to discover tools from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpClientServer>,
-    /// Tell the model the real names of the rooms in the house.
+    /// Tell the model the real names of the areas in the house.
     ///
     /// On by default because without it the model invents a name: asked in
-    /// Romanian it sends `bucătărie` to a house whose rooms are all in
+    /// Romanian it sends `bucătărie` to a house whose areas are all in
     /// English, and nothing happens. Costs roughly thirty tokens, prepared
     /// when a server is connected rather than per command.
     ///
     /// Exposed only so the difference can be measured — turn it off, ask
-    /// for a room in another language, and watch it fail.
+    /// for an area in another language, and watch it fail.
     #[serde(default = "default_true")]
     pub place_names: bool,
-    /// Hold a model on rails while it writes a command.
-    ///
-    /// A model running on your own machine writes the command out as text,
-    /// and a small one gets it wrong in ways nothing can recover from: a
-    /// colour no device accepts, a room that does not exist, a field the
-    /// server insists on left out. Asking it more clearly in the prompt was
-    /// tried three times and failed three times.
-    ///
-    /// With this on, the moment the model starts writing a command it can
-    /// only write one the server said it would accept — right name, no
-    /// missing fields, no invented values. Ordinary conversation is
-    /// untouched: the rails only exist while a command is being written, so
-    /// stories, jokes and explanations are as free as before. It costs
-    /// nothing to read the prompt again and cannot make Fono slower.
-    ///
-    /// Off until it has been measured to help, and only ever applies to a
-    /// model running on this machine — a cloud service enforces the same
-    /// thing itself.
-    #[serde(default)]
-    pub grammar: bool,
 }
 
 impl Default for AssistantTools {
     fn default() -> Self {
-        Self { enabled: false, mcp: Vec::new(), place_names: true, grammar: false }
+        Self { enabled: false, mcp: Vec::new(), place_names: true }
     }
 }
 
@@ -1661,16 +1636,11 @@ pub struct Overlay {
     /// instantaneous level) on top so the dynamic auto-stop
     /// thresholds are observable. `Advanced` is debug-grade UI and
     /// is only reachable by editing `config.toml`.
-    ///
-    /// Breaking change (slice 3 of the 2026-05-22 auto-stop-silence
-    /// plan): this field was a `bool` until 2026-05-22. Migrate
-    /// `volume_bar = true` to `volume_bar = "simple"` and
-    /// `volume_bar = false` to `volume_bar = "off"`.
     pub volume_bar: VolumeBarMode,
     /// Capture per-token "brain" keyframes (layer activations, MoE
     /// router choices, token confidence) from the **embedded** local
-    /// LLM backends to drive the Glass Cortex visualization (see
-    /// `plans/2026-07-05-brain-visualization-v1.md`). Off by default:
+    /// LLM backends to drive the Glass Cortex visualization. Off by
+    /// default:
     /// when `false` no eval callback is ever installed and the decode
     /// path is byte-for-byte the same as before the feature existed.
     /// When `true`, capture is sparse (a few keyframes per second of
@@ -1820,13 +1790,9 @@ impl Default for Update {
     }
 }
 
-/// LAN-server settings. Slice 3 of
-/// `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
-///
-/// Holds the `[server.wyoming]` block today; gains `[server.fono]` in
-/// Slice 6 (the WebSocket-based Fono-native server). All flags are
-/// off by default — Fono only listens on a network socket if the user
-/// explicitly opts in.
+/// LAN-server settings: `[server.wyoming]`, `[server.web]`, and
+/// `[server.llm]`. All flags are off by default — Fono only listens on
+/// a network socket if the user explicitly opts in.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Server {
@@ -1873,8 +1839,9 @@ pub struct ServerWyoming {
     /// TCP port. Default `10300` (the de-facto Wyoming port).
     pub port: u16,
     /// Optional pre-shared bearer token reference, resolved through
-    /// `secrets.toml` / env. Empty = no auth (Wyoming v1 has no in-band
-    /// auth; the Fono-native protocol gains it in Slice 5).
+    /// `secrets.toml` / env. Empty = no auth. Wyoming v1 has no in-band
+    /// auth, so this is checked out of band before the protocol
+    /// handshake.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_token_ref: String,
 }

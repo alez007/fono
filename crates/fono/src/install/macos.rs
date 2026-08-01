@@ -235,7 +235,7 @@ fn refuse_if_package_managed() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// Signing identity (macOS port plan Task 11.4, install side)
+// Signing identity (install side)
 // ---------------------------------------------------------------------
 
 /// How the assembled bundle ends up signed.
@@ -481,8 +481,7 @@ fn enclosing_bundle(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Re-sign the app bundle after `fono update` swapped the binary inside
-/// it (macOS port plan Task 10.2 / the update half of Task 11.4).
+/// Re-sign the app bundle after `fono update` swapped the binary inside it.
 ///
 /// Replacing `Contents/MacOS/fono` invalidates the bundle's code
 /// signature; left broken, the next launch would fail TCC's

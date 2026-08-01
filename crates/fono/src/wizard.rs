@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! First-run interactive wizard. Phase 8 Tasks 8.1 & 8.2.
+//! First-run interactive wizard.
 //!
 //! Tier-aware: probes hardware first and recommends local-vs-cloud based on
-//! what the host can sustain — see `docs/plans/2026-04-25-fono-local-default-v1.md`.
+//! what the host can sustain.
 //!
-//! Roadmap-v2 R3.2 + R3.3: cloud keys are validated against the provider's
-//! `/v1/models` endpoint before persisting (so the user catches a typo
-//! immediately, not on the first dictation), and the top-level path picker
-//! offers a "Mixed" option that asks for STT and polish backends independently
-//! (e.g. local STT + cloud polish).
+//! Cloud keys are validated against the provider's `/v1/models` endpoint
+//! before persisting (so the user catches a typo immediately, not on the
+//! first dictation), and the top-level path picker offers a "Mixed" option
+//! that asks for STT and polish backends independently (e.g. local STT +
+//! cloud polish).
 //!
-//! Wizard local-model plan: `plans/2026-04-28-wizard-local-model-selection-v1.md`.
-//! The model picker is now data-driven from `WHISPER_MODELS`:
+//! The model picker is data-driven from `WHISPER_MODELS`:
 //!
 //! 1. **Language scope first** — "English only?" before the model picker so
 //!    `.en` variants are only shown to mono-lingual English users.
@@ -166,7 +165,7 @@ pub async fn run(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-// ─── Catalogue-driven helpers (Phase B, issues #9/#11) ────────────────────
+// ─── Catalogue-driven helpers ─────────────────────────────────────────────
 
 /// Outcome of the primary-cloud-provider picker.
 #[derive(Debug, Clone, Copy)]
@@ -1374,10 +1373,10 @@ fn pick_english_only(theme: &ColorfulTheme) -> bool {
     idx == 1
 }
 
-/// Languages-you-dictate-in picker. Plan v3 task 7. Wizard skips the
-/// picker entirely when ≥ 1 languages are reliably detected from the
-/// OS; the tray's Languages submenu remains the primary editing
-/// surface post-install. Only the zero-detection case falls back to
+/// Languages-you-dictate-in picker. Wizard skips the picker entirely
+/// when ≥ 1 languages are reliably detected from the OS; the tray's
+/// Languages submenu remains the primary editing surface
+/// post-install. Only the zero-detection case falls back to
 /// the manual MultiSelect from a curated common-language set with
 /// `en` pre-checked. Returning an empty `Vec` is allowed (collapses
 /// to unconstrained auto-detect at runtime).
@@ -1539,8 +1538,7 @@ fn accuracy_for_langs(model: &ModelInfo, langs: &[String]) -> AccuracyBucket {
 /// A candidate model for the wizard shortlist. Every entry has been
 /// validated by [`HardwareSnapshot::affords_model`]; the shortlist no
 /// longer carries an `Affordability` field because that was always a
-/// boolean in disguise once the `Borderline` middle state was removed
-/// (plan `2026-05-25-wizard-selection-heuristics-refresh-v5`, A3).
+/// boolean in disguise once the `Borderline` middle state went away.
 pub struct ShortlistEntry {
     pub model: &'static ModelInfo,
     pub accuracy: AccuracyBucket,
@@ -1812,8 +1810,7 @@ async fn configure_cloud_stt(
     config.stt.backend = parse_stt_backend(entry.id).context("catalogue STT id should parse")?;
     // Streaming for cloud Groq is auto-on whenever the user enabled
     // live mode (`[interactive].enabled = true`); there is no separate
-    // per-backend opt-in. Wizard removed the third question in v0.3.5
-    // (plan `2026-04-29-streaming-config-collapse-v1.md`).
+    // per-backend opt-in. Wizard removed the third question in v0.3.5.
     config.stt.cloud = Some(SttCloud {
         provider: entry.id.into(),
         api_key_ref: entry.key_env.into(),
@@ -2043,10 +2040,9 @@ fn prompt_masked_api_key(key_name: &str) -> Result<String> {
 // ─── Local STT latency probe ───────────────────────────────────────────────
 
 /// Tier-specific p50 budget for transcribing a 3-second clip with the
-/// recommended whisper model on that tier. Numbers come from the latency
-/// budget table in `docs/plans/2026-04-25-fono-latency-v1.md`. The probe
-/// uses these as soft thresholds: exceeding them prints a warning, not a
-/// hard fail, because real-world variance can be wide on first run.
+/// recommended whisper model on that tier. The probe uses these as
+/// soft thresholds: exceeding them prints a warning, not a hard fail,
+/// because real-world variance can be wide on first run.
 fn tier_latency_budget_ms(tier: LocalTier) -> u128 {
     match tier {
         LocalTier::HighEnd => 600,
@@ -2213,8 +2209,8 @@ mod tests {
 
     #[test]
     fn comfortable_tier_budget_is_two_seconds() {
-        // Regression guard for the 1500 -> 2000 ms bump (user feedback
-        // 2026-05-14): the Comfortable tier was rejecting first-run
+        // Regression guard for the 1500 -> 2000 ms bump (user
+        // feedback): the Comfortable tier was rejecting first-run
         // probes on borderline hardware too aggressively.
         assert_eq!(tier_latency_budget_ms(LocalTier::Comfortable), 2000);
     }
@@ -2246,10 +2242,10 @@ mod tests {
             [false, true, true, false, false, false],
         );
         // OpenRouter: STT (Whisper Turbo) + LLM + Assistant + TTS
-        // (OpenAI Mini TTS, swapped in from Kokoro 2026-05-14), no
-        // Vision/Search yet. STT was added in 2026-05-14 — OpenRouter
-        // proxies OpenAI-compatible /v1/audio/transcriptions to Groq's
-        // Whisper Turbo when the model id is `openai/whisper-large-v3-turbo`.
+        // (OpenAI Mini TTS, swapped in from Kokoro), no Vision/Search
+        // yet. OpenRouter proxies OpenAI-compatible
+        // /v1/audio/transcriptions to Groq's Whisper Turbo when the
+        // model id is `openai/whisper-large-v3-turbo`.
         let openrouter = primary_capabilities(find("openrouter").expect("openrouter entry"));
         assert_eq!(openrouter[..2], [true, true]);
         assert!(openrouter[2], "OpenRouter exposes an assistant chat");
@@ -2435,8 +2431,8 @@ mod tests {
 
     #[test]
     fn accuracy_good_for_small_en_on_english() {
-        // After the 2026-05-25 wer_by_lang refresh to Open-ASR-Leaderboard
-        // means, no Whisper variant lands in the Excellent (≤6%) bucket —
+        // With `wer_by_lang` anchored to Open-ASR-Leaderboard means, no
+        // Whisper variant lands in the Excellent (≤6%) bucket —
         // small.en sits at 9% WER and buckets as Good.
         let m = ModelRegistry::get("small.en").unwrap();
         assert_eq!(accuracy_for_langs(m, &["en".to_string()]), AccuracyBucket::Good);
@@ -2652,7 +2648,7 @@ mod tests {
         assert_eq!(ids.len(), 11, "unexpected primary candidate set: {ids:?}");
     }
 
-    /// Phase B Task B4. Pins the two-column layout of `pick_path`'s
+    /// Pins the two-column layout of `pick_path`'s
     /// rows: name padded to longest-name + 2 spaces, then description.
     /// The fixed order is `Local`, `Cloud`, `Customize`.
     #[test]
@@ -2681,7 +2677,7 @@ mod tests {
         }
     }
 
-    /// Phase C Task C7. Pre-seed two detected language codes and
+    /// Pre-seed two detected language codes and
     /// assert the pure helper returns them (normalised) without
     /// invoking `dialoguer`. The wizard's OS-detected fast-path is
     /// exercised by feeding the helper directly.
@@ -2694,7 +2690,7 @@ mod tests {
         assert_eq!(out.len(), 2, "no extra peer when ≥ 2 already present");
     }
 
-    /// Phase C Task C7 (cont.). Single non-English detection auto-adds
+    /// Single non-English detection auto-adds
     /// English as a peer per the bilingual safety net.
     #[test]
     fn finalise_detected_languages_adds_english_peer_for_single_nonenglish() {

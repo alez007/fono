@@ -2,10 +2,9 @@
 //! Glas Cortex — the "watch it think" LED bar (`WaveformStyle::Cortex`).
 //!
 //! A wordless, event-driven visualizer rendered as a fixed **6×46 LED
-//! grid**: a Rust port of the reference `cortex-live-engine.js` from
-//! the 2026-07 design (see `plans/2026-07-15-glas-cortex-rewrite-v1.md`
-//! and the implementation spec it was written against). It makes a
-//! running language model legible at a glance — reading vs writing,
+//! grid**: a Rust port of the reference `cortex-live-engine.js`
+//! design. It makes a running language model legible at a glance —
+//! reading vs writing,
 //! how deep/hard it is working, which experts it routes through (MoE),
 //! and how confident it is — without a single label.
 //!

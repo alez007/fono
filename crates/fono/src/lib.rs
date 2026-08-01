@@ -14,9 +14,7 @@
 // (`ggerganov/ggml`) and are ABI-compatible by construction, so the
 // linker keeping the first copy and discarding the second is safe;
 // the smoke test in `crates/fono/tests/pipeline.rs` exercises both
-// engines in the same process to catch any regression. See
-// `plans/2026-04-27-shared-ggml-static-binary-v1.md` for the full
-// rationale and the long-term shared-ggml plan.
+// engines in the same process to catch any regression.
 
 pub mod actions;
 pub mod agent_setup;
@@ -52,8 +50,7 @@ pub mod live;
 /// surfaces so the same single binary runs cleanly on headless servers
 /// and on graphical desktops.
 ///
-/// See `plans/2026-04-30-fono-single-binary-size-v1.md` Phase 3 +
-/// `docs/decisions/0022-binary-size-budget.md` for the contract.
+/// See `docs/decisions/0022-binary-size-budget.md` for the contract.
 #[must_use]
 pub fn is_graphical_session() -> bool {
     #[cfg(target_os = "macos")]
@@ -67,7 +64,7 @@ pub fn is_graphical_session() -> bool {
         // X11-style `DISPLAY` concept to gate on. Fono ships as a user
         // desktop app (not a session-0 service), so a graphical session
         // is always present. Returning `true` lets the daemon start the
-        // global-hotkey listener (Windows port plan Task 8.1).
+        // global-hotkey listener.
         true
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

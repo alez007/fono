@@ -5,7 +5,6 @@
 //! Rhasspy clients, …) and serves the active `Arc<dyn SpeechToText>` —
 //! whisper-rs, a cloud STT backend, anything implementing the trait.
 //!
-//! Slice 3 of `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`.
 //! One TCP listener task; one tokio task per accepted connection. The
 //! per-connection task runs the canonical Wyoming sequence:
 //!
@@ -18,12 +17,12 @@
 //! ```
 //!
 //! `transcript-start` / `transcript-chunk` / `transcript-stop` (the
-//! streaming server response variant) is *not* emitted in Slice 3 —
+//! streaming server response variant) is *not* emitted —
 //! `SpeechToText::transcribe` is one-shot, so there's no preview text
-//! to forward. Slice 3 advertises `supports_transcript_streaming =
+//! to forward. The server advertises `supports_transcript_streaming =
 //! false` accordingly so streaming-aware clients fall back to the
 //! one-shot lane gracefully. Streaming response support arrives when
-//! the daemon plumbs `Arc<dyn StreamingStt>` here (post-Slice 4).
+//! the daemon plumbs `Arc<dyn StreamingStt>` here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,7 +61,7 @@ pub struct WyomingServerConfig {
     /// TCP port. Default [`DEFAULT_PORT`] (`10300`).
     pub port: u16,
     /// Optional pre-shared bearer token, resolved by the daemon. Wyoming
-    /// v1 has no auth event, so this is plumbed for the Slice 5 Fono
+    /// v1 has no auth event, so this is plumbed for the Fono
     /// extension; today its value is logged at `debug!` and otherwise
     /// unused. Storing it here keeps the wiring honest.
     pub auth_token: Option<String>,

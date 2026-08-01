@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Audio capture via PulseAudio/PipeWire process capture on Linux (or optional
-//! `cpal`), resampling to 16 kHz mono f32, and a pluggable VAD trait. Phase 2
-//! of `docs/plans/2026-04-24-fono-design-v1.md`.
+//! `cpal`), resampling to 16 kHz mono f32, and a pluggable VAD trait.
 //!
 //! The shipped VAD is the energy-threshold [`vad::WebRtcVadStub`]; a
 //! neural VAD (Silero on `ort`) is a planned upgrade, not yet wired.
 //!
-//! # Cross-platform layout (Windows port plan Task 1.5)
+//! # Cross-platform layout
 //!
 //! This crate is already split correctly for new OS ports: the Linux
 //! subprocess capture/playback paths (parec / paplay) are gated

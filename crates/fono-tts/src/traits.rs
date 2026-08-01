@@ -51,8 +51,7 @@ pub trait TextToSpeech: Send + Sync {
     ///
     /// Defaults to `false`: the default `synthesize_stream` just wraps
     /// `synthesize`, so reporting `true` requires a genuine streaming override
-    /// (cloud backends only — see
-    /// `plans/2026-06-17-cloud-streaming-tts-v2.md`).
+    /// (cloud backends only).
     fn supports_streaming(&self) -> bool {
         false
     }

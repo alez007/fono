@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! `fono` — daemon + CLI entry point. Phase 8 of
-//! `docs/plans/2026-04-24-fono-design-v1.md`.
+//! `fono` — daemon + CLI entry point.
 
 // On Windows, build the shipped tray daemon as a GUI-subsystem binary
 // so a double-click or login-autostart launch shows ONLY the tray icon

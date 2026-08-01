@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! `winit` + `softbuffer` overlay backend — the original X11 path.
 //!
-//! After the 2026-05-19 winit Wayland strip (workspace `winit` dep
-//! lost its `wayland*` features) this backend is X11-only. On
-//! Wayland-only hosts (`DISPLAY` unset) `try_spawn` fails fast and
-//! the selection logic in [`crate::backend`] falls through to the
-//! Wayland-native backends.
+//! The workspace `winit` dep carries no `wayland*` features, so this
+//! backend is X11-only. On Wayland-only hosts (`DISPLAY` unset)
+//! `try_spawn` fails fast and the selection logic in
+//! [`crate::backend`] falls through to the Wayland-native backends.
 //!
 //! The renderer is in [`crate::renderer`]. This module owns only
 //! the winit event-loop machinery, the override-redirect window

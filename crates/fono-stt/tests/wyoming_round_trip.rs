@@ -3,8 +3,7 @@
 //!
 //! Stands up a minimal in-process Wyoming server on a loopback ephemeral
 //! port and drives a real `WyomingStt` client against it. Covers two
-//! flows from Slice 2 of
-//! `plans/2026-04-29-2026-04-29-client-server-wyoming-fono-and-mdns-v2.md`:
+//! flows:
 //!
 //! * the non-streaming path (`audio-start` → chunked `audio-chunk` →
 //!   `audio-stop` → `transcribe` → single `transcript`); and

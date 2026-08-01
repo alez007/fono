@@ -3,7 +3,7 @@
 //! `LocalAgreement` helper for confirming preview-pane tokens that two
 //! consecutive decodes agree on.
 //!
-//! Per `plans/2026-04-27-fono-interactive-v6.md` R1. Compiled only with the
+//! Compiled only with the
 //! `streaming` cargo feature so slim builds stay slim.
 
 use std::time::Duration;

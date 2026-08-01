@@ -292,6 +292,9 @@ pub struct AssistantTurnInputs {
     /// The user's own tools this turn may invoke, when they have any
     /// switched on. `None` leaves the turn conversation-only.
     pub actions: Option<std::sync::Arc<fono_assistant::ActionTools>>,
+    /// What this turn does with those tools, written down once the reply is
+    /// over so a phrase that keeps working can eventually skip the model.
+    pub learning: crate::actions::Learning,
     /// Runtime-only active-window context captured at assistant hotkey press.
     /// Local backends can cache this independently from stable system prompts.
     pub active_window_context: Option<String>,
@@ -394,6 +397,7 @@ pub async fn run_assistant_turn(
         prefer_vision,
         screen_capture_fn,
         actions,
+        learning,
         active_window_context,
         trim_silence,
         vocabulary,
@@ -455,7 +459,7 @@ pub async fn run_assistant_turn(
             return Ok(false);
         }
         let stt_started = std::time::Instant::now();
-        // Same silence trim dictation runs, through the same helper. Room
+        // Same silence trim dictation runs, through the same helper. Area
         // noise and a silent tail are what a recogniser turns into an
         // invented sign-off, and what dilutes its language decision.
         let captured_samples = pcm.len();
@@ -485,7 +489,7 @@ pub async fn run_assistant_turn(
                 json!({ "samples": pcm.len(), "sample_rate": sample_rate, "duration_ms": duration_ms }),
             );
         }
-        // The user's own spelling corrections, and nothing else. The room and
+        // The user's own spelling corrections, and nothing else. The area and
         // device names this home reported stay with the assistant model: the
         // recogniser is often a cloud service picked for audio alone, and a
         // home inventory is not audio (`docs/privacy.md`).
@@ -659,6 +663,14 @@ pub async fn run_assistant_turn(
         }
         snapshot
     };
+    // 2b. A phrase Fono has already got right twice, unprompted: run it now.
+    //     Deliberately after the history push, so the turn reads the same
+    //     afterwards whether the model was consulted or not.
+    let replayed = match &actions {
+        Some(tools) => crate::actions::replay(&learning, tools, &user_text).await,
+        None => None,
+    };
+
     let ctx = AssistantContext {
         system_prompt,
         instructions,
@@ -684,9 +696,15 @@ pub async fn run_assistant_turn(
         allow_brain_capture: true,
     };
 
-    // 3. Open the LLM stream.
+    // 3. Open the LLM stream — unless the phrase was replayed, in which case
+    //    the command is already done and the events it produced stand in for a
+    //    model turn. Everything downstream is unchanged: history records the
+    //    call, the page shows it, the trace times it.
     let llm_started = std::time::Instant::now();
-    let mut deltas = tokio::select! {
+    let mut deltas = if let Some(events) = replayed {
+        futures::stream::iter(events.into_iter().map(Ok)).boxed()
+    } else {
+        tokio::select! {
         biased;
         () = notify.notified() => {
             debug!(target: "fono::assistant", "cancelled before LLM");
@@ -761,6 +779,7 @@ pub async fn run_assistant_turn(
                 return Err(e);
             }
         },
+        }
     };
 
     // 3b. Text-only turn: no TTS backend. Stream the reply to the
@@ -1237,6 +1256,18 @@ pub async fn run_assistant_turn(
     if let Some(o) = &overlay {
         o.push_cortex(fono_overlay::CortexCmd::PlaybackDone);
     }
+    // The reply is over, so this is the moment a phrase that acted can be
+    // written down — and the moment the clock starts on whether the user comes
+    // back about it. Deliberately after the drain: starting that clock when the
+    // command was sent would let a slow turn eat the window and push a real
+    // complaint outside it, so a phrase Fono got wrong would look clean.
+    //
+    // A turn the user cut off says nothing about whether the command was right:
+    // they may have stopped a correct reply because they had heard enough. So a
+    // cancelled turn is neither promoted nor demoted.
+    if !aborted_mid_stream {
+        learning.finished(&user_text, metrics.language.as_deref().unwrap_or_default());
+    }
     if let Some(t) = &trace {
         t.finish(json!({
             "aborted": metrics.aborted,
@@ -1256,12 +1287,12 @@ pub async fn run_assistant_turn(
 /// Drop the rolling conversation log after a turn that actuated something.
 ///
 /// A spoken command is self-contained: "turn on the light in the master
-/// bedroom" names its own room and its own device, and the next command
+/// bedroom" names its own area and its own device, and the next command
 /// names its own too. Replaying the previous command as context adds no
 /// information a model can use, and measurably harms routing — across
 /// traced turns, commands issued with a non-empty log sent the required
 /// `domain` argument 16% of the time against 69% from a clean log, and
-/// the misses landed on whatever else shared the room (curtains, a
+/// the misses landed on whatever else shared the area (curtains, a
 /// roller, a thermostat).
 ///
 /// Clearing here also keeps the *cached* prompt prefix usable. The
@@ -3387,9 +3418,8 @@ mod tests {
     // PTT (push-to-talk) regression guard: the realtime reply pump must
     // drain the model's reply until `Done` and then STOP — it waits for
     // the model to finish, and does not consume anything past the turn
-    // boundary. This pins the contract the live-mode work (Parts C/D of
-    // `plans/2026-06-22-realtime-live-conversation-mode-v4.md`) must not
-    // silently regress. Uses the device-free drain path (playback None).
+    // boundary. This pins the contract live mode must not silently
+    // regress. Uses the device-free drain path (playback None).
     #[cfg(feature = "realtime")]
     #[tokio::test]
     async fn realtime_reply_drains_to_done_then_stops() {

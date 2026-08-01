@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Live full-duplex realtime smoke test (Slice 0 of the realtime
-//! live-conversation plan).
+//! Live full-duplex realtime smoke test.
 //!
 //! This is a standalone, hands-on harness for the single biggest
 //! unknown in the live-mode design: does a *full-duplex* Gemini Live

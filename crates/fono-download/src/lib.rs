@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! HTTP downloader with Range-resume, SHA256 verification, and `indicatif`
-//! progress UI. Phase 9 Task 9.5 (mirror override) + first-run downloads.
+//! progress UI. Supports a mirror override and first-run downloads.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

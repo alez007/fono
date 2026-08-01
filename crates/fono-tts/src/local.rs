@@ -2,7 +2,7 @@
 //! Local ONNX voice-stack runtime support (feature `tts-local`).
 //!
 //! Shared `ort` (ONNX Runtime) plumbing that every local voice engine
-//! builds on — Piper TTS first (Phase 2 of the v3 plan), then Kokoro,
+//! builds on — Piper TTS first, then Kokoro,
 //! Silero VAD, wake-word, and streaming STT, all on the *same* runtime
 //! (ADR 0032).
 //!
@@ -37,7 +37,7 @@ mod tests {
     // These tests link the static `libonnxruntime.a`, so they only build
     // when `tts-local` is enabled *and* `ORT_LIB_LOCATION` points at a
     // compatible archive — i.e. the dedicated voice-stack CI job, never the
-    // default `--workspace` build. See plan v3 Phase 1.4.
+    // default `--workspace` build.
     #[test]
     fn runtime_links_and_initialises() {
         // Forces the static runtime to load; proves the pinned

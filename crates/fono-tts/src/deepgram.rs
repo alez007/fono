@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(obj.len(), 1, "body has only the `text` field");
     }
 
-    /// Phase F regression: Deepgram uses `Token …`, not `Bearer …`.
+    /// Regression: Deepgram uses `Token …`, not `Bearer …`.
     /// Capture the header value via a request builder shim.
     #[test]
     fn auth_header_uses_token_prefix() {

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Brain-trace dump — captures one real local generation's full
-//! [`BrainEvent`] stream to JSON, for the Glas Cortex rewrite
-//! (`plans/2026-07-15-glas-cortex-rewrite-v1.md`).
+//! [`BrainEvent`] stream to JSON, for the Glass Cortex renderer.
 //!
 //! This is the "is the instrumented data the right shape?" tool: it
 //! drives a real GGUF model exactly the way the assistant backend does

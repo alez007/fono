@@ -18,11 +18,11 @@
 //! Otherwise the existing batch path runs unchanged. The behaviour
 //! contract is documented in `docs/interactive.md`.
 //!
-//! The boundary heuristics (R2.5 / R7.3a) live here, not in `fono-stt`,
-//! per design decision 22 in plan v7: they are **session-layer policy**
-//! that depends on per-session config (`commit_use_prosody`, etc.) and
-//! must remain easy for callers to disable without rebuilding the STT
-//! backends. ADR 0015 captures the rationale.
+//! The boundary heuristics live here, not in `fono-stt`: they are
+//! **session-layer policy** that depends on per-session config
+//! (`commit_use_prosody`, etc.) and must remain easy for callers to
+//! disable without rebuilding the STT backends. ADR 0015 captures the
+//! rationale.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -41,10 +41,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, field, instrument, warn, Span};
 
 /// Tunable knobs for the boundary heuristics. Built-in defaults today;
-/// the user-facing `[interactive].commit_*` knobs were removed in the
-/// 2026-05-22 config simplification because they were never plumbed
-/// here from `fono_core::config::Interactive`. The struct remains in
-/// case a future telemetry pass justifies exposing it again.
+/// the user-facing `[interactive].commit_*` knobs were removed in a
+/// config simplification because they were never plumbed here from
+/// `fono_core::config::Interactive`. The struct remains in case a
+/// future telemetry pass justifies exposing it again.
 #[derive(Debug, Clone)]
 pub struct HeuristicConfig {
     pub use_prosody: bool,

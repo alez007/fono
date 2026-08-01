@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Wake-word model registry + on-demand fetch (Phase G of
-//! `plans/2026-06-23-wake-word-openwakeword-v2.md`).
+//! Wake-word model registry + on-demand fetch.
 //!
 //! Distribution mirrors the local voice stack exactly (ADR 0033,
 //! `crates/fono-tts/src/voices.rs`): every asset is a SHA-256-pinned `.ort`
@@ -24,9 +23,9 @@
 //! - **Default / clean-license** ([`WakeModelClass::Default`]): the
 //!   freshly-trained Apache-2.0 "hey fono" classifier plus the shared
 //!   Apache melspectrogram graph and Google `speech_embedding` backbone.
-//!   These carry **no usage restriction**. The artifacts are produced in
-//!   Phase B and uploaded to the mirror; until then their SHA-256 pins are
-//!   the [`UNPINNED`] sentinel.
+//!   These carry **no usage restriction**. Until the artifacts are
+//!   trained and uploaded to the mirror their SHA-256 pins are the
+//!   [`UNPINNED`] sentinel.
 //! - **Community / NonCommercial** ([`WakeModelClass::Community`]): the
 //!   upstream openWakeWord phrases ("hey jarvis", "alexa", "hey mycroft")
 //!   published under **CC-BY-NC-SA-4.0**. Per ADR 0004 / the AGENTS
@@ -42,7 +41,7 @@
 //!   As of `ort-1.24.2` the three upstream conversions **are** hosted (the
 //!   repo owner's NonCommercial-redistribution call, recorded with attribution
 //!   in the `fono-voice` README) and pinned below; `hey_fono` remains
-//!   [`UNPINNED`] until the Phase B clean artifact is trained and uploaded.
+//!   [`UNPINNED`] until the clean artifact is trained and uploaded.
 
 use std::path::{Path, PathBuf};
 
@@ -179,15 +178,15 @@ pub const EMBEDDING: WakeAsset = WakeAsset {
 /// and `fono doctor`. The default clean model comes first.
 pub const WAKE_MODELS: &[WakeModelEntry] = &[
     // ── Default clean-license "hey fono" (Apache-2.0) ───────────────────
-    // The freshly-trained classifier from Phase B (Apache melspec + Apache
-    // Google embedding + clean-licensed positives/negatives). No usage
-    // restriction; no notice. Artifact + pin land in Phase B.
+    // The freshly-trained classifier (Apache melspec + Apache Google
+    // embedding + clean-licensed positives/negatives). No usage
+    // restriction; no notice. Artifact + pin land once it is trained.
     WakeModelEntry {
         id: "hey_fono",
         label: "Hey Fono",
         class: WakeModelClass::Default,
         license: WakeLicense::Apache2_0,
-        // TODO(phase B): pin once the trained `hey_fono.ort` is uploaded.
+        // TODO(hey_fono): pin once the trained `hey_fono.ort` is uploaded.
         classifier: WakeAsset { file: "hey_fono.ort", release_tag: RELEASE_TAG, sha256: UNPINNED },
     },
     // ── Opt-in community phrases (CC-BY-NC-SA-4.0, NonCommercial) ────────
@@ -238,7 +237,7 @@ pub const WAKE_MODELS: &[WakeModelEntry] = &[
 ///
 /// **TEMPORARY policy exception.** The clean-license default is `hey_fono`
 /// ([`WakeModelClass::Default`], Apache-2.0), but its `.ort` artifact is not
-/// trained/hosted yet ([`UNPINNED`], unfetchable). Until Phase B ships it,
+/// trained/hosted yet ([`UNPINNED`], unfetchable). Until it ships,
 /// the only model that actually loads out of the box is the community
 /// `hey_jarvis` conversion, so the runtime fallback points there. Note that
 /// `hey_jarvis` is **CC-BY-NC-SA-4.0 (NonCommercial)** — the fetch path

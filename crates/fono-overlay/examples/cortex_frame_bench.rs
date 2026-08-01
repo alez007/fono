@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Frame-budget microbenchmark for the Glass Cortex renderer
-//! (plan `plans/2026-07-05-brain-visualization-v1.md`, Task 2.6).
+//! Frame-budget microbenchmark for the Glass Cortex renderer.
 //!
 //! Measures `draw_cortex` wall-clock per frame in the busiest phase
 //! (speaking replay: beads + sparks + ribbon + HUD live) at the

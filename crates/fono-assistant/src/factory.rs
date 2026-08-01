@@ -104,8 +104,8 @@ fn resolve_cloud(
         } else {
             // `Always` / `None` / missing entry: leave the body
             // untouched. `Always` is reserved for Perplexity-shape
-            // providers (no toggle, always grounded) — Phase E ships
-            // no such provider.
+            // providers (no toggle, always grounded), and no such provider
+            // ships today.
             None
         }
     } else {

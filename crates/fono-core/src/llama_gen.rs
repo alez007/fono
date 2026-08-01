@@ -491,18 +491,11 @@ mod tests {
     #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
     fn llama_cpp_accepts_a_grammar_we_generated() {
         let model = vocab_model();
-        let tools = [crate::tool_catalog::ToolRow {
+        let row = |name: &str, schema: serde_json::Value| crate::tool_catalog::ToolRow {
             source: "ha".into(),
-            name: "HassTurnOn".into(),
+            name: name.into(),
             description: String::new(),
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "area": {"type": "string"},
-                    "name": {"type": "string"},
-                    "domain": {"type": "array", "items": {"type": "string"}},
-                },
-            }),
+            schema,
             schema_hash: String::new(),
             capability: crate::tool_catalog::Capability::Safe,
             verify_class: crate::tool_catalog::VerifyClass::None,
@@ -512,12 +505,48 @@ mod tests {
             user_touched: false,
             runs: 0,
             last_run: None,
-        }];
+        };
+        let tools = [
+            row(
+                "HassTurnOn",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "area": {"type": "string"},
+                        "name": {"type": "string"},
+                        "domain": {"type": "array", "items": {"type": "string"}},
+                    },
+                }),
+            ),
+            // Two field names that cannot be used verbatim in a GBNF rule name.
+            // The values a slot holds now live in a *named* rule, so the name
+            // has to be one llama.cpp will take — and this is the only place
+            // that genuinely knows what it will take.
+            //
+            // `device_class` earns its place here by having been the one that
+            // got through: it holds nothing but letters and an underscore, so
+            // it looks harmless, and llama.cpp takes no underscore in a rule
+            // name. A stock Home Assistant publishes it, one rejected rule name
+            // discards the whole grammar, and every command in a real house was
+            // written unconstrained as a result.
+            row(
+                "odd_server_tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "who's there?": {"type": "string"},
+                        "device_class": {"type": "string"},
+                    },
+                }),
+            ),
+        ];
         let mut slots = crate::tool_grammar::SlotValues::new();
-        slots.set("area", vec!["Kitchen".into(), "Master bedroom".into()]);
-        slots.set("name", vec![r#"Nick's "big" lamp"#.into()]);
-        slots.set("domain", vec!["light".into(), crate::tool_grammar::ANY_KIND.into()]);
-        slots.require("domain");
+        slots.set("ha", "area", vec!["Kitchen".into(), "Master bedroom".into()]);
+        slots.set("ha", "name", vec![r#"Nick's "big" lamp"#.into()]);
+        slots.set("ha", "domain", vec!["light".into(), crate::tool_grammar::ANY_KIND.into()]);
+        slots.set("ha", "who's there?", vec!["Kitchen".into()]);
+        slots.set("ha", "device_class", vec!["door".into(), "window".into()]);
+        slots.require("ha", "domain");
         let grammar = crate::tool_grammar::build(&tools, &slots).expect("a grammar");
 
         let sampler = grammar_sampler(&model, &grammar, &crate::tool_grammar::trigger_patterns());
@@ -544,7 +573,7 @@ mod tests {
     /// their reply — and it has to SAY it was rejected, because a trace that
     /// cannot tell `on` from `nothing happened` is how the rails managed to
     /// look enabled for a whole evening while a house filled up with invented
-    /// room names.
+    /// area names.
     #[test]
     #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
     fn a_rejected_grammar_still_returns_a_working_sampler() {
@@ -558,7 +587,7 @@ mod tests {
     }
 
     /// The test every other grammar test here was standing in for: that the
-    /// rails, once armed, actually **stop** the room this house does not have.
+    /// rails, once armed, actually **stop** the area this house does not have.
     ///
     /// Everything before this proved construction — the symbol links, the text
     /// parses, the pointer frees cleanly, every opener is accepted. None of it
@@ -569,11 +598,11 @@ mod tests {
     ///
     /// Two halves, and both matter. Before an opener, nothing at all is ruled
     /// out — that is the lazy form keeping ordinary talking free. After one,
-    /// the vocabulary is cut down, and a room the caller never supplied cannot
+    /// the vocabulary is cut down, and an area the caller never supplied cannot
     /// be spelled while the one that was supplied can.
     #[test]
     #[ignore = "needs a vocabulary via FONO_TEST_VOCAB_GGUF"]
-    fn the_rails_refuse_a_room_this_house_does_not_have() {
+    fn the_rails_refuse_an_area_this_house_does_not_have() {
         let model = vocab_model();
         let tools = [crate::tool_catalog::ToolRow {
             source: "ha".into(),
@@ -594,7 +623,7 @@ mod tests {
             last_run: None,
         }];
         let mut slots = crate::tool_grammar::SlotValues::new();
-        slots.set("area", vec!["Kitchen".into()]);
+        slots.set("ha", "area", vec!["Kitchen".into()]);
         let grammar = crate::tool_grammar::build(&tools, &slots).expect("a grammar");
         let mut sampler =
             grammar_sampler(&model, &grammar, &crate::tool_grammar::trigger_patterns())
@@ -619,7 +648,7 @@ mod tests {
              {} tokens was ruled out after `{opener}`",
             model.n_vocab()
         );
-        // And the one room that was supplied is still reachable, so the model
+        // And the one area that was supplied is still reachable, so the model
         // is being narrowed rather than cornered.
         assert!(
             after < model.n_vocab() as usize,

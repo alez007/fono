@@ -453,6 +453,7 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
 .act-head .desc { display: block; font-size: 11.5px; color: var(--ink-dim); margin-top: 3px; }
 .act-head .desc .mono { font-size: 11.5px; }
 .act-row.act-dim .act-head .lbl { color: var(--ink-mute); }
+.act-row.act-dim.act-say .lbl { color: var(--ink-mute); }
 .act-detail { padding: 4px 14px 16px 28px; border-left: 2px solid var(--line-2); margin: 0 0 0 18px; }
 .act-said { font-size: 12.5px; color: var(--ink-mute); margin: 6px 0 12px; text-wrap: pretty; }
 .act-detail .hint { margin: 8px 0 0; max-width: 66ch; }
@@ -462,6 +463,9 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
   font-family: var(--sans); vertical-align: 1px;
 }
 .pill.weak { color: var(--accent); border-color: var(--accent); }
+/* The accent is for a state that wants something from you. A phrase that has
+   earned the fast path wants nothing, so it gets the quiet approving colour. */
+.pill.good { color: var(--ok); border-color: var(--ok); }
 /* "Did this ever work, when, for whom" — the first question a row is opened
    to answer, so it reads a step louder than the hints below it. Never-used is
    the ordinary case and stays quiet; a failed last run does not. */
@@ -485,6 +489,48 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
 .act-ran .a { display: block; }
 .act-ran.good .w { color: var(--ok); }
 .act-ran.bad .w { color: var(--warn); }
+/* One learned phrase. Same skeleton as a tool row, and deliberately so: the
+   reserved status strip is the reason twenty phrases can be compared at a
+   glance. Nothing opens, though — a phrase is a fact, not a folder — so it
+   carries its own padding instead of borrowing a button's. */
+.act-say { padding: 9px 14px 9px 10px; }
+.act-say .info { flex: 1; min-width: 0; }
+.act-say .lbl { display: block; font-size: 13.5px; color: var(--ink); text-wrap: pretty; }
+.act-say .desc { display: block; font-size: 11.5px; color: var(--ink-dim); margin-top: 3px; }
+.act-say .desc .mono { font-size: 11.5px; }
+.act-say .ctl { display: flex; gap: 4px; flex-shrink: 0; }
+/* Every wording of one command, held together. The group is the unit a person
+   reads — "this is the thing I say, and these are the other ways I say it" —
+   so the rule between rows belongs between groups, not inside one. */
+.say-group + .say-group { border-top: 1px solid var(--line); }
+.say-group > .act-row + .act-row { border-top: 0; }
+/* An added wording, indented under the phrase it copies. Quieter than the row
+   above it on purpose: it is the same command, and the head of the group is
+   where the record lives. */
+.say-alias {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 14px 5px 34px; font-size: 12.5px; color: var(--ink-dim);
+}
+.say-alias .arr { color: var(--ink-mute); font-size: 11px; }
+.say-alias .lbl { min-width: 0; text-wrap: pretty; }
+.say-alias .ago { margin-left: auto; font-size: 11.5px; color: var(--ink-mute); white-space: nowrap; }
+.say-alias .ibtn { margin-left: 4px; }
+.say-alias.act-dim .lbl { color: var(--ink-mute); }
+/* Exactly what a phrase sends, shown when the row's { } is pressed. */
+.say-json {
+  margin: 2px 14px 10px 34px; padding: 8px 10px; font-size: 11.5px;
+  color: var(--ink-dim); background: var(--bg-2); border: 1px solid var(--line-2);
+  border-radius: 6px; white-space: pre-wrap; word-break: break-word;
+}
+/* One glyph, one action. Sized to the text beside it rather than to a button,
+   so a row of controls does not out-shout the phrase it belongs to. */
+.ibtn {
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  color: var(--ink-dim); cursor: pointer; font-family: var(--sans);
+  font-size: 13px; line-height: 1; padding: 5px 7px; min-width: 26px;
+}
+.ibtn:hover { color: var(--ink); border-color: var(--line-2); background: var(--bg-2); }
+.ibtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 /* What a tool was actually asked to do. The three lines are deliberately
    different weights, because they answer different questions: the words spoken
    are the human's, the arguments are the model's reading of them, and the

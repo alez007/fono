@@ -319,10 +319,9 @@ pub fn configured_stt_backends(secrets: &crate::Secrets, active: &SttBackend) ->
             if std::mem::discriminant(b) == std::mem::discriminant(active) {
                 return true;
             }
-            // Wyoming has no API key — its opt-in is `[stt.wyoming].uri`
-            // (manual config) or mDNS discovery (Slice 4 will inject
-            // discovered peers separately). Hide it from the menu
-            // until then to avoid a dead row.
+            // Wyoming has no API key — its opt-in is `[stt.wyoming].uri`.
+            // Discovered mDNS peers are injected separately, so listing
+            // Wyoming here unconditionally would leave a dead row.
             if matches!(b, SttBackend::Wyoming) {
                 return false;
             }
@@ -743,7 +742,7 @@ mod tests {
         }
     }
 
-    /// Phase F regression: every TTS backend variant must round-trip
+    /// Regression: every TTS backend variant must round-trip
     /// through `parse_tts_backend` / `tts_backend_str`.
     #[test]
     fn tts_roundtrip() {
@@ -751,14 +750,14 @@ mod tests {
             let s = tts_backend_str(&b);
             assert_eq!(parse_tts_backend(s).unwrap(), b);
         }
-        // New Phase F variants explicitly:
+        // Cloud TTS variants explicitly:
         assert_eq!(parse_tts_backend("groq"), Some(TtsBackend::Groq));
         assert_eq!(parse_tts_backend("openrouter"), Some(TtsBackend::OpenRouter));
         assert_eq!(parse_tts_backend("cartesia"), Some(TtsBackend::Cartesia));
         assert_eq!(parse_tts_backend("deepgram"), Some(TtsBackend::Deepgram));
     }
 
-    /// Phase F: every new cloud TTS backend reports the canonical
+    /// Every cloud TTS backend reports the canonical
     /// env-var name. Mirrors `key_env_matches_provider` for STT/LLM.
     #[test]
     fn tts_key_env_matches_provider() {

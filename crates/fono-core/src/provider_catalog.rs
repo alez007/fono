@@ -144,9 +144,9 @@ pub struct TtsDefaults {
     /// Endpoint shape (which client to instantiate, plus base URL).
     pub endpoint: TtsEndpoint,
     /// Whether the doctor should runtime-probe the provider's TTS
-    /// endpoint. **False for every catalogue entry in Phase A** — no
-    /// runtime probes anywhere yet; this flag is reserved for later
-    /// phases that may want to verify endpoint availability.
+    /// endpoint. **False for every catalogue entry today** — no runtime
+    /// probes anywhere yet; the flag is reserved for a future pass that
+    /// wants to verify endpoint availability.
     pub runtime_probe: bool,
     /// Declarative live-voice discovery descriptor. `Some` means the
     /// provider exposes an enumerable voice list (e.g. ElevenLabs
@@ -531,10 +531,10 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         stt: None,
         polish: Some(PolishDefaults {
             // TODO: verify against Anthropic's current model list — the
-            // Groq Maverick incident (issue: 404 model_not_found)
-            // exposed that the Phase A catalogue contained at least
-            // one hallucinated model id; the Anthropic dated suffix
-            // here is the most likely remaining suspect.
+            // Groq Maverick incident (issue: 404 model_not_found) exposed
+            // that the catalogue contained at least one hallucinated model
+            // id; the Anthropic dated suffix here is the most likely
+            // remaining suspect.
             model: "claude-haiku-4-5-20251001",
         }),
         assistant: Some(AssistantDefaults {
@@ -790,8 +790,7 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         // `ink-whisper` family of models; `ink-2` is reachable only
         // via the realtime WebSocket endpoint
         // (`wss://api.cartesia.ai/stt/turns/websocket`) which is the
-        // Phase 2 streaming work — see
-        // `plans/2026-05-23-cartesia-stt-support-v2.md`.
+        // streaming work.
         stt: Some(SttDefaults { model: "ink-whisper" }),
         polish: None,
         assistant: None,
@@ -1096,9 +1095,8 @@ mod tests {
     /// Test 2 — every backend variant claimed by an entry parses
     /// back through the matching `parse_*_backend`. For capabilities
     /// where the corresponding `*Backend` enum variant doesn't yet
-    /// exist (e.g. Groq/OpenRouter/Deepgram/Cartesia TTS in Phase A),
-    /// we skip silently; later phases that add the variant will start
-    /// exercising the check automatically.
+    /// exist (e.g. Groq/OpenRouter/Deepgram/Cartesia TTS), we skip
+    /// silently; adding the variant starts exercising the check.
     #[test]
     fn claimed_backends_roundtrip() {
         for p in CLOUD_PROVIDERS {
@@ -1117,8 +1115,8 @@ mod tests {
                 );
             }
             // TTS: only enforce roundtrip when the enum variant
-            // already exists. Phase A intentionally pre-declares TTS
-            // metadata for providers whose `TtsBackend` variant isn't
+            // already exists. The catalogue intentionally pre-declares
+            // TTS metadata for providers whose `TtsBackend` variant isn't
             // wired yet.
             if p.tts.is_some() {
                 if let Some(b) = parse_tts_backend(p.id) {
