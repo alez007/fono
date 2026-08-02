@@ -119,6 +119,10 @@ impl Assistant for AnthropicChat {
         "anthropic"
     }
 
+    fn model(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn reply_stream(
         &self,

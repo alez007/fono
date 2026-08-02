@@ -71,7 +71,8 @@ pub fn head_with_tools(
 pub fn instructions(descriptors: &[Value]) -> String {
     let mut s = String::from(
         "You can operate the user's devices by calling a tool.\n\
-         To call one, reply with EXACTLY this and nothing else:\n",
+         To call one, first say in one short sentence, in the user's own language, what you \
+         are doing, then immediately write EXACTLY this:\n",
     );
     s.push_str(OPEN);
     s.push_str("{\"name\": \"ToolName\", \"arguments\": {\"key\": \"value\"}}");
@@ -182,8 +183,12 @@ pub fn split_speakable(text: &str) -> (&str, &str) {
     if let Some(at) = text.find(OPEN) {
         return text.split_at(at);
     }
-    // Longest tail that is still an unfinished opening tag.
-    let max = OPEN.len().min(text.len()).saturating_sub(1);
+    // Longest tail that is still an unfinished opening tag. The tail may be
+    // the whole of what has arrived: a model that writes the tag one token at
+    // a time starts with a bare `<`, and releasing that releases the rest of
+    // the tag behind it, one harmless-looking fragment after another, until a
+    // whole command has been read aloud instead of run.
+    let max = (OPEN.len() - 1).min(text.len());
     (1..=max)
         .rev()
         .find(|&i| text.is_char_boundary(text.len() - i) && text.ends_with(&OPEN[..i]))
@@ -390,6 +395,27 @@ mod tests {
         let (speak, hold) = split_speakable("Anything under 5 < 3 is wrong.");
         assert_eq!(speak, "Anything under 5 < 3 is wrong.");
         assert!(hold.is_empty());
+    }
+
+    /// Feeding the split the way the backend does — one fragment at a time,
+    /// keeping only what it says to keep — must leave the whole command in
+    /// hand and nothing of it spoken. The tag can start a fragment on its own,
+    /// and a bare `<` used to be released for being all there was so far,
+    /// which let the rest of the command follow it out one piece at a time and
+    /// be read aloud as JSON while the house did nothing.
+    #[test]
+    fn a_command_written_one_character_at_a_time_is_never_spoken() {
+        let reply = "Sting lumina.\n<tool_call>{\"name\": \"HassTurnOff\"}</tool_call>";
+        let (mut buf, mut spoken) = (String::new(), String::new());
+        for ch in reply.chars() {
+            buf.push(ch);
+            let (speak, hold) = split_speakable(&buf);
+            spoken.push_str(speak);
+            buf = hold.to_string();
+        }
+        assert_eq!(spoken, "Sting lumina.\n");
+        assert_eq!(buf, "<tool_call>{\"name\": \"HassTurnOff\"}</tool_call>");
+        assert!(parse_call(&buf).is_some(), "the held text is still a readable command");
     }
 
     /// Multi-byte text must never be split mid-character; Fono is spoken to in

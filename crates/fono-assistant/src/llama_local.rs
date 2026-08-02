@@ -101,6 +101,23 @@ struct GenParams {
     /// tools offered *this turn* — and because it must be absent on the turns
     /// where no tools are offered at all.
     grammar: Option<Arc<str>>,
+    /// Where the steady part of this prompt ends: the greeting, the areas, the
+    /// devices and the tool catalogue, framed for the model and stopping short
+    /// of anything that changes from turn to turn.
+    ///
+    /// A checkpoint is usable only when its whole token list is a prefix of the
+    /// new prompt, so a checkpoint of a prompt carrying "Reply in Romanian." is
+    /// worthless to the English turn after it and to a turn with a different
+    /// speaker. Naming the boundary lets the cold read stop there, keep what it
+    /// has, and read on — after which every language, every speaker and every
+    /// note costs the handful of tokens it is written in rather than the whole
+    /// house. Measured on the command benchmark before this existed: two
+    /// languages, 1579 tokens each, 39 s and 35 s, for prompts identical but
+    /// for four words at the end.
+    ///
+    /// `None` where no such boundary is known, which leaves the read exactly as
+    /// it was.
+    steady_head: Option<Arc<str>>,
 }
 
 /// RAII guard that closes the backend's brain-capture gate when a
@@ -382,6 +399,89 @@ impl LlamaLocalAssistant {
         Ok(())
     }
 
+    /// Read as far as the end of the steady head, checkpoint there, and report
+    /// how many tokens that was.
+    ///
+    /// A checkpoint is usable only when its whole token list is a prefix of the
+    /// new prompt, so one taken of a prompt ending "Reply in Romanian." is worth
+    /// nothing to the English turn after it — and the two prompts are otherwise
+    /// the same 1579 tokens of greeting, areas, devices and tools. Stopping at
+    /// the boundary the note has yet to cross gives every language, every
+    /// speaker and every note the same checkpoint to start from.
+    ///
+    /// The entry goes under `F8System`, pinned, keyed exactly as the startup
+    /// warm keys it, so the two agree on one occupant instead of evicting each
+    /// other.
+    ///
+    /// `Ok(None)` where there is no boundary to stop at, where the head is not
+    /// a token prefix of this prompt after all, or where the whole prefix *is*
+    /// the head and the ordinary store below already pins it. The caller then
+    /// reads on exactly as it did before.
+    fn checkpoint_steady_head(
+        &self,
+        model: &LlamaModel,
+        ctx: &mut LlamaContext<'_>,
+        prefix_tokens: &[llama_cpp_2::token::LlamaToken],
+        params: &GenParams,
+        start: usize,
+    ) -> Result<Option<usize>> {
+        let Some(head) = params.steady_head.as_deref().map(str::trim_end).filter(|h| !h.is_empty())
+        else {
+            return Ok(None);
+        };
+        let head_tokens =
+            model.str_to_token(head, AddBos::Always).context("tokenize steady head")?;
+        if head_tokens.is_empty() || head_tokens.len() >= prefix_tokens.len() {
+            return Ok(None);
+        }
+        if !prefix_tokens.starts_with(&head_tokens) {
+            debug!(
+                head_tokens = head_tokens.len(),
+                prefix_tokens = prefix_tokens.len(),
+                "steady head is not a token prefix of this prompt; reading straight through"
+            );
+            return Ok(None);
+        }
+        // Something deeper is already restored, so the head is behind us and
+        // whatever supplied it is at least as good as this checkpoint.
+        if start >= head_tokens.len() {
+            return Ok(None);
+        }
+        self.prefill_tokens(
+            ctx,
+            &prefix_tokens[start..head_tokens.len()],
+            start as i32,
+            false,
+            "llm.prompt_cache_head_prefill",
+        )?;
+        let Some(key) =
+            self.prompt_state_cache_key(PromptStateCacheLayer::F8System, head, &head_tokens).ok()
+        else {
+            return Ok(Some(head_tokens.len()));
+        };
+        if let Ok(state) = copy_context_state(ctx) {
+            let state_bytes = state.len();
+            if let Ok(mut cache) = self.prompt_state_cache.lock() {
+                let entry = PromptStateCacheEntry::with_tokens(state, token_ids(&head_tokens[..]));
+                record_cache_mutation(&cache.insert_pinned(key.clone(), entry));
+            }
+            current_instant(
+                "llm.prompt_cache_head_stored",
+                "cache",
+                CACHE_LANE,
+                json!({
+                    "layer": key.layer().as_str(),
+                    "cache_key": key.stable_id(),
+                    "pinned": true,
+                    "token_count": head_tokens.len(),
+                    "prefix_tokens": prefix_tokens.len(),
+                    "state_bytes": state_bytes,
+                }),
+            );
+        }
+        Ok(Some(head_tokens.len()))
+    }
+
     /// Generation-time prefix cache. Restores a cached prefix checkpoint
     /// when one exists (building it on first use), then prefills only the
     /// per-turn suffix before generating. Returns `Ok(None)` — having emitted
@@ -595,6 +695,22 @@ impl LlamaLocalAssistant {
             if !matched {
                 cold_prefill(layer.as_str(), "no_prefix_match");
             }
+            // Stop at the end of the steady head, keep what has been read, then
+            // read on. Everything after that boundary — the language note, the
+            // speaker, the conversation, the user's words — is what makes one
+            // turn's checkpoint useless to the next; everything before it is
+            // the same in every turn this house will ever see, and is where
+            // nearly all the reading time goes.
+            //
+            // The pin goes here rather than to the whole prefix because a pin
+            // is one entry per layer and this is the occupant every turn can
+            // use. See the store site below for the whole-prefix checkpoint,
+            // which is still taken and still serves the exact-key path.
+            let pinned_head =
+                self.checkpoint_steady_head(model, &mut ctx, &prefix_tokens, &params, start)?;
+            if let Some(head_tokens) = pinned_head {
+                start = head_tokens;
+            }
             if start < prefix_tokens.len() {
                 self.prefill_tokens(
                     &mut ctx,
@@ -643,8 +759,14 @@ impl LlamaLocalAssistant {
             // wording pass after a tool call has a longer prefix that contains
             // the turn-start one, so filing both together deleted the useful
             // half seconds after it was written.
+            //
+            // The pin is claimed by the steady head when there is one: it is
+            // the same head with the turn's own note still to come, so it
+            // matches everything this one would and more. Pinning both would
+            // mean the second insert releasing the first.
+            let pin_here = params.pin_prefix && pinned_head.is_none();
             if start < prefix_tokens.len() {
-                let store_key = if params.pin_prefix {
+                let store_key = if pin_here {
                     head_key
                 } else if params.prefix_outlives_turn {
                     stored_key
@@ -663,7 +785,7 @@ impl LlamaLocalAssistant {
                             prefix_state,
                             token_ids(&prefix_tokens),
                         );
-                        let report = if params.pin_prefix {
+                        let report = if pin_here {
                             cache.insert_pinned(store_key.clone(), entry)
                         } else {
                             cache.insert(store_key.clone(), entry)
@@ -677,7 +799,7 @@ impl LlamaLocalAssistant {
                         json!({
                             "layer": store_key.layer().as_str(),
                             "cache_key": store_key.stable_id(),
-                            "pinned": params.pin_prefix,
+                            "pinned": pin_here,
                             "token_count": prefix_tokens.len(),
                             "state_bytes": state_bytes,
                         }),
@@ -2101,6 +2223,32 @@ fn render_assistant(turn: &ChatTurn) -> String {
     out
 }
 
+/// Whether the system block can ride on the first turn Gemma will render.
+///
+/// Gemma has no system role, so the block is folded into the first user turn —
+/// its trained convention. That only holds if a user turn is what comes first,
+/// and often it is not. The rolling window drops turns off the front, and turns
+/// arrive in pairs, so half the time the survivor at the front is a model
+/// reply; an API client, meanwhile, may send any array it likes. Rendering the
+/// block behind a model turn buries the instructions the model is meant to
+/// follow, and stops the pinned base checkpoint being a token prefix of the
+/// prompt — so it can never match, and the turn is prefilled cold from nothing.
+///
+/// An empty history counts as welding: the block leads the current user turn,
+/// which is the same shape.
+fn system_welds_onto_first_turn(history: &[ChatTurn]) -> bool {
+    history
+        .iter()
+        .find_map(|turn| match turn.role {
+            ChatRole::User | ChatRole::System => (!turn.content.trim().is_empty()).then_some(true),
+            ChatRole::Assistant => (!render_assistant(turn).trim().is_empty()).then_some(false),
+            ChatRole::Tool => {
+                (!local_tools::render_result(&turn.content).trim().is_empty()).then_some(false)
+            }
+        })
+        .unwrap_or(true)
+}
+
 fn build_gemma_prompt_split(
     ctx: &AssistantContext,
     user_text: &str,
@@ -2113,9 +2261,19 @@ fn build_gemma_prompt_split(
     // system checkpoint and a per-conversation checkpoint both stay valid as
     // token-prefixes turn after turn. Anything volatile (the current user text)
     // lives only in the trailing suffix.
+    //
+    // When the history does not open on a user turn there is nothing to fold
+    // into, so the block leads on a turn of its own instead. Slightly off the
+    // trained shape, and far better than the alternative of rendering it after
+    // a model reply, which buries it and voids the pinned checkpoint.
     let system = ctx.system_prompt.trim();
     let mut prefix = String::new();
-    let mut system_emitted = false;
+
+    let leads_alone = !system.is_empty() && !system_welds_onto_first_turn(&ctx.history);
+    if leads_alone {
+        push_gemma_turn(&mut prefix, "user", system, markers);
+    }
+    let mut system_emitted = leads_alone;
 
     for turn in &ctx.history {
         match turn.role {
@@ -2277,6 +2435,16 @@ impl Assistant for LlamaLocalAssistant {
         let prompt = build_prompt(ctx, user_text, model_name);
 
         let (cache_prefix, cache_suffix) = build_prompt_split(ctx, user_text, model_name);
+        // The head, framed for the model and stopping short of the language
+        // note, the speaker, the conversation and the user's words. Anything
+        // after it differs between two turns that are otherwise identical, and
+        // a checkpoint is all-or-nothing about its tokens — so this is the
+        // deepest point a checkpoint can reach and still serve the next turn,
+        // whatever language it is spoken in.
+        let steady_head: Option<Arc<str>> = {
+            let base = assistant_base_prefix(&head, model_name);
+            (!base.is_empty() && cache_prefix.starts_with(&base)).then(|| Arc::from(base.as_str()))
+        };
         current_instant(
             "llm.prompt_built",
             "assistant.llm",
@@ -2323,6 +2491,11 @@ impl Assistant for LlamaLocalAssistant {
             // `ActionTools::grammar` is already `None` when the switch is off,
             // so there is nothing to check here beyond "are there tools at all".
             grammar: actions.as_ref().and_then(|a| a.grammar.as_deref().map(Arc::from)),
+            // Where the steady part of this prompt ends. Rendered by the same
+            // call the startup warm uses, so the checkpoint taken here and the
+            // one warmed there are the same entry rather than two that evict
+            // each other.
+            steady_head,
         };
         let started = Instant::now();
         let model_name_owned = model_name.to_string();
@@ -2337,7 +2510,15 @@ impl Assistant for LlamaLocalAssistant {
                 // call is held back rather than spoken. `could_be_call` releases
                 // it the moment it is plainly prose, so an ordinary answer keeps
                 // its head start; only a genuine call is ever buffered whole.
-                let mut held = actions.is_some().then(String::new);
+                //
+                // Watching does not stop there. The model is asked to say what
+                // it is doing and then write the command, so the command
+                // arrives after prose that has already been spoken — and text
+                // released without watching for what follows it gets a
+                // perfectly good call read aloud as JSON.
+                let watching = actions.is_some();
+                let mut buf = String::new();
+                let mut spoken = String::new();
                 let text = me.run_inference_with_prefix_cache(
                     &prompt,
                     &cache_prefix,
@@ -2349,32 +2530,64 @@ impl Assistant for LlamaLocalAssistant {
                         if delta.is_empty() {
                             return Ok(true);
                         }
-                        if let Some(buf) = held.as_mut() {
-                            buf.push_str(&delta);
-                            if local_tools::could_be_call(buf) {
-                                return Ok(true);
-                            }
-                            let flush = std::mem::take(buf);
-                            held = None;
+                        if !watching {
                             deltas_emitted = deltas_emitted.saturating_add(1);
-                            return Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok());
+                            return Ok(tx.blocking_send(Ok(TokenDelta::text(delta))).is_ok());
                         }
+                        buf.push_str(&delta);
+                        // Nothing said yet, so the whole reply may still be a
+                        // command — in any of the shapes a model writes one in,
+                        // which is more than the one tag the split below knows.
+                        if spoken.is_empty() && local_tools::could_be_call(&buf) {
+                            return Ok(true);
+                        }
+                        let (speak, hold) = local_tools::split_speakable(&buf);
+                        let flush = speak.to_string();
+                        buf = hold.to_string();
+                        if flush.is_empty() {
+                            return Ok(true);
+                        }
+                        spoken.push_str(&flush);
                         deltas_emitted = deltas_emitted.saturating_add(1);
-                        Ok(tx.blocking_send(Ok(TokenDelta::text(delta))).is_ok())
+                        Ok(tx.blocking_send(Ok(TokenDelta::text(flush))).is_ok())
                     },
                 )?;
-                let Some(held) = held else { return Ok(text) };
-                let Some(actions) = actions else { return Ok(text) };
-                if held.trim().is_empty() {
+                if !watching {
                     return Ok(text);
                 }
-                let Some((name, arguments)) = local_tools::parse_call(&held) else {
+                let held = std::mem::take(&mut buf);
+                debug!(
+                    spoken_chars = spoken.len(),
+                    held_chars = held.len(),
+                    text_chars = text.len(),
+                    has_open = text.contains(local_tools::OPEN),
+                    "first pass finished"
+                );
+                let Some(actions) = actions else { return Ok(text) };
+                // Whether this turn carries a command is decided on the whole
+                // reply, not on the part that happened to arrive last. Holding
+                // is a streaming convenience: it keeps a command out of the
+                // speaker while it is still being written. Treating it as the
+                // record of what was written puts one delivery hiccup between
+                // a perfectly good command and the house — a run left five
+                // commands unrun and read all five out as JSON instead, each
+                // one whole and parseable in the text the model had just
+                // finished writing.
+                let Some((name, arguments)) =
+                    local_tools::parse_call(&held).or_else(|| local_tools::parse_call(&text))
+                else {
+                    if held.trim().is_empty() {
+                        return Ok(text);
+                    }
                     // Ambiguous to the last token, but prose after all. Say it —
                     // swallowing it would leave the user with silence.
                     deltas_emitted = deltas_emitted.saturating_add(1);
                     let _ = tx.blocking_send(Ok(TokenDelta::text(held)));
                     return Ok(text);
                 };
+                // Anything the command itself was spelled with is not something
+                // the user was told, whatever reached the speaker.
+                let spoken = local_tools::split_speakable(&spoken).0.to_string();
                 let call = ToolCall {
                     id: format!("local-{}", started.elapsed().as_nanos()),
                     name,
@@ -2464,6 +2677,10 @@ impl Assistant for LlamaLocalAssistant {
                 let mut base = prompt.clone();
                 let mut call_text = text.trim().to_string();
                 let mut attempt = 0;
+                // What the user has already been told this turn. The model
+                // announces the command before writing it, so on the ordinary
+                // path the reply exists before the tool runs.
+                let mut promised = spoken;
                 loop {
                     let _ = tx.blocking_send(Ok(TokenDelta::tool(ToolEvent::Called(call.clone()))));
                     let outcome = handle.block_on((actions.execute)(call.clone()));
@@ -2471,7 +2688,22 @@ impl Assistant for LlamaLocalAssistant {
                         tool_call_id: call.id.clone(),
                         summary: outcome.summary.clone(),
                         failed: outcome.failed,
+                        sent: outcome.sent.clone(),
                     })));
+
+                    // The command was announced, and the world was read
+                    // afterwards and agrees. The turn is over: reading the
+                    // result and writing a second sentence that says the same
+                    // thing costs a whole extra pass — measured at a median of
+                    // 2.2 s of generation on top of 2.1 s spent re-reading the
+                    // server's answer — and it is the pass that arrives in
+                    // English on a Romanian turn, or arrives empty, or claims
+                    // something the house never did. Nothing is skipped where
+                    // the reading disagreed, or where the model said nothing.
+                    if outcome.confirmed && !promised.trim().is_empty() {
+                        debug!("the house agrees with what was already said; no second pass");
+                        return Ok(promised);
+                    }
 
                     // Word the result. Two things decide whether this pass
                     // costs a fifth of a second or half a minute, and a real
@@ -2532,18 +2764,21 @@ impl Assistant for LlamaLocalAssistant {
                     // A repeat of the request that just failed is not a second
                     // attempt; it is a second wait for the same answer. Sending
                     // it is the only way the correction can waste the user's
-                    // time, so it is not sent.
+                    // time, so it is not sent — unless the failure was Fono
+                    // refusing on a guess about the request, where writing the
+                    // call again is how the model says the guess was wrong.
+                    let repeat_ok = outcome.repeat_ok;
                     let retry = retry.filter(|next| {
                         let repeat = next.name == call.name
                             && local_tools::same_request(&next.arguments, &call.arguments);
-                        if repeat {
+                        if repeat && !repeat_ok {
                             warn!(
                                 "{} was written again unchanged after it failed; not sending it a \
                                  second time",
                                 call.name
                             );
                         }
-                        !repeat
+                        !repeat || repeat_ok
                     });
                     let Some(next) = retry else {
                         // Nothing more to run. Whatever was held back is either
@@ -2574,6 +2809,10 @@ impl Assistant for LlamaLocalAssistant {
                     // cannot match and the whole conversation is re-read.
                     call_text = raw.trim().to_string();
                     call = next;
+                    // A correction is announced the same way the first attempt
+                    // was, so what the user just heard stands as the reply if
+                    // the second command lands.
+                    promised = spoken;
                     attempt += 1;
                 }
             })();
@@ -2628,6 +2867,10 @@ impl Assistant for LlamaLocalAssistant {
 
     fn name(&self) -> &'static str {
         "llama-local-assistant"
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model_path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
     }
 
     fn can_run_actions(&self) -> bool {
@@ -3082,6 +3325,52 @@ mod tests {
         }
     }
 
+    /// Two turns spoken in different languages share everything but their last
+    /// few words, and a checkpoint is all-or-nothing about its tokens — so a
+    /// checkpoint of the whole prompt serves exactly one language and the other
+    /// pays to read the house again.
+    ///
+    /// Asserts the property the head checkpoint depends on: the head leads both
+    /// prompts, and the prompts diverge only after it. String level; the token
+    /// level is guarded at runtime by `prefix_tokens.starts_with(&head_tokens)`
+    /// in [`LlamaLocalAssistant::checkpoint_steady_head`], which needs a real
+    /// vocabulary and falls back to reading straight through when it fails.
+    #[test]
+    fn the_head_leads_a_prompt_in_any_language_and_is_where_they_part() {
+        let head = "You are Fono, a terse assistant.\n\nAreas: Kitchen, Office.";
+        for model in ["gemma-4-e2b-it-Q4_K_M", "qwen3.5-0.8b"] {
+            let base = assistant_base_prefix(head, model);
+            let prompt = |code: &str| {
+                let ctx = AssistantContext {
+                    system_prompt: crate::compose_system_prompt(
+                        head,
+                        AssistantContext {
+                            language: Some(code.into()),
+                            ..AssistantContext::default()
+                        }
+                        .turn_notes()
+                        .as_deref(),
+                    ),
+                    ..AssistantContext::default()
+                };
+                build_prompt_split(&ctx, "stinge lumina", model).0
+            };
+            let (en, ro) = (prompt("en"), prompt("ro"));
+            assert_ne!(en, ro, "the note must actually differ for {model:?}");
+            for p in [&en, &ro] {
+                assert!(p.starts_with(&base), "head must lead the prompt for {model:?}: {p:?}");
+            }
+            let shared =
+                en.as_bytes().iter().zip(ro.as_bytes()).take_while(|(a, b)| a == b).count();
+            assert!(
+                shared >= base.len(),
+                "the two languages must share at least the head for {model:?}: \
+                 shared {shared} < head {}",
+                base.len()
+            );
+        }
+    }
+
     /// Tools reach this backend through the system prompt, so the two things
     /// that could quietly go wrong are: the block landing *before* the pinned
     /// base (a cold prefill on every turn), and the second pass not continuing
@@ -3181,6 +3470,7 @@ mod tests {
             })],
             hint: Some("Areas in this home: Kitchen, Office.".into()),
             grammar: None,
+            said: crate::Said::default(),
             execute: Arc::new(move |call: ToolCall| {
                 let recorder = Arc::clone(&recorder);
                 Box::pin(async move {
@@ -3290,6 +3580,7 @@ mod tests {
             })],
             hint: Some("Areas in this home: Kitchen, Office.".into()),
             grammar: None,
+            said: crate::Said::default(),
             execute: Arc::new(move |call: ToolCall| {
                 let recorder = Arc::clone(&recorder);
                 Box::pin(async move {
@@ -3302,6 +3593,9 @@ mod tests {
                             summary: "No such area. Nothing was changed.".into(),
                             failed: true,
                             retryable: true,
+                            sent: None,
+                            repeat_ok: false,
+                            confirmed: false,
                         }
                     } else {
                         ToolOutcome::worked(
@@ -3387,6 +3681,31 @@ mod tests {
         // The system prompt must appear exactly once even with history.
         let full = build_prompt(&with_history, "current question", "gemma-4-e2b-it");
         assert_eq!(full.matches("You are Fono.").count(), 1);
+    }
+
+    #[test]
+    fn gemma_system_leads_even_when_history_opens_on_a_reply() {
+        // The rolling window drops turns off the front and turns arrive in
+        // pairs, so half the time the survivor at the front is a model reply.
+        // The system block must still lead: buried behind a model turn it stops
+        // being a token prefix, the pinned base can never match, and the turn
+        // is prefilled cold from nothing.
+        let system = "You are Fono.";
+        let base = assistant_base_prefix(system, "gemma-4-e2b-it");
+        let histories = [
+            vec![turn(ChatRole::Assistant, "reply one"), turn(ChatRole::User, "turn two")],
+            vec![turn(ChatRole::Tool, "the light is on"), turn(ChatRole::User, "turn two")],
+        ];
+        for history in histories {
+            let ctx = AssistantContext {
+                system_prompt: system.into(),
+                history,
+                ..AssistantContext::default()
+            };
+            let full = build_prompt(&ctx, "current question", "gemma-4-e2b-it");
+            assert!(full.starts_with(&base), "pinned base must lead; got: {full}");
+            assert_eq!(full.matches(system).count(), 1, "system rendered twice: {full}");
+        }
     }
 
     #[test]

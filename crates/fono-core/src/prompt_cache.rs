@@ -29,6 +29,9 @@
 //! pinned and skipped by eviction. Only the most recent snapshot of a given
 //! pinnable layer stays pinned; when the active prompt changes the stale pin is
 //! released so it can age out.
+//!
+//! Both budgets measure only what eviction can actually reclaim — see
+//! [`PromptStateCache::evictable_totals`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -217,7 +220,7 @@ pub struct PromptStateCache {
 
 impl Default for PromptStateCache {
     fn default() -> Self {
-        Self::new(8, 256 * 1024 * 1024)
+        Self::new(10, 256 * 1024 * 1024)
     }
 }
 
@@ -233,7 +236,9 @@ impl PromptStateCache {
         }
     }
 
-    /// Total bytes currently held across all entries.
+    /// Total bytes currently held across all entries, pinned included. This is
+    /// real memory, so it is what diagnostics report; it is deliberately not
+    /// the quantity the byte budget bounds (see [`Self::evictable_totals`]).
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -382,12 +387,34 @@ impl PromptStateCache {
         }
     }
 
+    /// Count and byte total of the entries eviction is allowed to touch, i.e.
+    /// everything except the pins.
+    ///
+    /// Both budgets are measured against this rather than against the whole
+    /// cache, because a pin is by definition unreclaimable: counting pins would
+    /// only shrink the space left for the conversation checkpoints eviction can
+    /// manage. Under the entry cap that costs one slot per pinnable layer —
+    /// three of ten — before a single conversation is cached. Under the byte
+    /// budget it is worse than proportional: on a model with a large KV
+    /// footprint one pinned tool catalogue can exceed the budget by itself, and
+    /// then every unpinned entry is evicted on every insert and the cache stops
+    /// working at all.
+    fn evictable_totals(&self) -> (usize, usize) {
+        self.entries
+            .iter()
+            .filter(|(key, _)| !self.pinned.contains(*key))
+            .fold((0, 0), |(count, bytes), (_, entry)| (count + 1, bytes + entry.state.len()))
+    }
+
     fn evict_over_budget(&mut self) -> Vec<EvictedEntry> {
         let mut evicted = Vec::new();
-        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
-            // Evict the oldest entry that is not pinned. Pinned base prefixes
-            // are skipped; if only pinned entries remain we stop rather than
-            // drop a protected checkpoint.
+        loop {
+            let (count, bytes) = self.evictable_totals();
+            if count <= self.max_entries && bytes <= self.max_bytes {
+                break;
+            }
+            // Evict the oldest entry that is not pinned. If only pinned entries
+            // remain we stop rather than drop a protected checkpoint.
             let Some(pos) = self.lru.iter().position(|k| !self.pinned.contains(k)) else {
                 break;
             };
@@ -469,6 +496,51 @@ mod tests {
             cache.insert(key(PromptStateCacheLayer::ExactPrompt, &format!("p{i}")), entry(48));
         }
         assert!(cache.contains(&key(PromptStateCacheLayer::F7System, "base")));
+    }
+
+    #[test]
+    fn pins_do_not_consume_the_entry_cap() {
+        // Three pinnable layers exist. If pins counted against the cap they
+        // would take three of its slots before a single conversation is cached.
+        let mut cache = PromptStateCache::new(2, usize::MAX);
+        cache.insert_pinned(key(PromptStateCacheLayer::F7System, "f7"), entry(8));
+        cache.insert_pinned(key(PromptStateCacheLayer::F8System, "f8"), entry(8));
+        cache.insert_pinned(key(PromptStateCacheLayer::AssistantTools, "tools"), entry(8));
+        cache.insert(key(PromptStateCacheLayer::F8ChatPrefix, "a"), entry(8));
+        cache.insert(key(PromptStateCacheLayer::F8ChatPrefix, "b"), entry(8));
+        // The cap is two *evictable* entries, so both conversations survive
+        // alongside all three pins.
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8ChatPrefix, "a")));
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8ChatPrefix, "b")));
+        assert_eq!(cache.len(), 5);
+    }
+
+    #[test]
+    fn a_pin_larger_than_the_byte_budget_does_not_empty_the_cache() {
+        // On a model with a large KV footprint one pinned tool catalogue can
+        // exceed the whole budget. Counting it would evict every unpinned entry
+        // on every insert, leaving the cache permanently empty.
+        let mut cache = PromptStateCache::new(usize::MAX, 64);
+        cache.insert_pinned(key(PromptStateCacheLayer::AssistantTools, "huge"), entry(4096));
+        cache.insert(key(PromptStateCacheLayer::F8ChatPrefix, "a"), entry(32));
+        cache.insert(key(PromptStateCacheLayer::F8ChatPrefix, "b"), entry(32));
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8ChatPrefix, "a")));
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8ChatPrefix, "b")));
+        // `bytes` still reports true memory, pin included.
+        assert_eq!(cache.bytes(), 4096 + 64);
+    }
+
+    #[test]
+    fn releasing_a_pin_returns_it_to_the_budget() {
+        let mut cache = PromptStateCache::new(1, usize::MAX);
+        cache.insert_pinned(key(PromptStateCacheLayer::F8System, "old"), entry(8));
+        cache.insert(key(PromptStateCacheLayer::F8ChatPrefix, "chat"), entry(8));
+        // Repinning the layer unpins "old", which now competes for the single
+        // evictable slot and loses to the more recent chat checkpoint.
+        cache.insert_pinned(key(PromptStateCacheLayer::F8System, "new"), entry(8));
+        assert!(!cache.contains(&key(PromptStateCacheLayer::F8System, "old")));
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8System, "new")));
+        assert!(cache.contains(&key(PromptStateCacheLayer::F8ChatPrefix, "chat")));
     }
 
     #[test]

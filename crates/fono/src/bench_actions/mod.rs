@@ -157,6 +157,16 @@ pub async fn run(mut config: Config, paths: &Paths, args: &Args) -> Result<()> {
     };
 
     let mut all = RunOutcome { safe: Vec::new(), detail: Vec::new() };
+    // Read the steady part of the prompt before the first case, the way the
+    // daemon reads it at startup. A user never pays for that read on a command,
+    // so a run that pays for it charges the first cases with time nobody spends.
+    if !args.dry_run {
+        let started = std::time::Instant::now();
+        match driver.warm().await {
+            Ok(()) => println!("Prompt read and kept in {} ms", started.elapsed().as_millis()),
+            Err(e) => println!("Prompt not kept ({e:#}) — the first cases will be slower"),
+        }
+    }
     for path in &fixtures {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read fixture {}", path.display()))?;

@@ -194,6 +194,12 @@ pub struct SlotFields {
     pub device: Option<&'static str>,
     /// Holds a kind of device.
     pub kind: Option<&'static str>,
+    /// Holds a further narrowing within a kind — a class of device. Same
+    /// standing as [`Self::place`] again: it can only ever cut the set of
+    /// devices down, so beside a name that already picks one out it can only
+    /// cut it to nothing. A real call asking for the volume of a named display
+    /// carried `device_class: ["tv"]` and the house refused the lot.
+    pub filter: Option<&'static str>,
 }
 
 /// Pick the implementation for whichever software produced a result.
@@ -359,7 +365,7 @@ impl Vendor for HomeAssistant {
         observed(readback, names)
     }
 
-    /// The three words Home Assistant uses across its whole intent interface.
+    /// The words Home Assistant uses across its whole intent interface.
     ///
     /// They are part of its public API — every voice integration in existence
     /// sends these names — so they cannot change without breaking far more than
@@ -373,6 +379,7 @@ impl Vendor for HomeAssistant {
             wider_place: Some("floor"),
             device: Some("name"),
             kind: Some("domain"),
+            filter: Some("device_class"),
         }
     }
 

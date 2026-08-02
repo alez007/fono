@@ -201,7 +201,12 @@ pub enum ToolEvent {
     /// real bug: a Home Assistant result that succeeded ends with
     /// `"failed": []`, and keyword matching duly logged the turn as a
     /// failure. Only the party that ran the tool knows how it went.
-    Result { tool_call_id: String, summary: String, failed: bool },
+    ///
+    /// `sent` is the executor's copy of [`ToolOutcome::sent`], carried on this
+    /// event because it is the first moment it exists: the call was announced
+    /// before it ran, and only running it settles what was asked of the
+    /// server.
+    Result { tool_call_id: String, summary: String, failed: bool, sent: Option<String> },
 }
 
 /// Synchronous screen-capture callback type. The closure runs the
@@ -227,7 +232,14 @@ pub type ToolExecFn =
 /// What running one tool came to: what to tell the model, and whether it
 /// worked. `failed` means "something demonstrably went wrong" — never
 /// "we checked and it was fine", which for many tools is unknowable.
+///
+/// The four flags are four separate facts about one call, and no two of them
+/// can be folded into a state: a command can fail and be safe to repeat, or
+/// succeed without ever being checked, or be refused by Fono in a way that
+/// invites the identical call back. Collapsing them into an enumeration would
+/// name states nothing observes.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ToolOutcome {
     pub summary: String,
     pub failed: bool,
@@ -247,13 +259,47 @@ pub struct ToolOutcome {
     /// and asking once are the same request. A relative change — two degrees
     /// warmer — is never retried, because twice is four degrees.
     pub retryable: bool,
+    /// The arguments as they actually reached the server, when the executor
+    /// changed them — blanks dropped, values the home itself had already
+    /// stated corrected. `None` means "exactly as the model wrote them".
+    ///
+    /// Carried out of the executor because nothing downstream can reconstruct
+    /// it, and because the record was misleading without it: a user reading
+    /// their own history saw `"floor": ""` in a call whose blank fields had
+    /// been removed before it left, and reasonably concluded the removal was
+    /// never happening.
+    pub sent: Option<String>,
+    /// Whether writing the identical call again is worth sending.
+    ///
+    /// Normally it is not: the same request gets the same answer, so a model
+    /// that repeats itself is only making the user wait twice. The exception is
+    /// a refusal Fono itself made on a guess about the request — a number the
+    /// user may have spoken in words rather than digits — where repeating the
+    /// call is how the model says the guess was wrong, and where the refusal
+    /// itself invites exactly that.
+    pub repeat_ok: bool,
+    /// Whether the world was read again after the command and agreed with it.
+    ///
+    /// Stronger than `!failed`, and the difference is the whole point: a server
+    /// that answers "done" has made a claim, while this says the devices were
+    /// looked at afterwards and are in the state that was asked for. Only that
+    /// second thing is enough to let a sentence written *before* the command
+    /// stand as the report of it.
+    pub confirmed: bool,
 }
 
 impl ToolOutcome {
     /// A tool that did what was asked, with no second chance needed.
     #[must_use]
     pub fn worked(summary: String) -> Self {
-        Self { summary, failed: false, retryable: false }
+        Self {
+            summary,
+            failed: false,
+            retryable: false,
+            sent: None,
+            repeat_ok: false,
+            confirmed: false,
+        }
     }
 }
 
@@ -283,6 +329,38 @@ pub struct ActionTools {
     /// halves of the same failure: the hint tells the model which area to pick,
     /// the rails stop it writing one that does not exist.
     pub grammar: Option<String>,
+    /// The words this turn is about, for whoever runs the tools to read.
+    pub said: Said,
+}
+
+/// What the user said this turn, shared with whatever runs the tools.
+///
+/// Exists because one class of wrong call can only be recognised against the
+/// request: a value the user never mentioned. Asked plainly to switch an air
+/// conditioner off, a model reached for the tool that sets a temperature and
+/// wrote `"temperature": 0` — a value no schema can object to and no blank
+/// check can catch, and the only evidence it was invented is that nobody said
+/// a number.
+///
+/// A slot rather than an argument because the tools are assembled before the
+/// speech has been recognised, and the same assembly runs the calls afterwards.
+#[derive(Clone, Default)]
+pub struct Said(Arc<std::sync::Mutex<String>>);
+
+impl Said {
+    /// Record what the user said. Replaces whatever the last turn said.
+    pub fn heard(&self, text: &str) {
+        if let Ok(mut said) = self.0.lock() {
+            *said = text.to_string();
+        }
+    }
+
+    /// The words, or empty when nothing was recorded — which every check here
+    /// must read as "no evidence", never as "the user said nothing".
+    #[must_use]
+    pub fn words(&self) -> String {
+        self.0.lock().map(|s| s.clone()).unwrap_or_default()
+    }
 }
 
 impl std::fmt::Debug for ActionTools {
@@ -417,6 +495,16 @@ pub trait Assistant: Send + Sync {
 
     /// Backend identifier for history / logging.
     fn name(&self) -> &'static str;
+
+    /// The model this backend is talking to, as a person would name it —
+    /// `gpt-5-mini`, `qwen3.5-4b`. Recorded against a saved conversation so
+    /// the history page can say which model answered rather than which of
+    /// Fono's internal backends carried the request, a distinction only
+    /// Fono's own source makes sense of. `None` when the backend has no one
+    /// named model.
+    fn model(&self) -> Option<String> {
+        None
+    }
 
     /// Whether this backend can actually invoke [`AssistantContext::actions`].
     ///

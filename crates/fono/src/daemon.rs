@@ -4308,6 +4308,12 @@ fn turn_json(t: &fono_core::conversations::Turn) -> serde_json::Value {
         "speaker": t.speaker,
         "latency_ms": t.latency_ms,
         "partial": t.partial,
+        // Only a tool result carries a verdict, and it is deliberately the
+        // stored one: a Home Assistant call that worked comes back saying
+        // `"failed": []`, so the text cannot be read for it. `null` means
+        // nobody recorded how it went, which the page must not paint as
+        // success.
+        "ok": t.ok,
     })
 }
 

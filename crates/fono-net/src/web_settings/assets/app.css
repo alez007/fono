@@ -409,13 +409,23 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
   font: inherit; color: inherit; text-align: left;
 }
 .linkbtn:hover { color: var(--accent); }
-.turns { padding: 4px 0 16px 18px; border-left: 2px solid var(--line-2); margin-left: 4px; }
-.turn { padding: 8px 0; }
-.turn + .turn { border-top: 1px solid var(--line); }
+/* One conversation. The turns reuse the block the tools page uses for a
+   tool's past uses (`.uses`), because it is the same question asked in
+   another place — which of these landed — and answering it twice in two
+   layouts is how the two pages drifted apart before. What is added here is
+   a clock on every turn: a transcript without times cannot be lined up
+   against anything that happened in the room. */
+.turns { padding: 4px 0 16px 22px; }
 .turn .who { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-dim); }
+/* The timestamp rides in the label's own line rather than on a line of its
+   own below the text: three lines per turn made a ten-turn conversation
+   longer than the screen, and the time is a label, not a statement. */
+.turn .who .when {
+  text-transform: none; letter-spacing: 0; font-weight: 400;
+  margin-left: 8px; color: var(--ink-dim); white-space: nowrap;
+}
 .turn .what { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; text-wrap: pretty; margin: 2px 0; }
 .turn.assistant .what { color: var(--ink-mute); }
-.turn.tool_call .what, .turn.tool_result .what { font-family: var(--mono); font-size: 12px; color: var(--ink-mute); }
 
 /* ---------- tools & actions page ---------- */
 .act-lede { font-size: 13.5px; color: var(--ink-mute); margin: 0 0 14px; text-wrap: pretty; }
@@ -474,8 +484,10 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
 /* Only the verdict is coloured. Colouring the whole sentence made the two
    timings and the speaker's name read as part of the complaint, and left the
    one word anyone came for indistinguishable from its own footnotes. */
-.act-hist .v-ok { color: var(--ok); }
-.act-hist .v-bad { color: var(--warn); }
+.v-ok { color: var(--ok); }
+.v-bad { color: var(--warn); }
+/* "Nobody checked" is its own answer and must not borrow either colour. */
+.v-none { color: var(--ink-dim); font-weight: 400; }
 /* Fixed-width column, right-aligned, reserved on every row whether or not it
    has anything to say. Reserving it on empty rows is the whole trick: the words
    then start at the same x all the way down, so "failed" is found by scanning a
@@ -538,15 +550,15 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
    top to bottom — "turn off the office light" becoming {"area":"Office light"}
    is visible without knowing anything about the schema. The left rule carries
    the colour so the JSON stays legible. */
-.act-uses { margin: 12px 0 0; display: flex; flex-direction: column; gap: 8px; }
-.act-uses .use {
+.uses { margin: 12px 0 0; display: flex; flex-direction: column; gap: 8px; }
+.uses .use {
   border-left: 2px solid var(--line-2); padding: 1px 0 1px 10px; max-width: 82ch;
 }
-.act-uses .use.good { border-left-color: var(--ok); }
-.act-uses .use.bad { border-left-color: var(--warn); }
-.act-uses .said { font-size: 12.5px; color: var(--ink); text-wrap: pretty; }
-.act-uses .said .when { color: var(--ink-dim); font-size: 11px; margin-left: 8px; white-space: nowrap; }
-.act-uses .sent {
+.uses .use.good { border-left-color: var(--ok); }
+.uses .use.bad { border-left-color: var(--warn); }
+.uses .said { font-size: 12.5px; color: var(--ink); text-wrap: pretty; }
+.uses .said .when { color: var(--ink-dim); font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.uses .sent {
   font-size: 11.5px; color: var(--ink-mute); margin-top: 2px;
   overflow-wrap: anywhere; line-height: 1.45;
 }
@@ -554,21 +566,21 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
    caret — and reserved at that width on attempts with no recorded reply too, or
    the arguments would start at two different places down one list, which is the
    same misalignment the status column on the rows above exists to avoid. */
-.act-uses .sent .m { display: inline-block; width: 2.1em; }
-.act-uses .use.good .sent .m { color: var(--ok); }
-.act-uses .use.bad .sent .m { color: var(--warn); }
+.uses .sent .m { display: inline-block; width: 2.1em; }
+.uses .use.good .sent .m { color: var(--ok); }
+.uses .use.bad .sent .m { color: var(--warn); }
 /* The arguments line is itself the handle for the reply. A separate "what came
    back" row was a line on every attempt that said nothing until opened, and the
    request already names what the reply is about. The only marks of it being a
    fold are a caret in the tick's own column and the line lifting on hover —
    loud enough to invite the click, quiet enough that ten stacked attempts still
    read as a list of arguments rather than a list of buttons. */
-.act-uses summary.sent { cursor: pointer; list-style: none; }
-.act-uses summary.sent::-webkit-details-marker { display: none; }
-.act-uses summary.sent .m::after { content: '\25b8'; margin-left: 2px; color: var(--ink-dim); }
-.act-uses .got[open] > summary.sent .m::after { content: '\25be'; }
-.act-uses summary.sent:hover { color: var(--ink); }
-.act-uses .reply {
+.uses summary.sent { cursor: pointer; list-style: none; }
+.uses summary.sent::-webkit-details-marker { display: none; }
+.uses summary.sent .m::after { content: '\25b8'; margin-left: 2px; color: var(--ink-dim); }
+.uses .got[open] > summary.sent .m::after { content: '\25be'; }
+.uses summary.sent:hover { color: var(--ink); }
+.uses .reply {
   font-size: 11.5px; color: var(--ink-dim); margin: 3px 0 2px 2.1em;
   overflow-wrap: anywhere; line-height: 1.45;
 }

@@ -149,6 +149,22 @@ impl TurnDriver {
         self.assistant.can_run_actions()
     }
 
+    /// Read the steady part of the prompt once, before the first utterance —
+    /// the greeting, the areas, the devices and the tool catalogue.
+    ///
+    /// The daemon does this at startup, so a user never pays for it on a
+    /// command. Without it here the first two utterances of a run each paid
+    /// about forty seconds to read the same house, which is a number nobody
+    /// experiences and which dominated every average the run reported.
+    pub async fn warm(&self) -> Result<()> {
+        let warmup = crate::session::assistant_cache_warmup(
+            &self.config,
+            Some(&self.paths),
+            (self.assistant.name(), self.assistant.can_run_actions()),
+        );
+        self.assistant.prewarm_prompt_caches(warmup).await
+    }
+
     /// Run one utterance through the production turn and observe the result.
     ///
     /// The utterance's language is declared to the model, because production
@@ -219,7 +235,7 @@ impl TurnDriver {
         let produced = run_assistant_turn(state.clone(), inputs, notify)
             .await
             .context("assistant turn failed")?;
-        let elapsed = started.elapsed();
+        let wall = started.elapsed();
 
         // Take the pump's own record of the turn. Written at the same instant
         // as the history push, so it says exactly what the model was told —
@@ -233,6 +249,12 @@ impl TurnDriver {
             let s = state.lock().await;
             s.last_turn.clone()
         };
+        // Time the reply, not the reading hold. The pump keeps the panel on
+        // screen for a while after the answer is complete, which is legibility
+        // and not latency; wall-clock here counted it and roughly doubled every
+        // reported figure. Fall back to the wall clock only when the turn ended
+        // before the pump wrote its own timing.
+        let elapsed = if record.took.is_zero() { wall } else { record.took };
         Ok(TurnObservation {
             reply: record.reply,
             aborted: record.aborted,

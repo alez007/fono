@@ -1091,10 +1091,24 @@ mod tests {
         // The panels that make it a debugging instrument rather than a list:
         // what a tool was really asked to do, what each field is narrowed to,
         // the server's own words, and the words the model is given.
-        assert!(APP_JS.contains("act-uses"), "the commands that actually reached a tool");
+        assert!(APP_JS.contains("class=\"uses\""), "the commands that actually reached a tool");
         assert!(APP_JS.contains("held to "), "which fields Fono is narrowing");
         assert!(APP_JS.contains("What the server published, word for word"));
         assert!(APP_JS.contains("The exact words the assistant is given"));
+    }
+
+    /// A saved conversation has to answer the same question the tools page
+    /// answers — which command worked — so it renders the same block, wearing
+    /// the same three verdict states. It opens on conversations because a
+    /// dictation transcript is a line the user already watched being typed.
+    #[test]
+    fn a_saved_conversation_shows_which_commands_worked() {
+        assert!(APP_JS.contains("histTab = 'conversations'"), "conversations open first");
+        assert!(APP_JS.contains("renderCommandTurn"), "a call and its reply are one block");
+        // The verdict comes off the stored flag, never off the reply text: a
+        // Home Assistant call that worked comes back saying `"failed": []`.
+        assert!(APP_JS.contains("typeof res.ok === 'boolean'"), "three states, not two");
+        assert!(APP_CSS.contains(".uses .use.bad"), "and the failing one is coloured");
     }
 
     /// The settings page auto-picks a backend when a language-model role

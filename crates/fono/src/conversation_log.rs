@@ -33,6 +33,9 @@ pub struct ConversationSink {
     /// Unix time of the last turn appended to `thread`. Drives idle
     /// segmentation without a DB round-trip on every turn.
     last_turn_at: i64,
+    /// The model to stamp on the next thread opened, set by
+    /// [`Self::set_model`].
+    model: Option<String>,
 }
 
 impl ConversationSink {
@@ -43,7 +46,7 @@ impl ConversationSink {
     pub fn open(path: &Path, cfg: ConversationsConfig) -> Self {
         if !cfg.enabled {
             debug!("conversation persistence disabled; not opening conversations.sqlite");
-            return Self { store: None, cfg, thread: None, last_turn_at: 0 };
+            return Self { store: None, cfg, thread: None, last_turn_at: 0, model: None };
         }
         let store = match ConversationStore::open(path) {
             Ok(s) => Some(s),
@@ -52,7 +55,7 @@ impl ConversationSink {
                 None
             }
         };
-        Self { store, cfg, thread: None, last_turn_at: 0 }
+        Self { store, cfg, thread: None, last_turn_at: 0, model: None }
     }
 
     /// A disabled sink (tests, and the assistant-less configurations).
@@ -63,6 +66,7 @@ impl ConversationSink {
             cfg: ConversationsConfig { enabled: false, ..ConversationsConfig::default() },
             thread: None,
             last_turn_at: 0,
+            model: None,
         }
     }
 
@@ -126,6 +130,17 @@ impl ConversationSink {
         }
         self.last_turn_at = now;
         self.thread
+    }
+
+    /// Name the model that is answering, so the next thread opened records
+    /// it beside the backend name.
+    ///
+    /// This belongs to the thread rather than to a turn — the history page
+    /// reports which model a conversation was held with, and a mid-thread
+    /// switch does not rewrite what came before. Callers set it before
+    /// recording the turn that starts the conversation.
+    pub fn set_model(&mut self, model: Option<String>) {
+        self.model = model;
     }
 
     /// Record a spoken user turn, attributed to `speaker` when speaker
@@ -192,7 +207,8 @@ impl ConversationSink {
         if self.store.is_none() || text.trim().is_empty() {
             return;
         }
-        let Some(thread_id) = self.thread_for_turn(backend, None) else { return };
+        let model = self.model.clone();
+        let Some(thread_id) = self.thread_for_turn(backend, model.as_deref()) else { return };
         let mut turn = Turn::new(thread_id, role, text);
         turn.speaker = speaker.map(str::to_owned);
         turn.latency_ms = latency_ms;

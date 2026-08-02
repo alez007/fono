@@ -689,6 +689,7 @@ mod tests {
                     tool_call_id: "t1".into(),
                     summary: "ignored".into(),
                     failed: false,
+                    sent: None,
                 }),
                 TokenDelta::text("a deployment failure.".into()),
             ],

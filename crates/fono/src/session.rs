@@ -204,7 +204,7 @@ fn backend_is_vision_capable(backend: fono_core::config::LlmBackend) -> bool {
         .is_some()
 }
 
-fn assistant_cache_warmup(
+pub(crate) fn assistant_cache_warmup(
     config: &Config,
     paths: Option<&Paths>,
     backend: (&str, bool),

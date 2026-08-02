@@ -2410,12 +2410,17 @@ function renderDoctor() {
 }
 
 // ---------- history browser ----------
-// Two tabs over what Fono has saved locally: dictation transcripts
-// (GET /api/history/dictation) and assistant conversations
-// (GET /api/history/conversations). Both show the detected speaker when
+// Two tabs over what Fono has saved locally: assistant conversations
+// (GET /api/history/conversations) and dictation transcripts
+// (GET /api/history/dictation). Both show the detected speaker when
 // speaker verification made a match. Loaded on first visit to #/history
 // and on explicit refresh — never polled.
-let histTab = 'dictation';
+//
+// Conversations open first because they are the only tab you cannot read
+// anywhere else: a transcript is a line of text the user watched being
+// typed, while a conversation is the record of what the assistant was
+// asked to do and whether it worked.
+let histTab = 'conversations';
 let histDict = null, histThreads = null, histErr = null, histBusy = false;
 let histQuery = '';
 // Thread ids the user has expanded, mapped to their loaded turns.
@@ -2517,20 +2522,76 @@ function speakerChipSuffix(name) {
 function renderTurns(turns) {
   if (turns === null) return '<p class="hint">Loading\u2026</p>';
   if (!turns.length) return '<p class="hint">This conversation has no turns.</p>';
-  const LABEL = {
-    user: 'You', assistant: 'Fono',
-    tool_call: 'Tool call', tool_result: 'Tool result',
-  };
-  return turns.map((t) => {
-    const who = t.speaker || LABEL[t.role] || t.role;
-    const meta = [fmtWhen(t.ts)];
-    if (t.latency_ms) meta.push(t.latency_ms + ' ms');
-    if (t.partial) meta.push('cut short');
-    return '<div class="turn ' + esc(t.role) + '">'
-      + '<div class="who">' + esc(who) + '</div>'
-      + '<div class="what">' + esc(t.text) + '</div>'
-      + '<div class="desc">' + esc(meta.join(' \u00b7 ')) + '</div></div>';
-  }).join('');
+  let out = '';
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t.role === 'tool_call') {
+      // A call and the reply it got are one thing that happened, so they
+      // are one block. Read as two rows they had to be paired up by eye,
+      // and the verdict — the whole reason to open a conversation — sat on
+      // the second of them.
+      const next = turns[i + 1];
+      const res = next && next.role === 'tool_result' ? turns[++i] : null;
+      out += renderCommandTurn(t, res);
+    } else if (t.role === 'tool_result') {
+      // A result whose call was never recorded still shows, rather than
+      // vanishing into a pairing rule.
+      out += renderCommandTurn(null, t);
+    } else {
+      out += renderSpokenTurn(t);
+    }
+  }
+  return '<div class="uses">' + out + '</div>';
+}
+
+// One thing said, by either side.
+function renderSpokenTurn(t) {
+  const who = t.speaker || (t.role === 'user' ? 'You' : 'Fono');
+  const meta = [fmtWhen(t.ts)];
+  if (t.latency_ms) meta.push(fmtMs(t.latency_ms));
+  if (t.partial) meta.push('cut short');
+  return '<div class="use turn ' + esc(t.role) + '">'
+    + '<div class="who">' + esc(who)
+    + '<span class="when">' + esc(meta.join(' \u00b7 ')) + '</span></div>'
+    + '<div class="what">' + esc(t.text) + '</div></div>';
+}
+
+// One command the assistant sent, and what came back.
+//
+// Laid out exactly as #/actions lays out a tool's past uses, because it is
+// the same question in a different place: which of these landed. Three
+// states, not two — a call whose fate was never recorded must not be
+// painted green, since "we did not check" and "it worked" are precisely the
+// pair worth keeping apart. The arguments line is the fold: what was sent
+// stays visible, because that is what catches a misrouted device name,
+// while the server's answer is a click away for when the arguments look
+// right and it still went wrong.
+function renderCommandTurn(call, res) {
+  const ok = res && typeof res.ok === 'boolean' ? res.ok : null;
+  const cls = ok === true ? 'good' : ok === false ? 'bad' : '';
+  const mark = ok === true ? '\u2713' : ok === false ? '\u2717' : '\u00b7';
+  const word = ok === true ? 'worked' : ok === false ? 'failed' : 'not recorded';
+  const verdict = ok === true ? 'This one landed.'
+    : ok === false ? 'This one did not land.'
+      : 'Nothing was recorded about how this one ended.';
+  const text = ((call || res).text || '').trim();
+  const cut = call ? text.indexOf(' ') : -1;
+  const name = call ? (cut < 0 ? text : text.slice(0, cut)) : '';
+  const args = call && cut >= 0 ? text.slice(cut + 1) : '';
+  const meta = fmtWhen((call || res).ts) + ' \u00b7 <b class="'
+    + (ok === false ? 'v-bad' : ok === true ? 'v-ok' : 'v-none') + '">' + esc(word) + '</b>';
+  const sent = '<span class="m">' + mark + '</span>'
+    + (name ? '<b>' + esc(name) + '</b>' : '<i>the call was not recorded</i>')
+    + (args ? ' ' + esc(args) : '');
+  const reply = res ? res.text : '';
+  return '<div class="use turn command' + (cls ? ' ' + cls : '') + '" title="'
+    + esc(verdict) + '">'
+    + '<div class="who">Command<span class="when">' + meta + '</span></div>'
+    + (reply
+      ? '<details class="got"><summary class="sent mono" title="What came back.">'
+      + sent + '</summary><div class="reply mono">' + esc(reply) + '</div></details>'
+      : '<div class="sent mono">' + sent + '</div>')
+    + '</div>';
 }
 
 function renderThreadList() {
@@ -2542,14 +2603,32 @@ function renderThreadList() {
   return histThreads.map((t) => {
     const open = histOpen.has(t.id);
     const who = (t.speakers || []).map(speakerChip).join(' ');
-    const bits = [fmtWhen(t.last_at), t.turn_count + ' turn' + (t.turn_count === 1 ? '' : 's')];
-    if (t.backend) bits.push(t.backend);
-    if (!t.ended) bits.push('still open');
+    const bits = [esc(fmtWhen(t.last_at)),
+      esc(t.turn_count + ' turn' + (t.turn_count === 1 ? '' : 's'))];
+    // The model that answered, not the backend that carried the request:
+    // "llama-local-assistant" is a name only Fono's own source explains,
+    // and it is the same word whichever model is loaded. Older rows saved
+    // before the model was recorded fall back to the backend, which is at
+    // least true.
+    if (t.model) {
+      bits.push('<span' + (t.backend ? ' title="Answered through the '
+        + esc(t.backend) + ' backend."' : '') + '>' + esc(t.model) + '</span>');
+    } else if (t.backend) {
+      bits.push(esc(t.backend));
+    }
+    // "Still open" said nothing a reader could act on. What it means is
+    // that nothing has closed this conversation, so the newest one is the
+    // one Fono carries on from when you speak again.
+    if (!t.ended) {
+      bits.push('<span title="Nothing has closed this conversation. If it is the '
+        + 'newest one, speaking again carries on from here; otherwise Fono stopped '
+        + 'before it could close it.">never closed</span>');
+    }
     return '<div class="hthread">'
       + '<div class="row hrow"><div class="info">'
       + '<div class="lbl"><button class="linkbtn" type="button" data-hthread="' + t.id + '">'
       + (open ? '\u25bc ' : '\u25b6 ') + esc(t.preview || '(no user turn)') + '</button></div>'
-      + '<div class="desc">' + esc(bits.join(' \u00b7 ')) + (who ? ' \u00b7 ' + who : '') + '</div>'
+      + '<div class="desc">' + bits.join(' \u00b7 ') + (who ? ' \u00b7 ' + who : '') + '</div>'
       + '</div><div class="ctl">'
       + '<button class="btn ghost" type="button" data-hcdel="' + t.id + '">Delete</button>'
       + '</div></div>'
@@ -2564,7 +2643,7 @@ function renderHistory() {
     + '" type="button" data-htab="' + id + '">' + label + '</button>';
   const bar = '<div class="doctor-bar">'
     + '<a class="btn ghost" href="#/settings">\u2190 Settings</a>'
-    + tab('dictation', 'Dictation') + tab('conversations', 'Conversations')
+    + tab('conversations', 'Conversations') + tab('dictation', 'Dictation')
     + '<span class="hint" style="margin-left:auto">' + (histBusy ? 'loading\u2026' : '') + '</span>'
     + '<button class="btn ghost" type="button" id="hclear">Clear all</button>'
     + '<button class="btn" type="button" id="hrefresh"' + (histBusy ? ' disabled' : '') + '>Refresh</button>'
@@ -2842,7 +2921,7 @@ function actUses(t) {
     }
     return '';
   }
-  let out = '<div class="act-uses">';
+  let out = '<div class="uses">';
   for (const u of uses) {
     // Three states, not two. A call whose fate was never recorded must not be
     // painted green: "we did not check" and "it worked" are exactly the pair

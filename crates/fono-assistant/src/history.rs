@@ -78,7 +78,9 @@ pub struct ChatTurn {
 ///   history is considered stale and snapshot returns empty.
 /// * **Max-turn cap**: independent of the window, retain at most
 ///   `max_turns` recent turns. Bounds input-token cost on long
-///   continuous flows.
+///   continuous flows. Reaching the cap trims back to half of it, so
+///   the history oscillates rather than sitting pinned at the ceiling
+///   and shedding a turn per push — see [`Self::trim_max_turns`].
 #[derive(Debug, Clone)]
 pub struct ConversationHistory {
     turns: VecDeque<ChatTurn>,
@@ -189,10 +191,24 @@ impl ConversationHistory {
     }
 
     fn trim_max_turns(&mut self) {
-        if self.max_turns == 0 {
+        if self.max_turns == 0 || self.turns.len() <= self.max_turns {
             return;
         }
-        while self.turns.len() > self.max_turns {
+        // Trim well below the cap rather than back to it.
+        //
+        // Dropping one turn per push holds the history at the cap and moves
+        // every survivor to a new position. The prompt renders turns in order,
+        // so the cached prefix diverges at the first survivor and the whole
+        // conversation is re-read — on every turn, for as long as the
+        // conversation lasts. That re-read is seconds of prefill, and it was
+        // paid on turn after turn once the cap was reached. Halving pays it
+        // once per half-cap turns and appends cheaply in between.
+        //
+        // The cost is a shallower conversation on average. That is the right
+        // way round: the cap is here to bound input-token cost, not to promise
+        // a recall depth.
+        let target = (self.max_turns / 2).max(1);
+        while self.turns.len() > target {
             self.turns.pop_front();
         }
     }
@@ -231,16 +247,44 @@ mod tests {
     }
 
     #[test]
-    fn max_turns_cap_drops_oldest() {
-        let mut h = ConversationHistory::new(Duration::from_secs(60), 3);
-        h.push_user("a".into());
-        h.push_assistant("b".into());
-        h.push_user("c".into());
-        h.push_assistant("d".into());
+    fn max_turns_cap_is_never_exceeded() {
+        let mut h = ConversationHistory::new(Duration::from_secs(60), 4);
+        for i in 0..20 {
+            h.push_user(format!("u{i}"));
+            assert!(h.snapshot().len() <= 4);
+        }
+    }
+
+    #[test]
+    fn reaching_the_cap_trims_to_half_and_then_appends_cheaply() {
+        // Trimming back to the cap would shift every survivor and force the
+        // whole conversation to be re-read on every following turn. Trimming to
+        // half pays that once, then several turns append without dropping
+        // anything and stay a clean extension of the cached prefix.
+        let mut h = ConversationHistory::new(Duration::from_secs(60), 4);
+        for i in 0..5 {
+            h.push_user(format!("u{i}"));
+        }
         let snap = h.snapshot();
-        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].content, "u3");
+        assert_eq!(snap[1].content, "u4");
+
+        h.push_user("u5".into());
+        h.push_user("u6".into());
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 4, "the two pushes after a trim must not drop anything");
+        assert_eq!(snap[0].content, "u3", "the front must not move between trims");
+    }
+
+    #[test]
+    fn a_cap_of_one_still_keeps_the_latest_turn() {
+        let mut h = ConversationHistory::new(Duration::from_secs(60), 1);
+        h.push_user("a".into());
+        h.push_user("b".into());
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].content, "b");
-        assert_eq!(snap[2].content, "d");
     }
 
     #[test]

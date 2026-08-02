@@ -43,6 +43,6 @@ pub use history::{ChatRole, ChatTurn, ConversationHistory, ToolCall};
 pub use traits::{
     compose_head, compose_system_prompt, ActionTools, Assistant, AssistantCacheTrigger,
     AssistantContext, AssistantPromptCacheSnapshot, AssistantPromptCacheWarmup, RealtimeAssistant,
-    RealtimeEvent, RealtimeMode, RealtimeSession, ScreenCaptureFn, TokenDelta, ToolEvent,
+    RealtimeEvent, RealtimeMode, RealtimeSession, Said, ScreenCaptureFn, TokenDelta, ToolEvent,
     ToolExecFn, ToolOutcome,
 };

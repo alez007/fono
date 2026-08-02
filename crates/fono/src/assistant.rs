@@ -68,6 +68,11 @@ pub struct TurnRecord {
     /// Whether the user cut the reply off part way through. A truncated
     /// reply is not evidence of a model that replied badly.
     pub aborted: bool,
+    /// Turn start → the reply is complete. This is what the user waits
+    /// for, and it deliberately stops short of the reading hold that
+    /// keeps the panel on screen afterwards: the hold is how long the
+    /// answer stays legible, not how long the answer took.
+    pub took: std::time::Duration,
 }
 
 /// One tool call and the result the model read back.
@@ -113,6 +118,37 @@ impl TurnRecord {
             c.failed = failed;
         }
     }
+}
+
+/// For each event, the arguments the call it announces actually reached its
+/// server with — `None` when they were sent exactly as the model wrote them.
+///
+/// A call is announced before it runs, so what was asked of the server is only
+/// settled by the result that follows it: the executor drops the fields the
+/// model left blank and corrects what the home has already stated about a
+/// device. Without this the transcript showed the model's draft — one user read
+/// `"floor": ""` in their own history and concluded, reasonably, that the
+/// blank-dropping was not happening.
+///
+/// Read forward to the next result rather than matched on the call id, because
+/// a corrected second attempt may carry the id of the call it replaces, and
+/// stream order cannot.
+fn args_as_sent(events: &[fono_assistant::ToolEvent]) -> Vec<Option<String>> {
+    use fono_assistant::ToolEvent;
+    events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| match e {
+            ToolEvent::Called(_) => events[i + 1..]
+                .iter()
+                .take_while(|later| !matches!(later, ToolEvent::Called(_)))
+                .find_map(|later| match later {
+                    ToolEvent::Result { sent, .. } => sent.clone(),
+                    ToolEvent::Called(_) => None,
+                }),
+            ToolEvent::Result { .. } => None,
+        })
+        .collect()
 }
 
 /// Per-orchestrator assistant state. Owned by the
@@ -648,7 +684,10 @@ pub async fn run_assistant_turn(
         let snapshot = s.history.snapshot();
         s.history.push_user(user_text.clone());
         // Mirror the same turn to disk, carrying the verified speaker so
-        // the history page can show who was talking (ADR 0040).
+        // the history page can show who was talking (ADR 0040), and the
+        // model's own name so the saved conversation says which model
+        // answered rather than which backend carried the request.
+        s.log.set_model(assistant.model());
         s.log.record_user(&user_text, metrics.speaker.as_deref(), Some(assistant.name()));
         drop(s);
         if let Some(t) = &trace {
@@ -666,6 +705,13 @@ pub async fn run_assistant_turn(
     // 2b. A phrase Fono has already got right twice, unprompted: run it now.
     //     Deliberately after the history push, so the turn reads the same
     //     afterwards whether the model was consulted or not.
+    // The request itself, for the executor to hold the model's arguments
+    // against: a number in a call the user never said one for is the wrong
+    // tool, and nothing but the words can tell. Before the replay below, which
+    // runs a command through the same executor.
+    if let Some(tools) = &actions {
+        tools.said.heard(&user_text);
+    }
     let replayed = match &actions {
         Some(tools) => crate::actions::replay(&learning, tools, &user_text).await,
         None => None,
@@ -989,7 +1035,7 @@ pub async fn run_assistant_turn(
                     tool_started
                         .insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
                 }
-                ToolEvent::Result { tool_call_id, summary, failed } => {
+                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
                     if let Some((name, started_at)) = tool_started.remove(tool_call_id) {
                         let exec_ms = started_at.elapsed().as_millis() as u64;
                         let outcome = classify_tool_outcome(summary, *failed);
@@ -1139,17 +1185,19 @@ pub async fn run_assistant_turn(
         // the turn that just finished, and a turn that failed before reaching
         // this point must not leave the previous turn's calls on display.
         let mut record = TurnRecord { aborted: aborted_mid_stream, ..TurnRecord::default() };
-        for event in tool_event_log {
+        let as_sent = args_as_sent(&tool_event_log);
+        for (i, event) in tool_event_log.into_iter().enumerate() {
             match event {
                 ToolEvent::Called(call) => {
                     // Persist before the move: the rolling log takes
                     // ownership, but the audit trail wants name + args.
-                    s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
+                    let args = as_sent[i].clone().unwrap_or_else(|| call.arguments.clone());
+                    s.log.record_tool_call(&call.name, &args, Some(provider));
                     record.called(&call);
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, failed } => {
+                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
                     s.log.record_tool_result(&summary, failed, Some(provider));
                     record.answered(&summary, failed);
                     s.history.push_tool_result(tool_call_id, summary);
@@ -1165,6 +1213,7 @@ pub async fn run_assistant_turn(
             record.reply = full_reply.trim().to_string();
             s.history.push_assistant(full_reply.trim().to_string());
         }
+        record.took = turn_started.elapsed();
         s.last_turn = record;
         if acted {
             forget_after_action(&mut s.history);
@@ -1403,7 +1452,7 @@ async fn drive_text_only_reply(
                     tool_started
                         .insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
                 }
-                ToolEvent::Result { tool_call_id, summary, failed } => {
+                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
                     if let Some((name, started_at)) = tool_started.remove(tool_call_id) {
                         let exec_ms = started_at.elapsed().as_millis() as u64;
                         let outcome = classify_tool_outcome(summary, *failed);
@@ -1440,15 +1489,17 @@ async fn drive_text_only_reply(
         let mut s = state.lock().await;
         let mut acted = false;
         let mut record = TurnRecord { aborted: aborted_mid_stream, ..TurnRecord::default() };
-        for event in tool_event_log {
+        let as_sent = args_as_sent(&tool_event_log);
+        for (i, event) in tool_event_log.into_iter().enumerate() {
             match event {
                 ToolEvent::Called(call) => {
-                    s.log.record_tool_call(&call.name, &call.arguments, Some(provider));
+                    let args = as_sent[i].clone().unwrap_or_else(|| call.arguments.clone());
+                    s.log.record_tool_call(&call.name, &args, Some(provider));
                     record.called(&call);
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, failed } => {
+                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
                     s.log.record_tool_result(&summary, failed, Some(provider));
                     record.answered(&summary, failed);
                     s.history.push_tool_result(tool_call_id, summary);
@@ -1460,6 +1511,7 @@ async fn drive_text_only_reply(
             record.reply = full_reply.trim().to_string();
             s.history.push_assistant(full_reply.trim().to_string());
         }
+        record.took = turn_started.elapsed();
         s.last_turn = record;
         if acted {
             forget_after_action(&mut s.history);

@@ -498,6 +498,10 @@ impl Assistant for OpenAiCompatChat {
         self.backend_name
     }
 
+    fn model(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
     /// This backend speaks the OpenAI function-calling wire format, so the
     /// user's tools reach the model and the calls come back parsed.
     fn can_run_actions(&self) -> bool {
@@ -606,6 +610,7 @@ impl Assistant for OpenAiCompatChat {
                             tool_call_id: call.id.clone(),
                             summary: outcome.summary.clone(),
                             failed: outcome.failed,
+                            sent: outcome.sent.clone(),
                         })))
                         .await;
                     append_tool_result(&mut messages, &call, &outcome.summary);
@@ -675,6 +680,7 @@ impl Assistant for OpenAiCompatChat {
                             tool_call_id: call.id.clone(),
                             summary,
                             failed: true,
+                            sent: None,
                         })))
                         .await;
                     let _ = tx.send(Ok(TokenDelta::text(sentence.to_string()))).await;
@@ -692,6 +698,7 @@ impl Assistant for OpenAiCompatChat {
                     tool_call_id: call.id.clone(),
                     summary: summary.clone(),
                     failed: false,
+                    sent: None,
                 })))
                 .await;
 

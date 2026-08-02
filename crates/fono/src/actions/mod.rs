@@ -257,6 +257,7 @@ async fn run_again(
             tool_call_id: "replay".to_string(),
             summary: out.summary,
             failed: false,
+            sent: out.sent,
         }),
     ])
 }
@@ -418,6 +419,11 @@ pub fn build(
     info!("actions: {} tools offered to the assistant", descriptors.len());
 
     let runnable = Arc::new(runnable);
+    // Per turn, like everything else here: `build` runs once per turn, so the
+    // words this turn is about and the one refusal each tool gets both start
+    // fresh.
+    let words = Arc::new(Words::default());
+    let said = words.said.clone();
     let house = Arc::new(HouseFacts::learn(
         &store,
         &offered.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
@@ -431,12 +437,13 @@ pub fn build(
     let execute: fono_assistant::ToolExecFn = Arc::new(move |call: ToolCall| {
         let runnable = runnable.clone();
         let house = house.clone();
+        let words = words.clone();
         let journal = journal.clone();
         Box::pin(async move {
             let name = call.name.clone();
             let think = journal.take_think_time();
             let started = std::time::Instant::now();
-            let ran = run_one(&runnable, &house, call).await;
+            let ran = run_one(&runnable, &house, &words, call).await;
             // Filed against the server that offers it, so a name published by
             // two servers cannot credit the wrong one. A call to a tool nobody
             // offers has no row to write to and is simply not recorded.
@@ -444,7 +451,15 @@ pub fn build(
                 journal.note(&r.source, &name, &ran, think, started.elapsed());
             }
             journal.resumed();
-            ran.out
+            // What the server was actually asked travels with the outcome, so
+            // the record shows the call as it left rather than as it arrived.
+            // So does whether the world itself was read afterwards and agreed:
+            // that, and not the server saying "done", is what lets a caller
+            // treat the command as reported without asking the model again.
+            let mut out = ran.out;
+            out.sent = Some(ran.sent);
+            out.confirmed = matches!(ran.how, RunOutcome::Confirmed);
+            out
         })
     });
     let hint = cfg.assistant.tools.place_names.then(|| area_hint(&store)).flatten();
@@ -452,7 +467,7 @@ pub fn build(
     // These names go to the assistant model and nowhere else — never to the
     // speech recogniser, which is frequently a cloud service chosen for audio
     // alone. See `docs/privacy.md`.
-    Some(Arc::new(ActionTools { descriptors, execute, hint, grammar }))
+    Some(Arc::new(ActionTools { descriptors, execute, hint, grammar, said }))
 }
 
 /// The rails a local model is held to while it writes a command.
@@ -815,15 +830,9 @@ fn written_hint(store: &ToolCatalogStore, arm: HintArm) -> Option<String> {
     // out the conversation. A truncated list would be worse than none: the
     // model would conclude a real device does not exist and say so.
     if arm != HintArm::NoDevices {
-        if let Ok(devices) = store.device_names() {
+        if let Ok(devices) = store.devices() {
             if !devices.is_empty() && devices.len() <= MAX_LISTED_DEVICES {
-                let _ = write!(
-                    hint,
-                    "\nDevices in this home, named exactly as they must be used: {}. \
-                     Use one of these names verbatim — the home matches a name only exactly, \
-                     so a shortened name or one with the words in a different order finds nothing.",
-                    devices.join(", ")
-                );
+                hint.push_str(&by_kind(&devices));
             } else if devices.len() > MAX_LISTED_DEVICES {
                 debug!(
                     "actions: {} devices is too many to name in the prompt; \
@@ -836,25 +845,69 @@ fn written_hint(store: &ToolCatalogStore, arm: HintArm) -> Option<String> {
     Some(hint)
 }
 
+/// The devices, one line per kind, with the kind written as the value the
+/// `domain` argument takes.
+///
+/// The kind is the only thing that stops a name being read for what it sounds
+/// like. Asked to switch an air conditioner on, a model sent
+/// `{"area": "Office", "domain": ["light"]}` — `light` is the domain with the
+/// most training behind it, and a flat list of names offered nothing to
+/// contradict it. It is worse than a guess in the other direction too: this
+/// home has a `switch` called "Entrance lights" and another called "Basement
+/// lights", so the obvious domain for either finds nothing at all.
+///
+/// Grouping is what makes that mapping available, and it is close to free: on
+/// a 79-device home the whole hint moves by four characters, because one label
+/// per kind is paid for by a header shorter than the sentence about exact names
+/// it replaces.
+///
+/// Devices whose kind the server never stated are labelled as unknown rather
+/// than guessed at — a wrong domain is a call that silently reaches nothing.
+fn by_kind(devices: &[fono_core::tool_catalog::Device]) -> String {
+    let mut out = String::from(
+        "\nDevices by kind — the kind is the `domain`. Names work only exactly as written:",
+    );
+    // `devices()` is already ordered by kind then name, so one pass groups it.
+    let mut kind: Option<&str> = None;
+    for d in devices {
+        if kind == Some(d.domain.as_str()) {
+            out.push_str(", ");
+        } else {
+            kind = Some(&d.domain);
+            let label = if d.domain.is_empty() { "kind unknown" } else { &d.domain };
+            let _ = write!(out, "\n{label}: ");
+        }
+        out.push_str(&d.name);
+    }
+    out
+}
+
 /// The rules, one per entry, numbered where they are written.
 ///
 /// Split out so a measurement can leave some of them out without the numbering
 /// or the wording drifting between arms.
+///
+/// Two details in rule 2 are deliberate. The worked example uses `climate`
+/// rather than `light`, because the device list below already says which kind
+/// each device is, and `light` there primed the one domain the model over-reaches
+/// for — a run sent `["light"]` for an air conditioner three times in four.
+/// And `__all__` is named, because the rails make the field compulsory and
+/// offer that value as the way to still say "everything in here": unexplained,
+/// a model that means it has to either guess or file it under one kind. Fono
+/// takes the value back out before the call leaves, on every backend.
 const RULES: [&str; 6] = [
     "Never translate or invent an area or device name — pick the closest one listed.",
-    "Whenever the user says which kind of device they mean — the lights, the heating, \
-     the blinds — the domain is required, for example {\"area\": \"Master bedroom\", \
-     \"domain\": [\"light\"]}. Leave the domain out only when the user really meant \
-     everything in the area, because without it the command reaches every switchable \
-     device there and will open the blinds and start the air conditioning.",
+    "When the user says which kind of device they mean — the lights, the heating, the blinds — \
+     the domain is required, e.g. {\"area\": \"Master bedroom\", \"domain\": [\"climate\"]}. \
+     Write [\"__all__\"] only when they meant every device in the area.",
     "One call for an area, not one per device: an area plus a domain is a single call.",
-    "When the user names a device rather than an area, act on it by that name and do \
-     not narrow the search to an area: a device's name often mentions somewhere it is not.",
-    "Use the simplest tool that does what was asked. A tool that sets brightness, \
-     colour or temperature is only for when the user asked for that value; to switch \
-     something on or off, use the plain on/off tool.",
-    "Fill in only the arguments the user actually asked for. Never invent a value \
-     because the tool offers the field.",
+    "When the user names a device, act on it by that name and add no area: a device's name \
+     often mentions somewhere it is not.",
+    "Use the simplest tool that does what was asked: a brightness, colour or temperature tool \
+     only when the request named that value, the plain on/off tool to switch something on or \
+     off.",
+    "Fill in only what the user asked for. If a tool cannot be called without a value nobody \
+     gave, it is the wrong tool.",
 ];
 
 /// Which parts of the hint to write, for measurement only.
@@ -1054,9 +1107,16 @@ impl HouseFacts {
     /// run, each time after the kind had been corrected successfully. An area
     /// beside a name can only ever *narrow*, so on a name only one device
     /// answers to it can only narrow wrongly. It is dropped, along with
-    /// anything an area is itself inside. Not corrected: the catalogue records
-    /// what a device is and not where, so there is no right value to write —
-    /// but there is a value that is never needed.
+    /// anything an area is itself inside and any class of device. Not
+    /// corrected: the catalogue records what a device is and not where, so
+    /// there is no right value to write — but there is a value that is never
+    /// needed.
+    ///
+    /// **The storey.** The same argument one rung out, and it needs no device
+    /// name: a command that names an area does not need to say which floor the
+    /// area is on, and a run showed the model *adding* `floor: "1"` on its
+    /// second attempt at a bedroom the house then failed to find. Whatever
+    /// narrows furthest is kept and everything wider than it goes.
     ///
     /// Silent when the named device is unknown to us, when the name is shared
     /// by two devices (there the area is the only thing telling them apart),
@@ -1064,40 +1124,57 @@ impl HouseFacts {
     /// not know. In each of those the call goes out exactly as written.
     fn agree(&self, args: serde_json::Value) -> (serde_json::Value, Option<String>) {
         use serde_json::Value;
-        let Some(device_field) = self.slots.device else { return (args, None) };
         let Some(map) = args.as_object() else { return (args, None) };
-        let Some(named) = map.get(device_field).and_then(|v| v.as_str()) else {
-            return (args, None);
-        };
-        let key = named.trim().to_lowercase();
         let mut map = map.clone();
         let mut notes = Vec::new();
-        if let (Some(kind_field), Some(kind)) = (self.slots.kind, self.kind_of.get(&key)) {
-            if let Some(written) = map.get(kind_field) {
-                let agrees = match written {
-                    Value::String(s) => Some(s == kind),
-                    Value::Array(a) => Some(a.len() == 1 && a[0].as_str() == Some(kind.as_str())),
-                    // Anything else is not a kind we can read, so nothing is claimed.
-                    _ => None,
-                };
-                if agrees == Some(false) {
-                    notes.push(format!(
-                        "{kind_field} was {}, but this home says {named} is a {kind}",
-                        written.to_string().trim_matches('"')
-                    ));
-                    let fixed = match written {
-                        Value::Array(_) => Value::Array(vec![Value::String(kind.clone())]),
-                        _ => Value::String(kind.clone()),
+        let named = self
+            .slots
+            .device
+            .and_then(|f| map.get(f))
+            .and_then(|v| v.as_str())
+            .map(|n| n.trim().to_string());
+
+        if let Some(named) = &named {
+            let key = named.to_lowercase();
+            if let (Some(kind_field), Some(kind)) = (self.slots.kind, self.kind_of.get(&key)) {
+                if let Some(written) = map.get(kind_field) {
+                    let agrees = match written {
+                        Value::String(s) => Some(s == kind),
+                        Value::Array(a) => {
+                            Some(a.len() == 1 && a[0].as_str() == Some(kind.as_str()))
+                        }
+                        // Anything else is not a kind we can read, so nothing is claimed.
+                        _ => None,
                     };
-                    map.insert(kind_field.to_string(), fixed);
+                    if agrees == Some(false) {
+                        notes.push(format!(
+                            "{kind_field} was {}, but this home says {named} is a {kind}",
+                            written.to_string().trim_matches('"')
+                        ));
+                        let fixed = match written {
+                            Value::Array(_) => Value::Array(vec![Value::String(kind.clone())]),
+                            _ => Value::String(kind.clone()),
+                        };
+                        map.insert(kind_field.to_string(), fixed);
+                    }
+                }
+            }
+            if self.sole.contains(&key) {
+                let wider = [self.slots.place, self.slots.wider_place, self.slots.filter];
+                for field in wider.into_iter().flatten() {
+                    if map.remove(field).is_some() {
+                        notes.push(format!(
+                            "{field} was dropped: {named} is one device in this home"
+                        ));
+                    }
                 }
             }
         }
-        if self.sole.contains(&key) {
-            for field in [self.slots.place, self.slots.wider_place].into_iter().flatten() {
-                if map.remove(field).is_some() {
-                    notes.push(format!("{field} was dropped: {named} is one device in this home"));
-                }
+        // Nothing narrower than an area was given, so the area is the target
+        // and anything containing it is one more thing to get wrong.
+        if let (Some(place), Some(wider)) = (self.slots.place, self.slots.wider_place) {
+            if map.contains_key(place) && map.remove(wider).is_some() {
+                notes.push(format!("{wider} was dropped: the {place} already says where"));
             }
         }
         if notes.is_empty() {
@@ -1105,6 +1182,69 @@ impl HouseFacts {
         }
         (Value::Object(map), Some(notes.join("; ")))
     }
+}
+
+/// Never send a number the user did not ask for.
+///
+/// The defect this exists for: asked in plain words to switch an air
+/// conditioner off, a local model called the tool that *sets a temperature*
+/// and wrote `"temperature": 0`. Nothing already here can catch that. The
+/// value is the type the schema asks for, so the schema check passes it; it is
+/// not blank, so the blank check passes it; and it is required by that tool, so
+/// it cannot simply be removed. The tool is wrong, and the only evidence of
+/// that is the request: nobody said a number.
+///
+/// So that is the test, and it is deliberately the crudest one that works —
+/// **if the request contains no digit anywhere, a numeric argument was
+/// invented**. Digits are the same in every language, which is what makes this
+/// work on a Romanian sentence without a translation table, a locale, or a word
+/// list to maintain. It needs nothing from the server and nothing from the
+/// model, so it holds on a cloud backend exactly as it does on a local one.
+///
+/// One outcome, and it is the same whichever field the number is in: the call
+/// stays at home, and the complaint names the number and says the request had
+/// none. Nothing is quietly deleted. That was tried first — drop the number
+/// where the schema calls it optional, keep the call — and it fails in both
+/// directions at once. Home Assistant marks nothing required, so *"turn the air
+/// conditioner off"* went out as
+/// `HassClimateSetTemperature {"name": "Air conditioner"}`, a tool asked to set
+/// a temperature and given none; the house refused it and the user heard
+/// silence. And on *"set the Couch Blue to thirty percent"* the same rule threw
+/// away the one value the user had asked for, because "thirty" is not a digit.
+/// Asking is right in both: the model either writes the call again, or writes a
+/// better one.
+///
+/// The escape hatch is at the call site: this fires once per tool per turn, and
+/// the refusal marks itself repeatable, so a model that writes the same call
+/// again gets it sent. That covers the one way the test can be wrong — a
+/// recogniser that writes "seventy" instead of "70" — at the price of one extra
+/// round trip. Both halves were learned the hard way on *"set the volume to
+/// seventy"*: with the hatch unreachable, and then with a complaint that called
+/// the tool wrong outright, the model answered that no tool for setting a value
+/// existed, deleted the volume, and the display never moved. So the complaint
+/// states the evidence and offers both readings of it, and picks neither.
+fn numbers_nobody_asked_for(
+    args: serde_json::Value,
+    said: &str,
+) -> (serde_json::Value, Option<String>) {
+    // Empty means the words were never recorded, which is no evidence at all —
+    // and a number is only suspect where there is something to compare it to.
+    if said.trim().is_empty() || said.chars().any(char::is_numeric) {
+        return (args, None);
+    }
+    let Some(map) = args.as_object() else { return (args, None) };
+    let unasked: Vec<String> =
+        map.iter().filter(|(_, v)| v.is_number()).map(|(k, v)| format!("{k} ({v})")).collect();
+    let complaint = (!unasked.is_empty()).then(|| {
+        format!(
+            "nothing in what the user said is a number, so {} came from nowhere. If they did ask \
+             for that value, in words rather than digits, write this same call again and it will \
+             be sent. If they only asked to switch something on or off, use the plain on/off \
+             tool instead.",
+            unasked.join(" and ")
+        )
+    });
+    (args, complaint)
 }
 
 /// Check the arguments against what the server said it accepts.
@@ -1278,18 +1418,19 @@ async fn execute(
 /// The arguments as they will actually be sent, or the complaint that keeps the
 /// call at home.
 ///
-/// Three steps in this order: drop what says nothing, let the house settle what
-/// it already knows about the device named, and only then check the arguments
-/// against the schema the model was shown. Nothing has left when this returns,
-/// so a complaint costs nothing to act on.
+/// Four steps in this order: drop what says nothing, let the house settle what
+/// it already knows about the device named, take out numbers nobody asked for,
+/// and only then check what is left against the schema the model was shown.
+/// Nothing has left when this returns, so a complaint costs nothing to act on.
 ///
 /// The `Err` carries what *would* have been sent beside the complaint, because a
 /// run is recorded by the arguments it used whether or not they travelled.
 fn prepare_args(
     r: &Runnable,
     house: &HouseFacts,
+    words: &Words,
     call: &ToolCall,
-) -> Result<serde_json::Value, (String, String)> {
+) -> Result<serde_json::Value, Refusal> {
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let args = drop_empty_arguments(drop_any_kind(args));
@@ -1305,6 +1446,32 @@ fn prepare_args(
         );
     }
 
+    // Only on the first go at this tool. A model that writes the same number
+    // again is insisting, and the one way this check can be wrong — a
+    // recogniser that spelled a number out in words — needs a way through.
+    let args = if words.first_attempt_at(&call.name) {
+        let (args, unasked) = numbers_nobody_asked_for(args, &words.said.words());
+        if let Some(complaint) = unasked {
+            warn!(tool = %call.name, args = %call.arguments, "actions: not sending {}: {complaint}", call.name);
+            current_instant(
+                "tool.rejected",
+                "actions",
+                ACTIONS_LANE,
+                serde_json::json!({ "tool": call.name, "args": args, "complaint": complaint }),
+            );
+            return Err(Refusal {
+                sent: args.to_string(),
+                complaint: format!("{} was not sent: {complaint}", call.name),
+                // The refusal rests on a guess about the request, and the
+                // complaint tells the model how to say the guess was wrong.
+                repeat_ok: true,
+            });
+        }
+        args
+    } else {
+        args
+    };
+
     // Never sent, so nothing moved and a correction is free. The complaint is
     // phrased against the schema the model was shown, which is a more useful
     // thing to hand back than the server's rejection of the whole payload.
@@ -1316,18 +1483,65 @@ fn prepare_args(
             ACTIONS_LANE,
             serde_json::json!({ "tool": call.name, "args": args, "complaint": complaint }),
         );
-        return Err((args.to_string(), format!("{} was not sent: {complaint}.", call.name)));
+        return Err(Refusal {
+            sent: args.to_string(),
+            complaint: format!("{} was not sent: {complaint}.", call.name),
+            repeat_ok: false,
+        });
     }
     Ok(args)
+}
+
+/// A call Fono would not send, and what to tell the model about it.
+struct Refusal {
+    /// What would have gone out, so the run is recorded by the arguments it
+    /// used whether or not they travelled.
+    sent: String,
+    /// The reason, in the model's hands, phrased as something to act on.
+    complaint: String,
+    /// Whether writing the same call again is worth sending. See
+    /// [`ToolOutcome::repeat_ok`].
+    repeat_ok: bool,
+}
+
+/// What the user said this turn, and which tools have already been told a
+/// number in their arguments was never asked for.
+///
+/// One per turn, because both halves are: the words change every turn, and a
+/// tool that has spent its one refusal must get through on its next attempt.
+#[derive(Default)]
+struct Words {
+    said: fono_assistant::Said,
+    told: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl Words {
+    /// Is this the first call to this tool in this turn? Records it on the way
+    /// past, so the answer is `false` from then on.
+    ///
+    /// A poisoned lock answers `false`, which lets the call through unchecked —
+    /// the safe direction, since the worst a missed check costs is the wrong
+    /// tool running, and the worst a wrongly applied one costs is a command the
+    /// user asked for never happening.
+    fn first_attempt_at(&self, tool: &str) -> bool {
+        self.told.lock().map(|mut told| told.insert(tool.to_string())).unwrap_or(false)
+    }
 }
 
 /// Run one call the model asked for and describe what happened.
 ///
 /// Never returns an error: a tool that failed is the news, not a fault in
 /// the turn, and the user has to hear it.
+///
+/// Long because it is a ladder, and the rungs only mean anything in order —
+/// each one is a stronger claim about what happened than the one below it, and
+/// splitting them into functions would hide which claim a given answer rests
+/// on.
+#[allow(clippy::too_many_lines)]
 async fn run_one(
     runnable: &std::collections::HashMap<String, Runnable>,
     house: &HouseFacts,
+    words: &Words,
     call: ToolCall,
 ) -> Ran {
     // Two ways for a call to end badly, and they are not equally safe to
@@ -1345,6 +1559,10 @@ async fn run_one(
             summary: format!("{s} {RETRY_INVITATION}"),
             failed: true,
             retryable: true,
+            // Filled in once, where the outcome leaves the executor.
+            sent: None,
+            repeat_ok: false,
+            confirmed: false,
         },
         how: RunOutcome::Failed,
         targets: Vec::new(),
@@ -1357,9 +1575,13 @@ async fn run_one(
             format!("There is no tool called {}.", call.name),
         );
     };
-    let args = match prepare_args(r, house, &call) {
+    let args = match prepare_args(r, house, words, &call) {
         Ok(args) => args,
-        Err((sent, complaint)) => return nothing_happened(&sent, complaint),
+        Err(no) => {
+            let mut ran = nothing_happened(&no.sent, no.complaint);
+            ran.out.repeat_ok = no.repeat_ok;
+            return ran;
+        }
     };
 
     let sent = args.to_string();
@@ -1397,6 +1619,11 @@ async fn run_one(
             },
             failed: true,
             retryable: vendor.repeatable(&call.name),
+            sent: None,
+            // Something in the world may already have moved, so a repeat is
+            // never a free question here.
+            repeat_ok: false,
+            confirmed: false,
         },
         how: RunOutcome::Failed,
         targets: touched.clone(),
@@ -1444,10 +1671,13 @@ async fn run_one(
     // check must not set it: "checked" and "the server did not complain" are
     // different claims, and the record is only worth keeping while it holds
     // them apart.
-    let mut checked = false;
+    // What a call that worked is worth handing back, in place of the server's
+    // own words for it.
+    let worked = || landed(&call.name, &touched).unwrap_or_else(|| brief(&res.text));
     match (&r.readback, r.verify) {
         (Some(rb), VerifyClass::PostCondition) if !touched.is_empty() => {
-            let looked = confirm(r, vendor, rb, &call, &res.text).await;
+            let ask = about(runnable.get(rb).map(|rb| &rb.schema), vendor.slot_fields(), &args);
+            let looked = confirm(r, vendor, rb, &ask, &call, &res.text).await;
             let reads = state_of_the_house(&looked.readings);
             match looked.verdict {
                 Some(Verdict::Contradicted) => {
@@ -1462,14 +1692,14 @@ async fn run_one(
                     ));
                 }
                 Some(Verdict::Confirmed) => {
-                    checked = true;
                     info!(tool = %call.name, "action confirmed");
+                    return ok(RunOutcome::Confirmed, format!("{}{reads}", worked()));
                 }
                 // Unproven is not disproven: the weaker rungs stand. What the
                 // house reads is still worth saying, because the alternative is
                 // a reply built on the server's word alone.
                 None if !reads.is_empty() => {
-                    return ok(RunOutcome::Accepted, format!("{}{reads}", brief(&res.text)));
+                    return ok(RunOutcome::Accepted, format!("{}{reads}", worked()));
                 }
                 None => {}
             }
@@ -1477,12 +1707,88 @@ async fn run_one(
         // Nothing observes this tool's effect, so "it was accepted" is the
         // strongest true statement available. Saying "done" here would be
         // inventing evidence.
+        //
+        // The server's own words are kept whole here, unlike every branch
+        // above: a tool that only reads *is* its answer, and shortening it to
+        // the devices it mentions would throw away the thing the model asked
+        // the question to find out.
         (_, VerifyClass::None) => {
             return ok(RunOutcome::Sent, format!("{} was sent. {}", call.name, brief(&res.text)));
         }
         _ => {}
     }
-    ok(if checked { RunOutcome::Confirmed } else { RunOutcome::Accepted }, brief(&res.text))
+    ok(RunOutcome::Accepted, worked())
+}
+
+/// What a call that worked is worth handing back to the model.
+///
+/// A server's reply to a command it carried out is written for a program, not
+/// for a reader. A stock Home Assistant answers an area-wide command with every
+/// entity it reached and a 32-character identifier for each: one measured reply
+/// ran to 3,447 characters, which is 1,090 tokens the model pays to read and
+/// pays again to answer, for a command whose whole content is "these seven
+/// things did it". The names are the only part that says anything, and Fono has
+/// already read them off the same reply.
+///
+/// `None` when the server named nothing it reached — the truth for every server
+/// Fono has no specific knowledge of, and for a call that moved a device the
+/// server did not list. The reply is handed back whole in that case.
+fn landed(tool: &str, touched: &[vendor::Target]) -> Option<String> {
+    // A long list is a command that reached a whole area, and the model does
+    // not need the roll call to answer for it. Enough names to say what kind of
+    // thing was reached, then the count.
+    const NAMED: usize = 8;
+    let names: Vec<&str> = touched.iter().filter(|t| t.landed).map(|t| t.name.as_str()).collect();
+    match names.len() {
+        0 => None,
+        n if n <= NAMED => Some(format!("{tool} reached {}.", names.join(", "))),
+        n => Some(format!(
+            "{tool} reached {} devices: {} and {} more.",
+            n,
+            names[..NAMED].join(", "),
+            n - NAMED
+        )),
+    }
+}
+
+/// Which devices to ask the house about, taken from the command just sent.
+///
+/// The readback is a second round trip to the same server, and asked bare it
+/// answers with every device in the home — a whole-house dump to check that one
+/// lamp did what it was told. Every field of the command that names *what* it
+/// was aimed at is worth repeating to the reader, and nothing else is: the
+/// value that was set says nothing about which devices to look at.
+///
+/// Both halves come from what the servers publish about themselves, so this
+/// carries no knowledge of any particular tool. The vendor's slot table already
+/// names the fields that mean a place, a device and a kind, and a field is only
+/// repeated when the reading tool's own schema advertises it and accepts the
+/// type. A reader with no such fields, or a command that named nothing, asks
+/// bare as before.
+fn about(
+    schema: Option<&serde_json::Value>,
+    slots: vendor::SlotFields,
+    sent: &serde_json::Value,
+) -> serde_json::Value {
+    let mut ask = serde_json::Map::new();
+    let props = schema.and_then(|s| s.get("properties")).and_then(|p| p.as_object());
+    if let Some(props) = props {
+        for field in [slots.place, slots.device, slots.kind].into_iter().flatten() {
+            let (Some(value), Some(spec)) = (sent.get(field), props.get(field)) else { continue };
+            // A reader that spells out a different type for the same field —
+            // one domain where the command took a list — is not being argued
+            // with. Leaving the field out reads the house widely, which is
+            // still true, where sending the wrong shape risks an error.
+            let fits = spec
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_none_or(|want| matches_json_type(want, value));
+            if fits {
+                ask.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(ask)
 }
 
 /// Re-read the world: what the vendor makes of it, and what it plainly says.
@@ -1505,15 +1811,15 @@ async fn confirm(
     r: &Runnable,
     vendor: &'static dyn Vendor,
     readback: &str,
+    ask: &serde_json::Value,
     call: &ToolCall,
     result: &str,
 ) -> Looked {
-    let empty = serde_json::json!({});
     // Sequential with `tool.execute` and never nested inside it, so the two
     // costs read off the lane separately: proving a command landed is a whole
     // extra round trip to the same server, and it is charged to the same turn.
     let span = current_span("tool.verify", "actions", ACTIONS_LANE);
-    let back = mcp_client::call_tool(&r.endpoint, readback, &empty).await;
+    let back = mcp_client::call_tool(&r.endpoint, readback, ask).await;
     let looked = match &back {
         Ok(back) => Looked {
             verdict: vendor.confirms(call, result, &back.text),
@@ -1563,23 +1869,29 @@ fn state_of_the_house(readings: &[(String, String)]) -> String {
     )
 }
 
-/// Servers can be chatty, and every extra token here is paid for twice —
-/// once reading it, once replying to it. The cap is nonetheless generous,
-/// because the part a server puts last is often the part that says what
-/// went wrong: Home Assistant's result ends with its list of failures, and
-/// a tighter limit cut exactly that off, leaving the model reading an
-/// apparently clean success. Trimming is visible (`…`) so a truncated
-/// result is never mistaken for a complete one.
+/// Servers can be chatty, and every extra token here is paid for twice — once
+/// reading it, once replying to it.
+///
+/// What survives is the start and the end, because the part a server puts last
+/// is often the part that says what went wrong: Home Assistant's result ends
+/// with its list of failures, and an earlier head-only cap cut exactly that
+/// off, leaving the model reading an apparently clean success. Keeping both
+/// ends is what lets the cap be tight rather than generous. Trimming is visible
+/// (`…`) so a shortened result is never mistaken for a complete one.
 fn brief(text: &str) -> String {
-    const MAX: usize = 2000;
+    const HEAD: usize = 700;
+    const TAIL: usize = 500;
     let t = text.trim();
     if t.is_empty() {
         return "Done.".into();
     }
-    match t.char_indices().nth(MAX) {
-        Some((i, _)) => format!("{}…", &t[..i]),
-        None => t.to_string(),
+    let count = t.chars().count();
+    if count <= HEAD + TAIL {
+        return t.to_string();
     }
+    let head_end = t.char_indices().nth(HEAD).map_or(t.len(), |(i, _)| i);
+    let tail_start = t.char_indices().nth(count - TAIL).map_or(t.len(), |(i, _)| i);
+    format!("{}…{}", &t[..head_end], &t[tail_start..])
 }
 
 #[cfg(test)]
@@ -1613,8 +1925,13 @@ mod tests {
     /// dropped — otherwise the model waits for a result that never comes.
     #[tokio::test]
     async fn an_unknown_tool_is_reported() {
-        let ran =
-            run_one(&tools(VerifyClass::PostCondition), &HouseFacts::default(), call("Nope")).await;
+        let ran = run_one(
+            &tools(VerifyClass::PostCondition),
+            &HouseFacts::default(),
+            &Words::default(),
+            call("Nope"),
+        )
+        .await;
         assert!(ran.out.failed, "an unknown tool is not a success");
         assert!(ran.out.summary.contains("no tool called Nope"), "{}", ran.out.summary);
         assert_eq!(ran.how, RunOutcome::Failed);
@@ -1624,9 +1941,13 @@ mod tests {
     /// rather than the turn failing or, worse, claiming success.
     #[tokio::test]
     async fn an_unreachable_server_is_reported_not_claimed_done() {
-        let ran =
-            run_one(&tools(VerifyClass::PostCondition), &HouseFacts::default(), call("HassTurnOn"))
-                .await;
+        let ran = run_one(
+            &tools(VerifyClass::PostCondition),
+            &HouseFacts::default(),
+            &Words::default(),
+            call("HassTurnOn"),
+        )
+        .await;
         assert!(ran.out.failed, "unreachable must not be logged as a success");
         assert!(ran.out.summary.starts_with("HassTurnOn could not be run"), "{}", ran.out.summary);
         assert!(!ran.out.summary.to_lowercase().contains("done"), "{}", ran.out.summary);
@@ -1710,15 +2031,17 @@ mod tests {
         kind_of.insert("air conditioner".to_string(), "climate".to_string());
         kind_of.insert("balcony lights".to_string(), "light".to_string());
         let sole = ["air conditioner", "balcony lights"].into_iter().map(String::from).collect();
-        HouseFacts {
-            slots: vendor::SlotFields {
-                place: Some("area"),
-                wider_place: Some("floor"),
-                device: Some("name"),
-                kind: Some("domain"),
-            },
-            kind_of,
-            sole,
+        HouseFacts { slots: slots(), kind_of, sole }
+    }
+
+    /// The fields Home Assistant uses to say *which* device a call is about.
+    fn slots() -> vendor::SlotFields {
+        vendor::SlotFields {
+            place: Some("area"),
+            wider_place: Some("floor"),
+            device: Some("name"),
+            kind: Some("domain"),
+            filter: Some("device_class"),
         }
     }
 
@@ -1793,6 +2116,105 @@ mod tests {
 
         let args = serde_json::json!({"name": "Something else entirely", "area": "Office"});
         assert_eq!(house().agree(args.clone()), (args, None), "never heard of it");
+    }
+
+    /// Verbatim from a run: asked for the volume of a named display, the model
+    /// added `device_class: ["tv"]` and the house matched nothing. A class of
+    /// device narrows within a kind, so beside a name that already picks one
+    /// device out it can only narrow to nothing.
+    #[test]
+    fn a_class_of_device_named_beside_one_device_is_dropped() {
+        let (fixed, note) = house().agree(serde_json::json!({
+            "name": "Balcony lights",
+            "device_class": ["tv"],
+            "brightness": 70,
+        }));
+        assert_eq!(fixed, serde_json::json!({"name": "Balcony lights", "brightness": 70}));
+        assert!(note.is_some_and(|n| n.contains("device_class")), "the drop is written down");
+    }
+
+    /// Verbatim from a run: the model's second attempt at the guest bedroom
+    /// lights *added* `floor: "1"`, and the house then failed to find the
+    /// bedroom at all. A storey cannot narrow past the area inside it, so
+    /// whatever narrows furthest is kept and everything wider goes — and this
+    /// one needs no device name, which is what makes it more than the rule
+    /// above.
+    #[test]
+    fn a_storey_named_beside_an_area_is_dropped() {
+        let (fixed, note) = house()
+            .agree(serde_json::json!({"area": "Guest bedroom", "floor": "1", "domain": ["light"]}));
+        assert_eq!(fixed, serde_json::json!({"area": "Guest bedroom", "domain": ["light"]}));
+        assert!(note.is_some_and(|n| n.contains("floor")), "the drop is written down");
+
+        // A storey on its own is the target and stays: it is the narrowest
+        // thing the call gave.
+        let args = serde_json::json!({"floor": "1", "domain": ["light"]});
+        assert_eq!(house().agree(args.clone()), (args, None), "nothing narrower was given");
+    }
+
+    /// The defect that started this, verbatim: *"turn the air conditioner
+    /// off"*, and the model called the tool that sets a temperature with
+    /// `temperature: 0`. The schema is happy and the value is not blank, so the
+    /// only evidence against it is the request — nobody said a number.
+    #[test]
+    fn a_number_the_user_never_said_keeps_the_call_at_home() {
+        let args = serde_json::json!({"name": "Air conditioner", "temperature": 0});
+        let (kept, complaint) = numbers_nobody_asked_for(args.clone(), "oprește aerul condiționat");
+        let complaint = complaint.expect("a value nobody asked for is not sent");
+        assert_eq!(kept, args, "nothing is quietly deleted; the call is simply not sent");
+        assert!(complaint.contains("temperature"), "{complaint}");
+        assert!(complaint.contains("on/off"), "the model needs a way out: {complaint}");
+    }
+
+    /// The rule is the same wherever the number sits, and that is the point:
+    /// dropping it instead threw away the value *"set the Couch Blue to thirty
+    /// percent"* had asked for, because "thirty" is not a digit. Asked about, it
+    /// can come back.
+    #[test]
+    fn a_number_beside_another_value_is_asked_about_too() {
+        let args = serde_json::json!({"name": "Couch Blue", "color": "blue", "brightness": 30});
+        let (kept, complaint) =
+            numbers_nobody_asked_for(args.clone(), "set the Couch Blue to thirty percent");
+        let complaint = complaint.expect("a spelled-out number is still not a digit");
+        assert_eq!(kept, args, "the brightness survives to be written again");
+        assert!(complaint.contains("brightness (30)"), "{complaint}");
+    }
+
+    /// The check must never touch a number the user did in fact ask for, in
+    /// any language — a digit is a digit — and must have no opinion at all when
+    /// the words were never recorded.
+    #[test]
+    fn a_number_the_user_asked_for_is_sent_untouched() {
+        let args = serde_json::json!({"name": "Office thermostat", "temperature": 21});
+        for said in ["set the office thermostat to 21", "pune termostatul la 21 de grade", ""] {
+            let (fixed, complaint) = numbers_nobody_asked_for(args.clone(), said);
+            assert_eq!(fixed, args, "left alone for {said:?}");
+            assert_eq!(complaint, None, "no complaint for {said:?}");
+        }
+    }
+
+    /// The escape hatch, for the one way the digit test can be wrong: a
+    /// recogniser that writes "seventy" instead of "70". The first attempt is
+    /// refused, and whatever the model writes next goes through.
+    #[test]
+    fn a_tool_that_insists_on_its_number_gets_through_the_second_time() {
+        let words = Words::default();
+        assert!(words.first_attempt_at("HassClimateSetTemperature"), "the first go is checked");
+        assert!(!words.first_attempt_at("HassClimateSetTemperature"), "the second is not");
+        assert!(words.first_attempt_at("HassTurnOff"), "and every tool gets its own");
+    }
+
+    /// The hatch is only usable if the model is told it exists and is allowed to
+    /// use it. *"Set the volume to seventy"* proved both halves matter: told
+    /// only that the value was invented, the model believed it, wrote the same
+    /// tool with the volume deleted, and the display never moved.
+    #[test]
+    fn the_refusal_says_how_to_insist() {
+        let args = serde_json::json!({"name": "Kitchen display", "volume_level": 70});
+        let (_, complaint) = numbers_nobody_asked_for(args, "set the volume to seventy");
+        let complaint = complaint.expect("no digits, so the number is suspect");
+        assert!(complaint.contains("in words rather than digits"), "{complaint}");
+        assert!(complaint.contains("write this same call again"), "{complaint}");
     }
 
     /// Verbatim from two traces, one in Romanian and one in English: asked to
@@ -2003,7 +2425,13 @@ mod tests {
             let out = out.clone();
             Box::pin(async move { out })
         });
-        let tools = ActionTools { descriptors: Vec::new(), execute, hint: None, grammar: None };
+        let tools = ActionTools {
+            descriptors: Vec::new(),
+            execute,
+            hint: None,
+            grammar: None,
+            said: fono_assistant::Said::default(),
+        };
         (tools, asked)
     }
 
@@ -2046,6 +2474,9 @@ mod tests {
             summary: "HassTurnOn could not be run".into(),
             failed: true,
             retryable: true,
+            sent: None,
+            repeat_ok: false,
+            confirmed: false,
         });
         assert!(run_again(&tools, &found).await.is_err(), "a failed replay is not an answer");
         assert_eq!(asked.lock().unwrap().len(), 1, "tried once, then handed over");
@@ -2056,8 +2487,13 @@ mod tests {
     /// say the whole thing again.
     #[tokio::test]
     async fn a_failure_that_changed_nothing_invites_one_correction() {
-        let ran =
-            run_one(&tools(VerifyClass::PostCondition), &HouseFacts::default(), call("Nope")).await;
+        let ran = run_one(
+            &tools(VerifyClass::PostCondition),
+            &HouseFacts::default(),
+            &Words::default(),
+            call("Nope"),
+        )
+        .await;
         assert!(ran.out.failed);
         assert!(ran.out.retryable, "an unknown tool moved nothing, so a second go is free");
         assert!(ran.out.summary.contains("call the tool once more"), "{}", ran.out.summary);
@@ -2076,7 +2512,8 @@ mod tests {
         let lower = hint.to_lowercase();
         assert!(lower.contains("simplest tool"), "{hint}");
         assert!(lower.contains("on/off tool"), "{hint}");
-        assert!(lower.contains("never invent a value"), "{hint}");
+        assert!(lower.contains("only what the user asked for"), "{hint}");
+        assert!(lower.contains("it is the wrong tool"), "{hint}");
     }
 
     /// A device named after somewhere it is not — a lamp called after the
@@ -2091,7 +2528,7 @@ mod tests {
         assert!(hint.contains("Office"), "{hint}");
         let lower = hint.to_lowercase();
         assert!(lower.contains("never translate"), "{hint}");
-        assert!(lower.contains("do not narrow the search to an area"), "{hint}");
+        assert!(lower.contains("add no area"), "{hint}");
     }
 
     /// An area-wide switch-on reaches everything switchable in the area. Asked
@@ -2111,8 +2548,15 @@ mod tests {
         let hint = area_hint(&store).expect("names present means a hint");
         let lower = hint.to_lowercase();
         assert!(lower.contains("domain"), "{hint}");
-        assert!(hint.contains("[\"light\"]"), "the worked example must survive: {hint}");
+        assert!(hint.contains("\"domain\": [\"climate\"]"), "the worked example survives: {hint}");
         assert!(lower.contains("domain is required"), "advice was not enough: {hint}");
+        // The one value that means "everything in here". The rails offer it and
+        // nothing else explains it, so a model that means it would have to
+        // guess — and would file the request under one kind instead.
+        assert!(
+            hint.contains(fono_core::tool_grammar::ANY_KIND),
+            "the way to say 'every device' must be named: {hint}"
+        );
 
         let domain_at = lower.find("the domain is required").expect("the obligation");
         let one_call_at = lower.find("one call for an area").expect("the economy");
@@ -2142,7 +2586,66 @@ mod tests {
             .expect("devices");
         let hint = area_hint(&store).expect("hint");
         assert!(hint.contains("Office outdoor light"), "{hint}");
-        assert!(hint.to_lowercase().contains("only exactly"), "{hint}");
+        assert!(hint.to_lowercase().contains("only exactly as written"), "{hint}");
+    }
+
+    /// A name says what a device sounds like, not what it is. Told only the
+    /// names, a model sent `domain: ["light"]` for an air conditioner — and
+    /// this home has a `switch` called "Entrance lights", where the obvious
+    /// domain finds nothing. So each name is written under its kind, and the
+    /// kind is written as the word the `domain` argument takes.
+    #[test]
+    fn each_device_is_named_under_its_kind() {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        store.set_place_names("home", &["Office".to_string()]).expect("areas");
+        store
+            .set_devices(
+                "home",
+                &[
+                    fono_core::tool_catalog::Device::new("Office light", "light"),
+                    fono_core::tool_catalog::Device::new("Air conditioner", "climate"),
+                    fono_core::tool_catalog::Device::new("Entrance lights", "switch"),
+                    fono_core::tool_catalog::Device::new("Mystery box", ""),
+                ],
+            )
+            .expect("devices");
+        let hint = area_hint(&store).expect("hint");
+        assert!(hint.contains("\nclimate: Air conditioner"), "{hint}");
+        assert!(hint.contains("\nlight: Office light"), "{hint}");
+        assert!(hint.contains("\nswitch: Entrance lights"), "{hint}");
+        assert!(hint.contains("`domain`"), "the kind has to be named as the argument: {hint}");
+        // An unstated kind is said to be unstated, never guessed from the name.
+        assert!(hint.contains("kind unknown: Mystery box"), "{hint}");
+    }
+
+    /// Grouping must not be paid for in tokens. One label per kind is covered
+    /// by the header being shorter than the sentence about exact names it
+    /// replaced, so the device half of the hint does not grow.
+    #[test]
+    fn naming_the_kinds_costs_no_more_than_the_flat_list_did() {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        store.set_place_names("home", &["Office".to_string()]).expect("areas");
+        let devices: Vec<fono_core::tool_catalog::Device> = (0..40)
+            .map(|i| {
+                let kind = if i % 4 == 0 { "light" } else { "switch" };
+                fono_core::tool_catalog::Device::new(format!("Device number {i}"), kind)
+            })
+            .collect();
+        store.set_devices("home", &devices).expect("devices");
+        let grouped = area_hint(&store).expect("hint");
+        let flat = format!(
+            "Devices in this home, named exactly as they must be used: {}. \
+             Use a name exactly as written: the home matches nothing else, \
+             not a shortened name and not a different word order.",
+            devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        let devices_part = grouped.find("\nDevices by kind").expect("the device half is written");
+        assert!(
+            grouped.len() - devices_part <= flat.len(),
+            "grouped {} vs flat {}",
+            grouped.len() - devices_part,
+            flat.len()
+        );
     }
 
     /// A truncated list is worse than none: the model would read it as the
@@ -2179,8 +2682,8 @@ mod tests {
         // the wording cannot drift between arms.
         assert!(full.contains("1. Never translate"), "{full}");
         assert!(!lean.contains("Never translate"), "{lean}");
-        assert!(!lean.contains("do not narrow the search to an area"), "{lean}");
-        assert!(lean.contains("2. Whenever the user says which kind"), "{lean}");
+        assert!(!lean.contains("add no area"), "{lean}");
+        assert!(lean.contains("2. When the user says which kind"), "{lean}");
         assert!(lean.contains("5. Use the simplest tool"), "{lean}");
 
         // `no-rules` and `no-devices` each drop one whole half.
@@ -2286,14 +2789,86 @@ mod tests {
         assert!(rails(&store, &rows).is_none());
     }
 
-    /// Long server output is trimmed, but visibly, and with enough room
-    /// that a real result's trailing failure list survives.
+    /// Long server output is trimmed, but visibly, and from the middle: a
+    /// server that puts its failures last must still be heard saying so.
     #[test]
-    fn long_output_is_trimmed_visibly() {
+    fn long_output_is_trimmed_from_the_middle() {
         assert_eq!(brief("  "), "Done.");
-        let out = brief(&"x".repeat(50_000));
-        assert!(out.ends_with('…'), "truncation must be visible: {}", &out[out.len() - 20..]);
-        assert!(out.chars().count() < 2100);
+        let out = brief(&format!("{}{}", "x".repeat(50_000), "the failures go here"));
+        assert!(out.contains('…'), "trimming must be visible: {out}");
+        assert!(out.starts_with("xxx"), "the start must survive");
+        assert!(out.ends_with("the failures go here"), "the end must survive: {out}");
+        assert!(out.chars().count() < 1300, "and the whole thing must be short");
+    }
+
+    /// What a call that worked hands back is the devices it reached, not the
+    /// server's own words for them.
+    ///
+    /// The reply Home Assistant sends for one area-wide command measured 3,447
+    /// characters, nearly all of it identifiers. The model pays for that text
+    /// twice — once to read it, once to answer it — and none of it says
+    /// anything the device names do not.
+    #[test]
+    fn a_call_that_worked_hands_back_the_devices_not_the_payload() {
+        let one = [vendor::Target { name: "Balcony lights".into(), landed: true }];
+        assert_eq!(
+            landed("HassTurnOn", &one).as_deref(),
+            Some("HassTurnOn reached Balcony lights.")
+        );
+
+        // A device the server listed as failed is not something that worked,
+        // and the half-done wording says so elsewhere.
+        let failed = [vendor::Target { name: "Hall lamp".into(), landed: false }];
+        assert_eq!(landed("HassTurnOn", &failed), None);
+
+        // A server Fono knows nothing about names nothing, so its own words
+        // are all there is and must be kept.
+        assert_eq!(landed("Whatever", &[]), None);
+    }
+
+    /// A command that reaches a whole area gets a count, not a roll call: the
+    /// names stop saying anything new long before the list ends.
+    #[test]
+    fn an_area_wide_call_is_counted_after_the_first_few() {
+        let many: Vec<vendor::Target> =
+            (0..12).map(|i| vendor::Target { name: format!("Lamp {i}"), landed: true }).collect();
+        let out = landed("HassTurnOff", &many).expect("named");
+        assert!(out.starts_with("HassTurnOff reached 12 devices: Lamp 0,"), "{out}");
+        assert!(out.ends_with("and 4 more."), "{out}");
+        assert!(!out.contains("Lamp 9"), "the tail is counted, not listed: {out}");
+    }
+
+    /// The check reads the devices the command was aimed at, not the whole
+    /// home. A bare read costs a dump of every device in the house to find out
+    /// what one lamp is doing.
+    #[test]
+    fn the_check_asks_about_what_the_command_was_aimed_at() {
+        let reader = serde_json::json!({"properties": {
+            "area": {"type": "string"},
+            "name": {"type": "string"},
+            "domain": {"description": "one or a list"},
+        }});
+        let sent = serde_json::json!({
+            "name": "Balcony lights", "area": "Yard", "domain": ["light"], "brightness": 40,
+        });
+        assert_eq!(
+            about(Some(&reader), slots(), &sent),
+            serde_json::json!({"area": "Yard", "name": "Balcony lights", "domain": ["light"]}),
+            "every field that says what was aimed at, and no value"
+        );
+
+        // A reader that publishes nothing to filter by, and a command that
+        // named nothing, both read the house as they always did.
+        assert_eq!(about(None, slots(), &sent), serde_json::json!({}));
+        assert_eq!(
+            about(Some(&reader), slots(), &serde_json::json!({"brightness": 40})),
+            serde_json::json!({})
+        );
+
+        // The reader wants a plain string where the command sent a list. Its
+        // own schema decides, and the field is left out rather than reshaped.
+        let strict = serde_json::json!({"properties": {"domain": {"type": "string"}}});
+        assert_eq!(about(Some(&strict), slots(), &sent), serde_json::json!({}));
     }
 
     /// The page exists to close one gap: the model was told things nobody
@@ -2432,6 +3007,7 @@ mod tests {
             execute: Arc::new(|_| Box::pin(async { ToolOutcome::worked(String::new()) })),
             hint: Some("Areas: Kitchen".into()),
             grammar: None,
+            said: fono_assistant::Said::default(),
         });
 
         let (kept, note) = for_backend(Some(tools.clone()), true, "openai");
