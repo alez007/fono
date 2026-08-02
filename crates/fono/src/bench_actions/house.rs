@@ -111,11 +111,32 @@ impl Entity {
         READ_ONLY_DOMAINS.contains(&self.domain.as_str())
     }
 
-    /// Whether the entity reports a brightness level, which is how a
-    /// dimmable lamp is told from a plain one without knowing the house.
+    /// Whether the entity has a setting beyond on/off that a command could
+    /// name — a lamp's brightness, a speaker's volume, a blind's position.
+    ///
+    /// Asked of [`Self::level`] rather than of one named attribute, so the
+    /// question is the same for every domain. A fixture about "set it to
+    /// fifty percent" needs a device that has a fifty percent, and which
+    /// attribute carries that is the house's business, not the fixture's.
     #[must_use]
-    pub fn is_dimmable(&self) -> bool {
-        self.attributes.contains_key("brightness")
+    pub fn is_adjustable(&self) -> bool {
+        self.level().is_some()
+    }
+
+    /// Whether the home can act on this entity at all right now.
+    ///
+    /// An `unavailable` entity is one whose integration is down: it is listed,
+    /// it has a name, and every command addressed to it is accepted and does
+    /// nothing. Aiming a fixture at one measures the outage. Six cases of a
+    /// run scored `failed` this way while a hub was offline, which is a number
+    /// about the house reported as a number about the model.
+    ///
+    /// `unknown` is deliberately not included. It means the state has not been
+    /// reported yet, not that the device is beyond reach, and excluding it
+    /// would shrink the pool of targets on a healthy house.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        !self.state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("unavailable"))
     }
 
     /// The setting this entity carries beyond being on or off.
@@ -365,11 +386,27 @@ impl House {
         self.entities.iter().filter(|o| o.every_name().any(|n| loose_eq(n, &e.name))).count() <= 1
     }
 
-    /// Whether a fixture may aim at this entity: safe to move *and* reachable
-    /// by name. The two questions are always asked together.
+    /// Whether a fixture may aim at this entity: safe to move, reachable by
+    /// name, and answering at all. The three questions are always asked
+    /// together.
     #[must_use]
     pub fn targetable(&self, e: &Entity) -> bool {
-        e.safe_to_target() && self.addressable(e)
+        e.safe_to_target() && self.addressable(e) && e.is_available()
+    }
+
+    /// Why a domain yielded no target, in words a reader can act on.
+    ///
+    /// A house with forty lights that reports "no light in this home" sends
+    /// somebody looking for a bug in the fixture. Saying the lights are all
+    /// unavailable sends them to the hub, which is where the problem is.
+    fn no_target(&self, domain: &str, extra: &str) -> Unsatisfied {
+        let present = self.entities.iter().any(|e| e.domain == domain);
+        let reachable = self.entities.iter().any(|e| e.domain == domain && e.is_available());
+        Unsatisfied(match (present, reachable) {
+            (true, false) => format!("every {domain} in this home is unavailable"),
+            (true, true) => format!("no {domain} in this home {extra}"),
+            (false, _) => format!("no {domain} in this home"),
+        })
     }
 
     /// The same house with some devices taken out of consideration.
@@ -437,10 +474,14 @@ fn inner_dump(text: &str) -> String {
 pub enum Requirement {
     /// Any single entity in a domain — "a light", "a media player".
     Device { domain: String },
-    /// A device in a domain that also reports brightness. The dimmable-lamp
-    /// case, which is where the wrong-tool failure lives: a model reaching
-    /// for the brightness tool when asked simply to switch something on.
-    DimmableDevice { domain: String },
+    /// A device in a domain that also reports a settable level. The dimmable
+    /// lamp, the speaker with a volume, the blind with a position — anything a
+    /// command can aim a number at.
+    ///
+    /// Two failure classes live here and they pull in opposite directions: a
+    /// model reaching for the level tool when asked simply to switch something
+    /// on, and a model dropping the level when the user did name one.
+    AdjustableDevice { domain: String },
     /// An area containing a device in `domain` **and** at least one device in
     /// a different switchable domain.
     ///
@@ -466,6 +507,26 @@ pub enum Requirement {
     /// and a harness that watched a single lamp would call a half-lit area a
     /// pass. The group is what gets staged, scored and restored together.
     NamedArea { area: String, domain: String },
+    /// Whichever area holds at least `at_least` devices of one domain, as a
+    /// group — the committable form of [`Self::NamedArea`].
+    ///
+    /// A plain area command may resolve onto an area with one lamp in it,
+    /// where "all of them arrived" and "the one arrived" are the same
+    /// sentence. Insisting on several is what exercises the parts that only
+    /// exist because a command can reach many devices at once: every member
+    /// having to land, and the reading of the home afterwards having to say so
+    /// without reciting a roll call.
+    AreaWithSeveral { domain: String, at_least: usize },
+    /// A name no device in this home answers to.
+    ///
+    /// Resolves to a target with **no** devices in it, which is the point: the
+    /// case asserts that nothing in the home moved. It guards the worst
+    /// available failure short of a lie — a model asked for something that is
+    /// not there quietly doing it to the nearest thing that is.
+    ///
+    /// Skips on a home that turns out to have such a device, so the fixture
+    /// can be committed without anybody's house being consulted first.
+    NoSuchDevice { name: String },
 }
 
 /// A requirement resolved against a real house.
@@ -561,15 +622,32 @@ impl Requirement {
                     .entities
                     .iter()
                     .find(|e| &e.domain == domain && house.targetable(e))
-                    .ok_or_else(|| Unsatisfied(format!("no {domain} in this home")))?;
+                    .ok_or_else(|| house.no_target(domain, "can be commanded by name"))?;
                 Ok(Target::single(device.clone(), device.areas.first().cloned(), None))
             }
-            Self::DimmableDevice { domain } => {
-                let device = house
-                    .entities
-                    .iter()
-                    .find(|e| &e.domain == domain && e.is_dimmable() && house.targetable(e))
-                    .ok_or_else(|| Unsatisfied(format!("no dimmable {domain} in this home")))?;
+            Self::AdjustableDevice { domain } => {
+                // Whether a device reports a level can depend on what it is
+                // doing: a lamp publishes its brightness only while it is lit,
+                // and a speaker its volume only once something has played. A
+                // house where every dimmable lamp happens to be off therefore
+                // looks like a house with no dimmable lamp, and the two cases
+                // that guard against an invented brightness skip — which is
+                // what happened, on the strength of one lit lamp whose name a
+                // second entity shared.
+                //
+                // So a device that reports a level now is preferred, and any
+                // commandable device of the domain will do otherwise. The run
+                // finds out the only way it can: stage the device, read the
+                // house again, and drop it if it is still silent about its
+                // level. A cover needs none of this — it reports how far open
+                // it is whatever it is doing.
+                let candidates =
+                    house.entities.iter().filter(|e| &e.domain == domain && house.targetable(e));
+                let device = candidates
+                    .clone()
+                    .find(|e| e.is_adjustable())
+                    .or_else(|| candidates.clone().next())
+                    .ok_or_else(|| house.no_target(domain, "can be commanded by name"))?;
                 Ok(Target::single(device.clone(), device.areas.first().cloned(), None))
             }
             Self::AreaWithBystander { domain } => {
@@ -633,6 +711,52 @@ impl Requirement {
                 })?;
                 Ok(Target { device, group, area: Some(real), bystander: None })
             }
+            Self::AreaWithSeveral { domain, at_least } => {
+                let wanted = (*at_least).max(2);
+                for area in house.areas() {
+                    let group: Vec<Entity> = house
+                        .in_area(&area)
+                        .filter(|e| &e.domain == domain && house.targetable(e))
+                        .cloned()
+                        .collect();
+                    if group.len() < wanted {
+                        continue;
+                    }
+                    let device = group[0].clone();
+                    return Ok(Target { device, group, area: Some(area), bystander: None });
+                }
+                Err(Unsatisfied(format!(
+                    "no area in this home exposes {wanted} {domain} devices at once"
+                )))
+            }
+            Self::NoSuchDevice { name } => {
+                // A house that turns out to own the invented name would score
+                // the model for obeying a request that was, in that house,
+                // perfectly sensible.
+                if let Some(e) = house.find_by_name(name) {
+                    return Err(Unsatisfied(format!(
+                        "this home has a device matching `{name}` ({}), so it is not a name to \
+                         refuse",
+                        e.name
+                    )));
+                }
+                Ok(Target {
+                    device: Entity {
+                        name: name.clone(),
+                        domain: String::new(),
+                        aliases: Vec::new(),
+                        areas: Vec::new(),
+                        state: None,
+                        attributes: BTreeMap::new(),
+                    },
+                    // Empty on purpose: nothing in this home may move, and
+                    // every member of the group is something the harness
+                    // stages, scores and puts back.
+                    group: Vec::new(),
+                    area: None,
+                    bystander: None,
+                })
+            }
         }
     }
 }
@@ -684,8 +808,8 @@ mod tests {
         assert_eq!(lamp.domain, "light");
         assert_eq!(lamp.areas, vec!["Office"]);
         assert_eq!(lamp.state.as_deref(), Some("off"));
-        assert!(lamp.is_dimmable());
-        assert!(!h.get("Hall lamp").unwrap().is_dimmable());
+        assert!(lamp.is_adjustable());
+        assert!(!h.get("Hall lamp").unwrap().is_adjustable());
     }
 
     /// A benchmark runs unattended, so it never picks the front door or the
@@ -735,7 +859,7 @@ mod tests {
         // name and the one that stages a whole area.
         for req in [
             Requirement::Device { domain: "light".into() },
-            Requirement::DimmableDevice { domain: "light".into() },
+            Requirement::AdjustableDevice { domain: "light".into() },
             Requirement::NamedArea { area: "Living".into(), domain: "light".into() },
         ] {
             let t = req.resolve(&h).unwrap();
@@ -744,6 +868,29 @@ mod tests {
         }
         let err = Requirement::NamedDevice { name: "Couch".into() }.resolve(&h).unwrap_err();
         assert!(err.0.contains("Couch"));
+    }
+
+    /// A house whose only dimmable lamp happens to be off still yields a
+    /// target: the level cannot be read until the lamp is lit, so the
+    /// requirement must be allowed to nominate a candidate and let the run
+    /// find out. A device that does report one now is still preferred.
+    #[test]
+    fn a_level_that_only_appears_when_lit_does_not_lose_the_case() {
+        let dark = House::parse(
+            "- names: Ceiling\n  domain: light\n  state: 'off'\n  areas: Hall\n- names: Desk\n  \
+             domain: light\n  state: 'off'\n  areas: Hall\n",
+        );
+        let req = Requirement::AdjustableDevice { domain: "light".into() };
+        assert_eq!(req.resolve(&dark).unwrap().device.name, "Ceiling");
+
+        let lit = House::parse(
+            "- names: Ceiling\n  domain: light\n  state: 'off'\n  areas: Hall\n- names: Desk\n  \
+             domain: light\n  state: 'on'\n  brightness: 128\n  areas: Hall\n",
+        );
+        assert_eq!(req.resolve(&lit).unwrap().device.name, "Desk", "a real level wins");
+
+        let none = House::parse("- names: Hall temp\n  domain: sensor\n  state: '20'\n");
+        assert!(req.resolve(&none).is_err());
     }
 
     /// A device the house listed but then refused to act on is dropped from
@@ -962,5 +1109,77 @@ mod tests {
     fn a_missing_level_is_absent_not_zero() {
         let h = House::parse("- names: Plain\n  domain: light\n  state: 'on'\n");
         assert_eq!(h.get("Plain").unwrap().level(), None);
+    }
+
+    /// A lamp whose integration is down accepts every command and does
+    /// nothing. Aiming a fixture at one measures the outage: six cases of one
+    /// run scored `failed` this way while a hub was offline.
+    #[test]
+    fn an_unavailable_device_is_never_targeted() {
+        let h = House::parse(
+            "- names: Dead lamp\n  domain: light\n  state: unavailable\n  areas: Hall\n- names: \
+             Live lamp\n  domain: light\n  state: 'off'\n  areas: Hall\n",
+        );
+        assert!(!h.get("Dead lamp").unwrap().is_available());
+        assert!(!h.targetable(h.get("Dead lamp").unwrap()));
+        let t = Requirement::Device { domain: "light".into() }.resolve(&h).unwrap();
+        assert_eq!(t.device.name, "Live lamp");
+    }
+
+    /// `unknown` means nobody has reported yet, not that the device is beyond
+    /// reach — excluding it would shrink the pool on a healthy house.
+    #[test]
+    fn an_unreported_state_is_still_targetable() {
+        let h = House::parse("- names: Lamp\n  domain: light\n  state: unknown\n");
+        assert!(h.get("Lamp").unwrap().is_available());
+    }
+
+    /// A house with forty unreachable lights that reports "no light in this
+    /// home" sends the reader hunting for a bug in the fixture. The hub is
+    /// where the problem is, so that is what the skip says.
+    #[test]
+    fn an_outage_is_reported_as_an_outage() {
+        let h = House::parse("- names: Lamp\n  domain: light\n  state: unavailable\n");
+        let err = Requirement::Device { domain: "light".into() }.resolve(&h).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+    }
+
+    /// An area command is only exercised by an area that holds more than one
+    /// device: with a single lamp, "all of them arrived" and "the one arrived"
+    /// are the same sentence.
+    #[test]
+    fn an_area_of_several_takes_the_whole_group() {
+        let h = House::parse(
+            "- names: Ceiling\n  domain: light\n  state: 'off'\n  areas: Kitchen\n- names: \
+             Counter\n  domain: light\n  state: 'off'\n  areas: Kitchen\n- names: Hall lamp\n  \
+             domain: light\n  state: 'off'\n  areas: Hall\n",
+        );
+        let t = Requirement::AreaWithSeveral { domain: "light".into(), at_least: 2 }
+            .resolve(&h)
+            .unwrap();
+        assert_eq!(t.area.as_deref(), Some("Kitchen"));
+        assert_eq!(t.group_names(), vec!["Ceiling", "Counter"]);
+        assert!(t.is_group());
+
+        let alone = House::parse("- names: Hall lamp\n  domain: light\n  areas: Hall\n");
+        assert!(Requirement::AreaWithSeveral { domain: "light".into(), at_least: 2 }
+            .resolve(&alone)
+            .is_err());
+    }
+
+    /// The refusal case resolves to a target with nothing in it, so nothing is
+    /// staged, scored or put back — the whole assertion is that the home did
+    /// not move.
+    #[test]
+    fn a_name_nobody_answers_to_resolves_to_an_empty_target() {
+        let h = House::parse("- names: Hall lamp\n  domain: light\n  areas: Hall\n");
+        let t = Requirement::NoSuchDevice { name: "pizza oven".into() }.resolve(&h).unwrap();
+        assert_eq!(t.device.name, "pizza oven");
+        assert!(t.group.is_empty());
+
+        // A house that turns out to own the name skips instead: obeying is the
+        // right answer there, and scoring it wrong would measure the house.
+        let has_one = House::parse("- names: Pizza oven\n  domain: switch\n  areas: Kitchen\n");
+        assert!(Requirement::NoSuchDevice { name: "pizza oven".into() }.resolve(&has_one).is_err());
     }
 }

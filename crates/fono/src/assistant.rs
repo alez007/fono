@@ -83,6 +83,14 @@ pub struct RecordedCall {
     /// re-serialised: invalid JSON from a model is a finding in its own
     /// right, and normalising it would erase the evidence.
     pub arguments: String,
+    /// The arguments as they actually reached the server, when the executor
+    /// changed them — `None` when the call travelled exactly as written.
+    ///
+    /// Both are kept because they answer different questions. The draft above
+    /// is what the model is scored on; this is what the home was asked to do,
+    /// and reading a failure without it means guessing which of the two a
+    /// device disobeyed.
+    pub sent: Option<String>,
     /// The executor's own verdict, which is also the text the model saw
     /// before deciding whether to correct itself. `None` when the turn ended
     /// before a result arrived.
@@ -100,6 +108,7 @@ impl TurnRecord {
         self.calls.push(RecordedCall {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            sent: None,
             outcome: None,
             failed: false,
         });
@@ -112,10 +121,11 @@ impl TurnRecord {
     /// first unanswered call is the one this result belongs to. A backend
     /// that omits ids is a wire-format quirk, not a reason to lose the
     /// outcome.
-    fn answered(&mut self, summary: &str, failed: bool) {
+    fn answered(&mut self, summary: &str, failed: bool, sent: Option<&str>) {
         if let Some(c) = self.calls.iter_mut().find(|c| c.outcome.is_none()) {
             c.outcome = Some(summary.to_string());
             c.failed = failed;
+            c.sent = sent.map(str::to_string);
         }
     }
 }
@@ -1197,9 +1207,9 @@ pub async fn run_assistant_turn(
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
+                ToolEvent::Result { tool_call_id, summary, failed, sent } => {
                     s.log.record_tool_result(&summary, failed, Some(provider));
-                    record.answered(&summary, failed);
+                    record.answered(&summary, failed, sent.as_deref());
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -1499,9 +1509,9 @@ async fn drive_text_only_reply(
                     s.history.push_assistant_tool_calls(String::new(), vec![call]);
                     acted = true;
                 }
-                ToolEvent::Result { tool_call_id, summary, failed, .. } => {
+                ToolEvent::Result { tool_call_id, summary, failed, sent } => {
                     s.log.record_tool_result(&summary, failed, Some(provider));
-                    record.answered(&summary, failed);
+                    record.answered(&summary, failed, sent.as_deref());
                     s.history.push_tool_result(tool_call_id, summary);
                 }
             }
@@ -3310,7 +3320,7 @@ mod tests {
         };
         record.called(&call);
         history.push_assistant_tool_calls(String::new(), vec![call]);
-        record.answered("turned on 1 light", false);
+        record.answered("turned on 1 light", false, None);
         history.push_tool_result("local-1".into(), "turned on 1 light".into());
         record.reply = "Done.".into();
         history.push_assistant("Done.".into());
@@ -3336,12 +3346,21 @@ mod tests {
             arguments: "{}".into(),
         };
         record.called(&call("a", "HassLightSet"));
-        record.answered("no matching entity", true);
+        record.answered("no matching entity", true, Some(r#"{"name":"Hall"}"#));
         record.called(&call("b", "HassTurnOn"));
-        record.answered("turned on 1 light", false);
+        record.answered("turned on 1 light", false, None);
 
         assert_eq!(record.calls[0].outcome.as_deref(), Some("no matching entity"));
         assert_eq!(record.calls[1].outcome.as_deref(), Some("turned on 1 light"));
+        assert_eq!(
+            record.calls[0].sent.as_deref(),
+            Some(r#"{"name":"Hall"}"#),
+            "a call the executor rewrote keeps both the draft and what travelled"
+        );
+        assert_eq!(
+            record.calls[1].sent, None,
+            "a call that travelled as written records no second copy"
+        );
     }
 
     #[test]

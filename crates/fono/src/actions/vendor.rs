@@ -330,11 +330,12 @@ impl Vendor for HomeAssistant {
         // Every device the server said it switched must actually be in the
         // asked-for state. One lamp left behind is a half-done command, and
         // the user needs to hear that rather than "done".
-        Some(if states.iter().all(|s| s == want) {
-            Verdict::Confirmed
-        } else {
-            Verdict::Contradicted
-        })
+        //
+        // A reading that says nothing either way is not evidence, so a set of
+        // those yields no verdict at all rather than a confident one.
+        let mut judged = states.iter().filter_map(|s| want.met_by(s)).peekable();
+        judged.peek()?;
+        Some(if judged.all(|met| met) { Verdict::Confirmed } else { Verdict::Contradicted })
     }
 
     /// Read off the same two lists [`Self::admission`] judges, one entry at a
@@ -397,11 +398,51 @@ impl Vendor for HomeAssistant {
 /// Only the plain on/off intents are covered. Brightness, colour and position
 /// are deliberately absent: a wrong guess about what "set" meant would be a
 /// confident false verdict, which is worse than no verdict.
-fn desired_state(tool: &str) -> Option<&'static str> {
+fn desired_state(tool: &str) -> Option<Wanted> {
     match tool {
-        "HassTurnOn" => Some("on"),
-        "HassTurnOff" => Some("off"),
+        "HassTurnOn" => Some(Wanted::On),
+        "HassTurnOff" => Some(Wanted::Off),
         _ => None,
+    }
+}
+
+/// Where a switching intent asked the world to end up.
+///
+/// A reading is compared by meaning rather than by equality with the words
+/// `on` and `off`, because only a light spells it that way. A blind that is on
+/// reports `open`, an air conditioner reports the mode it is running in, a
+/// media player reports `playing`, a vacuum `cleaning`. Comparing those
+/// against the literal `on` reports a call that worked as a call that failed —
+/// and the model then "corrects" it by undoing what the user asked for, which
+/// is how a request to open a blind ended up closing it.
+///
+/// Off has a short, closed list of spellings across Home Assistant's domains;
+/// on has as many spellings as there are things a device can be busy doing. So
+/// the list below is the off side, and everything else counts as on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wanted {
+    On,
+    Off,
+}
+
+impl Wanted {
+    /// Whether a device reporting `state` is where this intent wanted it, or
+    /// `None` when the reading is no evidence either way.
+    fn met_by(self, state: &str) -> Option<bool> {
+        let state = state.trim().trim_matches('\'').to_ascii_lowercase();
+        let resting = match state.as_str() {
+            // Nobody has reported, or the device is beyond reach.
+            "" | "unavailable" | "unknown" => return None,
+            // Still on its way. The server took the command and the world has
+            // not caught up — a roller takes seconds, and the reading happens
+            // in milliseconds. Judge it by where it is heading, which is what
+            // the reading is evidence of.
+            "opening" => Self::On,
+            "closing" | "returning" => Self::Off,
+            "off" | "closed" | "standby" | "docked" => Self::Off,
+            _ => Self::On,
+        };
+        Some(resting == self)
     }
 }
 
@@ -613,6 +654,55 @@ mod tests {
         assert_eq!(
             ha.confirms(&call("HassTurnOff"), SWITCHED_A_LAMP, dark),
             Some(Verdict::Confirmed)
+        );
+    }
+
+    /// Only a light spells being on as the word `on`. This is the bug that
+    /// made Fono close a blind it had just opened: the server switched the
+    /// cover, the cover read `open`, Fono told the model the call had failed,
+    /// and the model obligingly sent the opposite one and reported success.
+    #[test]
+    fn a_device_that_is_on_does_not_have_to_say_on() {
+        let ha = HomeAssistant;
+        let claimed =
+            r#"{"data": {"success": [{"name": "Hall lamp", "type": "entity"}], "failed": []}}"#;
+        let reads = |state: &str| format!("- names: Hall lamp\n  state: '{state}'\n");
+
+        // On, in the words of a blind, an air conditioner, a media player and
+        // a vacuum cleaner.
+        for state in ["on", "open", "cool", "dry", "playing", "idle", "cleaning"] {
+            assert_eq!(
+                ha.confirms(&call("HassTurnOn"), claimed, &reads(state)),
+                Some(Verdict::Confirmed),
+                "{state} is a device doing something"
+            );
+        }
+        for state in ["off", "closed", "standby", "docked"] {
+            assert_eq!(
+                ha.confirms(&call("HassTurnOff"), claimed, &reads(state)),
+                Some(Verdict::Confirmed),
+                "{state} is a device at rest"
+            );
+            assert_eq!(
+                ha.confirms(&call("HassTurnOn"), claimed, &reads(state)),
+                Some(Verdict::Contradicted)
+            );
+        }
+        // A roller takes seconds to travel and the reading happens in
+        // milliseconds, so it is caught mid-way far more often than not.
+        // Where it is heading is what the reading is evidence of.
+        assert_eq!(
+            ha.confirms(&call("HassTurnOn"), claimed, &reads("opening")),
+            Some(Verdict::Confirmed)
+        );
+        assert_eq!(
+            ha.confirms(&call("HassTurnOff"), claimed, &reads("closing")),
+            Some(Verdict::Confirmed)
+        );
+        assert_eq!(
+            ha.confirms(&call("HassTurnOff"), claimed, &reads("returning")),
+            Some(Verdict::Confirmed),
+            "a vacuum on its way to the dock is being switched off"
         );
     }
 

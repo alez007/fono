@@ -64,6 +64,11 @@ pub struct ObservedCall {
     /// Raw JSON string exactly as the model emitted it — never re-serialised,
     /// because a model that emits invalid JSON is a finding, not a parse error.
     pub arguments: String,
+    /// What actually reached the server, when the executor changed it — `None`
+    /// when the call travelled exactly as written. Scoring reads `arguments`,
+    /// because the model is what is being scored; a human reading a failure
+    /// needs this one, or the house's answer makes no sense.
+    pub sent: Option<String>,
     /// The executor's own prose verdict, which is also what the model read
     /// before deciding whether to try again.
     pub outcome: Option<String>,
@@ -264,6 +269,7 @@ impl TurnDriver {
                 .map(|c| ObservedCall {
                     name: c.name,
                     arguments: c.arguments,
+                    sent: c.sent,
                     outcome: c.outcome,
                     failed: c.failed,
                 })
@@ -311,6 +317,7 @@ mod tests {
                 .map(|failed| ObservedCall {
                     name: "HassClimateSetTemperature".into(),
                     arguments: "{}".into(),
+                    sent: None,
                     outcome: Some("…".into()),
                     failed: *failed,
                 })

@@ -413,3 +413,421 @@ keep when the warm has not run or its head is stale.
    for, each costing a retry.
 3. The air conditioner sits in `dry`, where Home Assistant's `turn_off` does not
    move it. Not ours.
+
+## 8. Built: the readback summary, and four cases that widen the suite
+
+### The roll call is now a count
+
+`state_of_the_house` recited every device a command reached, unbounded. One
+twelve-lamp living-room command produced 358 characters of `Couch is on, Couch
+is on, Couch Blue is off, …` — read twice, because the turn retried, for 5.7 s
+of a 15.3 s turn. Two of the entries were the same device twice, and a sensor
+was in there as well.
+
+It now drops exact repeats, names every device while there are fewer than five,
+and above that groups by equality of the state string: the largest group gets a
+count and every smaller group is counted **and** named, capped at six names.
+The same example becomes `11 devices — 8 are off; 3 are on: Couch, Living
+square red, Living square white` — 181 characters, and the devices that
+disobeyed keep their names, which is the only reason to read the line at all.
+Grouping is string equality, so it knows nothing about what `on`, `cool` or
+`41` mean and works against a server Fono has never seen.
+
+### The suite went from 11 cases to 15
+
+Six of the eleven were lights. The four added are the kinds of command a person
+actually gives that nothing exercised:
+
+- **`open_a_cover`** — a blind reports `open`/`closed`, not `on`/`off`, and the
+  same two switch intents move it. The harness had to learn that a state it had
+  never seen is still a state it can stage and put back.
+- **`an_unknown_device_is_refused`** — the worst failure short of a lie: asked
+  for something the home does not have, a model quietly does it to the nearest
+  thing that is. Skips on a home that owns the name.
+- **`an_area_of_several_lights_all_arrive`** — an area holding at least three
+  lights, where every member has to land. The existing area case can resolve
+  onto an area with one lamp, where "they all came on" and "it came on" are the
+  same sentence.
+- **`set_a_temperature_uses_the_climate_tool`** — the mirror of the switch-on
+  case. A suite that only ever *forbids* the temperature field says nothing
+  about whether the model can still reach for it when asked, and the fix for the
+  invented value is exactly the kind of fix that could break this. Every
+  language spells the number in words in at least one of them, so it is also the
+  end-to-end test of the escape hatch.
+
+`dim_uses_the_brightness_tool` gained `expect_level = 30`: it pinned the tool
+and never checked the lamp, so a refused call scored as a pass.
+
+### Harness changes the four cases needed
+
+- **An unavailable device is never a target.** Six cases of one run scored
+  `failed` while a hub was offline — a number about the house reported as a
+  number about the model. A domain that is present but wholly unreachable now
+  skips, and says so. `unknown` is deliberately still targetable: it means
+  nobody has reported yet, not that the device is beyond reach.
+- **`dimmable_device` is now `adjustable_device`** and asks for any settable
+  level, so it covers a speaker's volume and a blind's position, not only a
+  lamp's brightness.
+- **`--show-house` marks unreachable devices**, which is the commonest reason a
+  run comes back full of skips and was invisible in a list of states.
+
+### What the four found on first contact
+
+Each of them caught something, and three caught the same thing.
+
+- **A named device is not being used as the target.** `open the Curtain Left`
+  produced `HassTurnOn {"area": "Guest bedroom", "domain": ["cover"], "floor":
+  "__all__"}` — a different cover, in a different area, and the reply claimed
+  success. `set the Air conditioner to twenty-three degrees` reached the
+  *Master bedroom thermostat*. The catalogued name is in the utterance verbatim
+  and nothing mechanical uses it. This is now the largest accuracy item, and six
+  light cases never showed it.
+- **`__all__` is leaking into `floor`.** Stripped before the call travels, so it
+  is harmless today, but the prompt teaching is being over-applied.
+- **An area command is being narrowed to one device.** `turn on all the lights
+  in the Kitchen` produced `HassLightSet {"area": "Kitchen", "domain":
+  ["light"], "name": "Kitchen lights"}`; two of the three lamps stayed off and
+  the reply said they were on.
+- **The escape hatch works end to end.** `twenty-three degrees` carries no
+  digit, the call was stopped once, the model wrote the same call again and it
+  was sent. First proof of the designed behaviour, at the cost of one retry.
+- **A refusal can be the fastest turn in the suite.** The unknown device was
+  refused in 1.1 s with no call at all.
+
+## 9. The first full run of the widened suite on a healthy house
+
+30 turns (15 cases × en + ro), `gemma-4-e2b`, 14 devices offline which is this
+house's normal baseline. Four turns skipped for want of a target, so 26 scored.
+
+Latency has arrived: **median 8.8 s, slowest tenth 14.4 s**, against 27.8 s and
+58.1 s three changes ago. The 10 s target is met at the median. Prefill, which
+was the largest item in the run before last, is spent: 239 s → 66 s over a
+longer suite, median 12 tokens per read.
+
+**What is left is one number: 2.4 generations per turn.** A turn that generates
+once takes 2.3 s; a turn that generates twice or more takes 9.5 s. Generation is
+now 143 s of the 230 s the model spent. Every remaining latency question is the
+same question — why did this turn need a second attempt.
+
+Sorting the 38 call results by what happened answers it:
+
+| what became of the call | n | share |
+|---|---|---|
+| Fono refused an invented number | 10 | 26 % |
+| the house did not reach what was asked for | 9 | 24 % |
+| landed cleanly | 9 | 24 % |
+| the server refused the call outright | 8 | 21 % |
+| answered from a reading, or partial | 2 | 5 % |
+
+Only a quarter of calls land. The two largest groups have one cause each, and
+both causes are mechanical.
+
+### The named device is not being used as the target
+
+Nineteen turns spoke a catalogued device name **verbatim**. Ten put that name in
+the call. **Nine did not** — and every one of the nine substituted an area,
+which is a different device:
+
+| said | first call | reached |
+|---|---|---|
+| turn on the Balcony lights | `{"area":"Yard","domain":["light"]}` | three lights in the Yard |
+| open the Curtain Left | `{"area":"Guest bedroom","domain":["cover"]}` | the Guest bedroom roller |
+| turn off the Air conditioner | `HassTurnOff {"area":"Master bedroom"}` | both beds, two lights, a salt lamp and a curtain |
+| set the Air conditioner to 23 | `{"area":"Master bedroom"}` | the Master bedroom thermostat |
+| pune Air conditioner la 23 | `{"area":"bucătărie"}` | the Kitchen thermostat |
+
+The third row is the one to look at twice: a request to switch one device off
+switched off a bedroom. The last row also translated an area name into Romanian
+and invented one the home does not have, which rule 1 forbids in words.
+
+Six light cases never showed this, because a light called `Balcony lights` is in
+the Balcony and the wrong mechanism reaches the right device. Covers and climate
+are where the coincidence stops.
+
+### A tool the words cannot fill is still being offered
+
+Eight calls were refused by the server, and every one of them was
+`HassClimateSetTemperature` **with no temperature at all**. Route A stops the
+invented value; the model then writes the same tool with the field missing, and
+the house rejects it. Stopping the value was half the job — the tool is still
+the wrong tool.
+
+Together these two groups are 45 % of all calls and the whole of the second
+generation. Neither needs a word of any language.
+
+### Smaller findings
+
+- **The escape hatch is now routine, not exceptional.** Ten refusals, and the
+  model rewrote the same call and got through on `seventy` and on `twenty-three
+  degrees` in both languages.
+- **A third of every call the model writes is discarded.** 573 tokens drafted,
+  381 sent. Sixteen calls carried a blank field; eight put `__all__` in `floor`,
+  where it means nothing.
+- **A refusal is the fastest turn in the suite** — the unknown device was
+  refused in 0.7 s with no call at all. The Romanian half of the same case
+  instead aimed a temperature tool at the Kitchen and failed twice.
+- **A blind cannot be opened.** Both languages sent a switch intent at the
+  area and moved a different cover, then reported success. `open` and `closed`
+  are being treated as `on` and `off` by the model as well as by the harness,
+  but at the wrong target.
+
+### One harness gap to close
+
+`plain_switch_on_invents_no_brightness` and `dim_uses_the_brightness_tool` both
+skipped: no light in the house reports a level. That is true only because a
+light reports its brightness **when it is on**, and this house has exactly one
+lit lamp, which shares its name with a twin and so cannot be commanded by name.
+The requirement is state-dependent and should not be: the resolver should be
+able to switch a candidate on, read it again, and use it. Two guard fixtures for
+the invented-value defect are silently absent until it is.
+
+## 10. Built: the three free fixes, and what they moved
+
+Same 15 cases in English and Romanian, same house, same model. Four cases still
+skip for want of a lit lamp that reports a level.
+
+| | before | after |
+|---|---|---|
+| worked in the end | 57.7 % | **84.6 %** |
+| worked first try | 50.0 % | **65.4 %** |
+| passed / recovered | 13 / 2 | **17 / 5** |
+| drifted / failed | 2 / 9 | **0 / 4** |
+| median turn | 8.8 s | 8.8 s |
+| slowest tenth | 14.4 s | 13.4 s |
+
+Latency is unchanged, which is the point: none of the three costs a round trip,
+a prompt character or a word of any language.
+
+Sorting the calls by what became of them shows where the gain came from:
+
+| | before | after |
+|---|---|---|
+| landed cleanly | 9 (24 %) | **16 (41 %)** |
+| the house did not reach what was asked | 9 (24 %) | 6 (15 %) |
+| the server refused the call outright | 8 (21 %) | **2 (5 %)** |
+| Fono refused an invented number | 10 | 10 |
+| Fono refused a value tool with no value | — | 4 |
+| calls carrying a blank field | 16 | **3** |
+
+### The name the user spoke is the target
+
+A device name the *server itself* published, that exactly one device answers
+to, found whole in the words at a word boundary, is put in the device field and
+the wider place is dropped after it. Longest match wins, and a name that is
+also an area name in this home is left alone, so "everything in the Office"
+is never narrowed to a device called *Office*.
+
+It works, and the record shows it working: `aprinde Balcony lights` produced
+`{"area": "Yard", "brightness": 100, "color": "white"}` — no device at all —
+and what travelled was `{"name": "Balcony lights", …}`. Six climate and cover
+turns that used to reach a whole bedroom now reach the one device.
+
+### A tool that sets one thing must be given it
+
+Where a field is the only value a tool sets, and no tool sharing that field
+sets anything else, the field is compulsory whatever the schema says. It is
+insisted upon in the rails, so a local model cannot write the empty call, and
+refused at the door for a backend with no rails.
+
+Server refusals fell from 8 to 2, and all eight of the old ones were the same
+empty `HassClimateSetTemperature`.
+
+### Nothing writable that Fono deletes
+
+Text in the rails can no longer be empty. Calls carrying a blank field fell
+from 16 to 3.
+
+### What is left
+
+- **`__all__` in `floor` is now on 25 calls of 39**, up from 8. Harmless — it
+  is stripped before the call travels, and the wider place is dropped whenever
+  a nearer target exists — but it is written every time and paid for every
+  time. `floor` is the one target field with no published list of values, so
+  it is free text and the everything-word leaks into it. Pinning it needs a
+  floor catalogue the server does not currently offer.
+- **A blind's state is not understood.** `Curtain Left` was asked to open, was
+  open afterwards, and the readback called that a disagreement, because only
+  `on` and `off` are recognised as the two ends of a switch. The model then
+  "corrected" itself with a switch-off and claimed success.
+- **A refusal can end the turn in silence.** `turn on the Air conditioner` was
+  refused once and the model wrote nothing further — no call, no sentence. The
+  complaint has to leave the model somewhere to go.
+- **An air conditioner in `cool` does not answer `turn_off`**, which is the
+  house, not Fono.
+
+### The recogniser and digits
+
+The assistant path now carries a four-number demonstration as the recogniser's
+prompt. A recogniser's prompt is a continuation channel, not an instruction
+channel, so asking for a spelling in words does nothing and showing it is the
+only thing that works. Digits and punctuation belong to no language, so the
+same handful of characters serve every language Fono hears, and a leak into
+the transcript is a stray digit rather than a stray sentence. **Unmeasured:**
+the command benchmark feeds text and never opens the recogniser, so this needs
+a spoken test before it is believed.
+
+### Measured: 58 % → 77 %, at the same speed
+
+Same 15 cases in both languages, same house, four skipped for want of a target.
+
+| | before | after |
+|---|---|---|
+| worked in the end | 57.7 % | **76.9 %** |
+| worked first try | 50.0 % | **61.5 %** |
+| failed | 9 | **5** |
+| median turn | 8.8 s | 9.3 s |
+| slowest tenth | 14.4 s | 14.6 s |
+
+The call ledger says which change did what:
+
+| what became of the call | before | after |
+|---|---|---|
+| landed cleanly | 9 | **15** |
+| the house did not reach what was asked | 9 | **7** |
+| the server refused the call outright | 8 | **2** |
+| Fono refused an invented number | 10 | 10 |
+| Fono refused for the new reason | — | 4 |
+| calls carrying a blank field | 16 | **3** |
+
+The named-target rule is visible in every climate turn: the model writes
+`{"area": "Master bedroom", "floor": "__all__"}` and the house receives
+`{"name": "Air conditioner"}`. The empty set-temperature call is gone from the
+server's side of the ledger — it is now refused here, with a sentence naming
+the tool that switches things, and both languages then reach the right tool.
+
+Latency did not move, which is the point: none of the three costs a round trip.
+
+### What the run left behind
+
+- **`__all__` has moved house rather than left it.** A blank field is no longer
+  writable, so the model writes `"floor": "__all__"` instead — 8 calls before,
+  25 after. Every one is stripped before the call travels, so it costs tokens
+  and nothing else, but the cause is plain: `floor` is the one target field
+  whose permitted values this server never published, so it is the one field
+  with nothing holding it. Either it is constrained by a published list of
+  floors, or it is not offered at all; there is no third option that stops the
+  model filling it with something it invented.
+- **A blind that is already open cannot be told so.** `HassTurnOn` on
+  `Curtain Left` was accepted, the readback said `open`, and Fono reported the
+  command as not having reached the state asked for. The judge knows `on` and
+  `off`; it does not know that `open` is what `HassTurnOn` produces on a cover.
+  The model then sent `HassTurnOff` at the same blind and claimed success.
+- **The air conditioner still cannot be switched off.** It sits in `cool`;
+  `HassTurnOff` is accepted and the mode does not change. This is the house.
+- **A device the home has not got is still acted on in Romanian** — the pizza
+  oven became the Kitchen thermostat. English refuses it in 0.6 s.
+
+## 10. What the house can actually do, read from Home Assistant directly
+
+Read from the REST API rather than from `GetLiveContext`, because the intent
+catalogue publishes **state** and the capability lives in attributes the
+catalogue never forwards. Everything below is a fact about this house that the
+suite could not have learned from the tools it uses.
+
+### The value tools are wider than the suite
+
+| tool | value field | bounds published | exercised |
+|---|---|---|---|
+| `HassLightSet` | `brightness` 0–100, `color`, `temperature` | yes | brightness only, and both cases skip |
+| `HassSetVolume` | `volume_level` 0–100 | yes | yes |
+| `HassSetPosition` | `position` 0–100 | yes | **never** |
+| `HassSetVolumeRelative` | `volume_step` −100…100 or up/down | yes | yes |
+| `HassClimateSetTemperature` | `temperature` | **none** | yes |
+| `HassStopMoving` | — | — | **never** |
+
+`HassClimateSetTemperature` is the **only** value tool in the catalogue with no
+`minimum` and no `maximum`, and it is the tool that produced the reported
+defect. The device declares `min_temp: 7, max_temp: 35`; the intent schema
+forwards neither. So a check that enforced the published bounds would have
+caught an out-of-range `brightness`, `position` or `volume_level` and would
+**not** have caught `temperature: 0`. That is a concrete upstream contribution:
+publish the device's own bounds on the climate intent, and mark the value
+required.
+
+### Covers are the reliably adjustable devices, and nothing tests them
+
+| cover | state | position | can |
+|---|---|---|---|
+| Curtain Left | open | 100 | open, close, **set position**, stop |
+| Guest bedroom roller | open | 100 | open, close, **set position** |
+| Kids bedroom Roller | closed | 0 | open, close, **set position** |
+| Master bedroom roller | closed | 0 | open, close, **set position** |
+| Gate | closed | 0 | open, close, set position, stop |
+
+Every reachable cover reports `current_position` **whatever state it is in**.
+That makes a cover the one device kind whose level a fixture can rely on
+without first switching anything on — which is exactly what the two skipped
+light cases need and cannot get.
+
+### A dimmable light is invisible while it is off
+
+Of the lights this house exposes, about fifteen can be dimmed and the rest are
+`onoff` only. A light reports `brightness` **only while it is on**, so
+`adjustable_device{light}` can see one candidate: `Couch`, at full brightness.
+
+`Couch` is two entities with the same name, so it is not addressable, so it is
+not targetable, so both `plain_switch_on_invents_no_brightness` and
+`dim_uses_the_brightness_tool` skip. Two guards against the reported defect are
+absent, and the reason is a name collision in one house.
+
+`Living square` is the useful device here and the suite cannot ask for it by
+capability: unique name, `rgbw`, so both a brightness and a colour are
+settable. Its five siblings (`Living square (1)`, `red`, `green`, `blue`,
+`white`) are brightness-only channels of the same fitting.
+
+### What follows
+
+- **A cover position case earns its place twice**: it covers an enabled tool
+  nothing has ever called, and it is the only value case that cannot skip.
+- **`adjustable_device` must be allowed to find out.** Resolve to a targetable
+  device of the domain, stage it on, read the house again, and if it still
+  reports no level, drop it and re-resolve. `House::without` already exists for
+  exactly this shape — a device the run learns the hard way is unusable.
+- **`open`/`closed` is not `on`/`off`.** `desired_state` maps `HassTurnOn` to
+  the literal `on` and compares the readback for string equality, so opening a
+  blind is reported to the model as a failed call. The model then closes it and
+  says it did. This is the clearest wrong action in the suite and it is ours.
+
+## 11. The upstream defect, located in three lines
+
+`homeassistant/components/mcp_server/server.py:41-53` builds each tool
+descriptor like this:
+
+```python
+input_schema = convert(tool.parameters, custom_serializer=custom_serializer)
+return types.Tool(
+    name=tool.name,
+    description=tool.description or "",
+    inputSchema={
+        "type": "object",
+        "properties": input_schema["properties"],
+    },
+)
+```
+
+`voluptuous_openapi.convert` returns `{"type", "properties", "required"}`.
+The MCP server copies two of the three keys and throws `required` away.
+
+The intent handlers themselves are correct.
+`SetTemperatureIntent.slot_schema` declares `vol.Required("temperature")`
+(`homeassistant/components/climate/intent.py:31`), and a local run of
+`convert` over that schema emits `"required": ["temperature"]`. So the
+obligation exists, `convert` publishes it, and the transport discards it.
+This is why all 26 tools in Fono's catalogue report no required field.
+
+The consequence for any MCP client that constrains a model with the
+published schema: `HassClimateSetTemperature` appears callable with no
+temperature. A model asked to switch an air conditioner off reaches for
+the most specific climate tool, invents `temperature: 0` to satisfy a
+field it cannot tell is optional, and the house is asked to set zero
+degrees. When the invented value is refused the model writes the same
+tool with the field absent, which the schema also permits, and the
+server rejects the call.
+
+Secondary, weaker, and reported as a note rather than a defect:
+`vol.Coerce(float)` carries no range, so the climate intent publishes no
+`minimum` and no `maximum` while the device declares `min_temp: 7,
+max_temp: 35`. Every other value intent does publish bounds
+(`brightness` 0-100, `position` 0-100, `volume_level` 0-100). A client
+that enforces published bounds therefore catches a bad brightness and
+not a bad temperature.

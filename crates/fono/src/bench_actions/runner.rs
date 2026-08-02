@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use fono_assistant::mcp_client::{self, McpEndpoint};
 
 use super::fixture::{args_match, Case, CaseReport, Class, Manifest, Verdict};
-use super::house::{Entity, House, Level, Target};
+use super::house::{Entity, House, Level, Requirement, Target};
 use super::turn::{TurnDriver, TurnObservation};
 
 /// How long a setup or restore call may take.
@@ -30,6 +30,12 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A lamp reports back before the bulb has answered. Reading the world too
 /// soon scores the delay rather than the model.
 const SETTLE: Duration = Duration::from_millis(1200);
+
+/// How many devices one case may try before it gives up and skips.
+///
+/// Every rejection costs one staging call and one reading, so this is also the
+/// worst a case can cost when a home has nothing that fits it.
+const RE_AIM_LIMIT: usize = 12;
 
 /// What a run needs to know that the fixtures do not say.
 pub struct RunOptions {
@@ -84,7 +90,13 @@ pub struct CaseDetail {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DetailCall {
     pub name: String,
+    /// The model's draft, which is what the verdict scores.
     pub arguments: String,
+    /// What the executor actually sent, when it differs. Omitted when the call
+    /// travelled as written, so a reader who sees the field knows Fono
+    /// intervened without having to compare two identical strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent: Option<String>,
     pub outcome: Option<String>,
 }
 
@@ -162,10 +174,12 @@ async fn run_cases(
                 continue;
             }
         }
-        // Three tries: each refusal rules out one device, and a fixture that
-        // is still being refused after three has run out of house rather than
-        // luck.
-        for attempt in 0..3 {
+        // Each refusal rules out one device and the next try resolves again,
+        // so the cap is how much of a home a case may walk before it gives up.
+        // It is generous because a light reports a brightness only while it is
+        // on: a home with a dozen dark dimmers hides every one of them behind a
+        // device that has to be switched on to be ruled in or out.
+        for attempt in 0..RE_AIM_LIMIT {
             let usable = house.without(&unaddressable);
             // Resolve once per case, not once per language: the same device
             // must be used in every language or the cells are not comparable.
@@ -201,8 +215,18 @@ async fn run_cases(
                         case.id
                     );
                     unaddressable.insert(name.clone());
-                    if attempt == 2 {
+                    if attempt == RE_AIM_LIMIT - 1 {
                         let why = format!("this home would not act on `{name}` by name");
+                        for lang in &opts.languages {
+                            out.safe.push(skipped(case, lang, &why));
+                        }
+                    }
+                }
+                CaseRun::NoLevel(name) => {
+                    println!("  {:<34} re-aiming: `{name}` reports no level to set", case.id);
+                    unaddressable.insert(name.clone());
+                    if attempt == RE_AIM_LIMIT - 1 {
+                        let why = format!("`{name}` and its alternates report no level to set");
                         for lang in &opts.languages {
                             out.safe.push(skipped(case, lang, &why));
                         }
@@ -219,6 +243,7 @@ async fn run_cases(
 enum CaseRun {
     Scored { safe: Vec<CaseReport>, detail: Vec<CaseDetail> },
     Unaddressable(String),
+    NoLevel(String),
 }
 
 /// One case, in every requested language, against one resolved target.
@@ -231,6 +256,25 @@ async fn run_case(
 ) -> Result<CaseRun> {
     let mut safe = Vec::new();
     let mut detail = Vec::new();
+
+    // A case about a number needs a device that has one, and a lamp is silent
+    // about its brightness until it is lit — so the survey cannot answer the
+    // question for a house whose lamps are all off. Ask the device instead:
+    // switch it on, read the house, and if it still reports no level then this
+    // fixture is asking it for something it has not got. Costs one call and
+    // one settle, once per case, and only for the cases that need a number.
+    // Whatever this moves, the end-of-run pass puts back.
+    if matches!(case.requires, Requirement::AdjustableDevice { .. }) && !opts.dry_run {
+        if set_state(ep, &target.device, "on").await.is_err() {
+            return Ok(CaseRun::Unaddressable(target.device.name.clone()));
+        }
+        tokio::time::sleep(SETTLE).await;
+        let lit = House::read(ep).await.context("read the home while looking for a level")?;
+        if !lit.get(&target.device.name).is_some_and(Entity::is_adjustable) {
+            return Ok(CaseRun::NoLevel(target.device.name.clone()));
+        }
+    }
+
     for lang in &opts.languages {
         let Some(template) = case.utterances.get(lang) else {
             safe.push(skipped(case, lang, "no utterance written in this language"));
@@ -261,6 +305,7 @@ async fn run_case(
                     detail.push(*one);
                 }
                 Ran::Unaddressable(name) => return Ok(CaseRun::Unaddressable(name)),
+                Ran::NoLevel(name) => return Ok(CaseRun::NoLevel(name)),
             }
         }
     }
@@ -273,6 +318,10 @@ enum Ran {
     /// The staging call was refused, naming the device the house would not
     /// move. Not a score: the model was never asked anything.
     Unaddressable(String),
+    /// The device was staged and still reports no level to aim a number at.
+    /// Not a score either, and not the house's fault — the fixture asked for
+    /// something this device cannot be asked for.
+    NoLevel(String),
 }
 
 /// One case, in one language, once.
@@ -314,6 +363,31 @@ async fn run_one(
     // the model's fault.
     let before = House::read(ep).await.context("read the home before the command")?;
 
+    // A device that has gone dark since the house was surveyed can be
+    // commanded by nobody, so the case has nothing to say about the model.
+    // Caught here rather than at the end because the alternative is a run
+    // reporting an outage as a routing collapse — six cases of one run scored
+    // `failed` this way while a hub was down.
+    if !target.group.is_empty()
+        && !target.group.iter().any(|e| before.get(&e.name).is_some_and(Entity::is_available))
+    {
+        return Ok(Ran::Scored(
+            skipped(case, lang, "every device this case targets is unavailable"),
+            Box::new(CaseDetail {
+                id: case.id.clone(),
+                language: lang.to_string(),
+                said: said.to_string(),
+                device: target.device.name.clone(),
+                group: target.group_names().into_iter().map(str::to_string).collect(),
+                area: target.area.clone(),
+                bystander: None,
+                reply: String::new(),
+                calls: Vec::new(),
+                notes: vec!["every device this case targets is unavailable".to_string()],
+            }),
+        ));
+    }
+
     let obs = driver.run(said, lang).await?;
 
     tokio::time::sleep(SETTLE).await;
@@ -352,6 +426,7 @@ async fn run_one(
             .map(|c| DetailCall {
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
+                sent: c.sent.clone(),
                 outcome: c.outcome.clone(),
             })
             .collect(),
@@ -755,12 +830,29 @@ fn claims_success(reply: &str) -> bool {
 /// Bypassing is the point: staging must not depend on the thing being
 /// measured, or a model that cannot route also cannot be tested.
 async fn set_state(ep: &McpEndpoint, entity: &Entity, want: &str) -> Result<()> {
-    let tool = match (entity.domain.as_str(), want) {
-        (_, "on") => "HassTurnOn",
-        (_, "off") => "HassTurnOff",
+    let tool = match commandable(want) {
+        // A cover reports `open`/`closed` rather than `on`/`off`, and the
+        // same two intents move it: there is no `HassOpenCover`. Mapping the
+        // words here is what lets a fixture stage and restore a blind at all.
+        Some("on") => "HassTurnOn",
+        Some("off") => "HassTurnOff",
         _ => anyhow::bail!("do not know how to put a {} into `{want}`", entity.domain),
     };
     call(ep, tool, &serde_json::json!({ "name": entity.name })).await
+}
+
+/// The switch a reported state corresponds to, when there is one.
+///
+/// `on`/`off` for most things and `open`/`closed` for a cover, which is the
+/// same pair of intents wearing different words. Anything else — a climate
+/// mode, `playing`, `unavailable` — has no switch that reproduces it, and
+/// guessing would be worse than leaving it alone.
+fn commandable(state: &str) -> Option<&'static str> {
+    match state.to_lowercase().as_str() {
+        "on" | "open" => Some("on"),
+        "off" | "closed" => Some("off"),
+        _ => None,
+    }
 }
 
 /// Put one entity's level back where it was.
@@ -819,13 +911,13 @@ async fn restore(ep: &McpEndpoint, target: &Target, before: &House) -> Result<()
     let now = House::read(ep).await.ok();
     for name in names {
         let Some(entity) = before.get(name) else { continue };
-        if let Some(was) = entity.state.as_deref().filter(|s| matches!(*s, "on" | "off")) {
+        if let Some(was) = entity.state.as_deref().filter(|s| commandable(s).is_some()) {
             set_state(ep, entity, was).await?;
         }
         // After the switch, so a lamp is on before it is dimmed, and skipped
         // for a device that was off — where setting a level would switch it
         // back on.
-        if entity.state.as_deref() != Some("off") {
+        if commandable(entity.state.as_deref().unwrap_or_default()) != Some("off") {
             if let Some(was) = entity.level() {
                 let is = now.as_ref().and_then(|h| h.get(name)).and_then(Entity::level);
                 if is.is_none_or(|is| was.differs_from(is)) {
@@ -879,9 +971,9 @@ async fn restore_baseline(ep: &McpEndpoint, baseline: &House) -> Result<usize> {
 
         let mut touched = false;
         if was.state != is.state {
-            // Only on/off is restorable; a cover reports `open`/`closed` and
-            // is put back by position instead, below.
-            if let Some(want) = was.state.as_deref().filter(|s| matches!(*s, "on" | "off")) {
+            // Only a state with a switch behind it is restorable: `on`/`off`,
+            // and a cover's `open`/`closed`, which the same two intents move.
+            if let Some(want) = was.state.as_deref().filter(|s| commandable(s).is_some()) {
                 match set_state(ep, was, want).await {
                     Ok(()) => touched = true,
                     Err(e) => failures.push(format!("{}: {e}", was.name)),
@@ -892,7 +984,7 @@ async fn restore_baseline(ep: &McpEndpoint, baseline: &House) -> Result<usize> {
         // Levels after switching, so a lamp is on before it is dimmed. Skipped
         // for anything the home reports as off, where a level is meaningless
         // and setting one would switch the device back on.
-        if was.state.as_deref() != Some("off") {
+        if commandable(was.state.as_deref().unwrap_or_default()) != Some("off") {
             if let (Some(w), Some(i)) = (was.level(), is.level()) {
                 if w.differs_from(i) {
                     match set_level(ep, was, w).await {
@@ -1217,6 +1309,7 @@ mod tests {
                 .map(|n| super::super::turn::ObservedCall {
                     name: (*n).to_string(),
                     arguments: "{}".into(),
+                    sent: None,
                     outcome: None,
                     failed: false,
                 })

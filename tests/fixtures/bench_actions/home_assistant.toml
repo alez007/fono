@@ -13,7 +13,7 @@
 # The cases are not a tour of the happy path. Each one is a failure that has
 # actually been observed, written down so it cannot come back unnoticed.
 
-suite_version = 2
+suite_version = 4
 server = "Home Assistant"
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ es = "enciende la luz en {area}"
 [[cases]]
 id = "plain_switch_on_invents_no_brightness"
 class = "invented_argument"
-requires = { kind = "dimmable_device", domain = "light" }
+requires = { kind = "adjustable_device", domain = "light" }
 precondition = "off"
 expect_device = "on"
 expect_tool = "HassTurnOn"
@@ -107,10 +107,15 @@ es = "enciende {device}"
 [[cases]]
 id = "dim_uses_the_brightness_tool"
 class = "tool_choice"
-requires = { kind = "dimmable_device", domain = "light" }
+requires = { kind = "adjustable_device", domain = "light" }
 precondition = "on"
 expect_device = "on"
 expect_tool = "HassLightSet"
+# And the lamp has to be at thirty afterwards. Every language below spells the
+# number out in words rather than digits, which is the case that catches a
+# harness — Fono's or anyone's — refusing a number because no digit was typed.
+# Speech is where these commands come from, and speech has no digits.
+expect_level = 30
 
 [cases.utterances]
 en = "set the {device} to thirty percent"
@@ -250,3 +255,140 @@ en = "set the volume to seventy on the {device}"
 ro = "setează volumul la 70 pe {device}"
 fr = "règle le volume à soixante-dix sur {device}"
 es = "pon el volumen a setenta en {device}"
+
+# ---------------------------------------------------------------------------
+# A blind, which is neither on nor off.
+#
+# Every case above this point acts on something that reports `on` or `off`. A
+# cover reports `open` and `closed`, and there is no `HassOpenCover` — the same
+# two switch intents move it. So this is the plain switch-on wearing different
+# words, and a model that has learnt "on means HassTurnOn" rather than "the
+# user wants this thing running" fails it.
+#
+# It is also the only case where the harness itself has to know that a state it
+# has never seen is still a state it can put back.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "open_a_cover"
+class = "plain_command"
+requires = { kind = "device", domain = "cover" }
+precondition = "closed"
+expect_device = "open"
+expect_tool = "HassTurnOn"
+# Nobody said how far. A position is one tool away, and a blind asked to open
+# that stops at forty percent has answered a request nobody made.
+forbid_args = ["position"]
+
+[cases.utterances]
+en = "open the {device}"
+ro = "deschide {device}"
+fr = "ouvre {device}"
+es = "abre {device}"
+
+# ---------------------------------------------------------------------------
+# A blind asked to go half way.
+#
+# `HassSetPosition` is enabled in every house that owns a blind, publishes its
+# bounds honestly, and has never been called by Fono. It is also the only value
+# case that cannot be skipped for want of a device: a lamp reports its
+# brightness only while it is lit, and a speaker only after something has
+# played, but a blind reports how far open it is whatever it is doing.
+#
+# The number is asserted against the blind and not only against the call. A
+# position that the server refused would otherwise score as a pass on the tool
+# name alone, which is exactly how the dimming case used to pass while doing
+# nothing.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "set_a_cover_position_uses_the_position_tool"
+class = "tool_choice"
+requires = { kind = "adjustable_device", domain = "cover" }
+precondition = "closed"
+expect_tool = "HassSetPosition"
+expect_args = { position = 50 }
+expect_level = 50
+
+[cases.utterances]
+en = "set the {device} to 50 percent"
+ro = "pune {device} la 50 la sută"
+fr = "règle {device} à 50 pour cent"
+es = "pon {device} al 50 por ciento"
+
+# ---------------------------------------------------------------------------
+# A name the home does not have.
+#
+# The worst failure short of an outright lie: asked for something that is not
+# there, a model quietly does it to the nearest thing that is. Nothing in the
+# call looks wrong — the tool is right, the arguments are well-formed, the
+# server accepts it — and a device nobody mentioned changes state.
+#
+# Scored entirely on the house. The right answer is to say the home has no such
+# thing; looking it up first is allowed, acting is not.
+#
+# Skips on a home that turns out to own something by this name, which is why
+# the name is deliberately absurd rather than merely unlikely.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "an_unknown_device_is_refused"
+class = "must_not_act"
+requires = { kind = "no_such_device", name = "pizza oven" }
+expect_no_change = true
+
+[cases.utterances]
+en = "turn on the pizza oven"
+ro = "pornește cuptorul de pizza"
+fr = "allume le four à pizza"
+es = "enciende el horno de pizza"
+
+# ---------------------------------------------------------------------------
+# An area with several devices in it, where every one of them has to arrive.
+#
+# The area case above resolves onto whatever area has a light and a bystander,
+# which may be an area with exactly one lamp — and there "they all came on" and
+# "it came on" are the same sentence. Insisting on several exercises the parts
+# that only exist because one command reaches many devices: every member having
+# to land, and the reading of the home afterwards having to report on a dozen
+# devices without reciting a dozen names at the model.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "an_area_of_several_lights_all_arrive"
+class = "area_command"
+requires = { kind = "area_with_several", domain = "light", at_least = 3 }
+precondition = "off"
+expect_device = "on"
+expect_args = { domain = ["light"] }
+
+[cases.utterances]
+en = "turn on all the lights in the {area}"
+ro = "aprinde toate luminile din {area}"
+fr = "allume toutes les lumières dans {area}"
+es = "enciende todas las luces en {area}"
+
+# ---------------------------------------------------------------------------
+# Aiming an air conditioner at a temperature.
+#
+# The mirror image of the switch-on case above, and the one command where the
+# temperature field is the request rather than an invention. A suite that only
+# ever forbids that field teaches nothing about whether the model can still
+# reach for it when it is asked to — and the fix for the invented value is
+# exactly the kind of fix that could break this.
+#
+# The number is not asserted against the device, only against the call: houses
+# disagree about degrees, a device clamps to its own limits, and a fixture that
+# demanded the thermostat read back twenty-three would be a fixture about one
+# air conditioner. What matters is that the number the user said reached the
+# call intact.
+# ---------------------------------------------------------------------------
+[[cases]]
+id = "set_a_temperature_uses_the_climate_tool"
+class = "tool_choice"
+requires = { kind = "adjustable_device", domain = "climate" }
+precondition = "on"
+expect_tool = "HassClimateSetTemperature"
+expect_args = { temperature = 23 }
+
+[cases.utterances]
+en = "set the {device} to twenty-three degrees"
+ro = "pune {device} la 23 de grade"
+fr = "règle {device} à vingt-trois degrés"
+es = "pon {device} a veintitrés grados"

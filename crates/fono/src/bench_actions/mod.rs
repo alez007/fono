@@ -258,8 +258,11 @@ async fn show_house(config: &Config, secrets: &Secrets) -> Result<()> {
         for area in house.areas() {
             println!("\n  {area}");
             for e in house.in_area(&area) {
-                let dim = if e.is_dimmable() { "  dimmable" } else { "" };
+                let dim = if e.level().is_some() { "  adjustable" } else { "" };
                 let safe = if e.safe_to_target() { "" } else { "  [never targeted]" };
+                // An outage is the commonest reason a run comes back full of
+                // skips, and it is invisible in a list that only prints states.
+                let out = if e.is_available() { "" } else { "  [unreachable]" };
                 // Aliases are shown because a fixture may name any of them,
                 // and a bilingual house is where that matters.
                 let also = if e.aliases.is_empty() {
@@ -268,7 +271,7 @@ async fn show_house(config: &Config, secrets: &Secrets) -> Result<()> {
                     format!("  (also {})", e.aliases.join(", "))
                 };
                 println!(
-                    "    {:<40} {:<14} {}{dim}{also}{safe}",
+                    "    {:<40} {:<14} {}{dim}{also}{safe}{out}",
                     e.name,
                     e.domain,
                     e.state.as_deref().unwrap_or("-")

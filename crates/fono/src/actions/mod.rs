@@ -526,6 +526,32 @@ fn rails(store: &ToolCatalogStore, rows: &[fono_core::tool_catalog::ToolRow]) ->
         if !said.is_empty() {
             described.push(format!("{source}: {}", said.join(", ")));
         }
+
+        // A tool that sets exactly one thing cannot do anything without it, so
+        // the field is compulsory whatever the schema says. Home Assistant
+        // marks nothing required on any of its intents, which is how a
+        // set-temperature call with no temperature comes to be writable at
+        // all; the house then refuses it and the user waits for a round trip
+        // to learn nothing.
+        //
+        // A field is only made compulsory where it is the *sole* value of
+        // every tool declaring it. One shared with a tool that sets several
+        // things is a real choice there, and insisting on it would make that
+        // tool's other perfectly good calls unwritable.
+        let mut sole: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut among_others: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for r in rows.iter().filter(|r| r.source.as_str() == *source) {
+            let values = the_values_a_tool_sets(&r.schema, fields);
+            if values.len() == 1 {
+                sole.extend(values);
+            } else {
+                among_others.extend(values);
+            }
+        }
+        for field in sole.difference(&among_others) {
+            slots.require(source, field);
+        }
     }
 
     let g = fono_core::tool_grammar::build(rows, &slots);
@@ -899,7 +925,7 @@ const RULES: [&str; 6] = [
     "Never translate or invent an area or device name — pick the closest one listed.",
     "When the user says which kind of device they mean — the lights, the heating, the blinds — \
      the domain is required, e.g. {\"area\": \"Master bedroom\", \"domain\": [\"climate\"]}. \
-     Write [\"__all__\"] only when they meant every device in the area.",
+     Write the domain [\"__all__\"] only when they meant every device in the area.",
     "One call for an area, not one per device: an area plus a domain is a single call.",
     "When the user names a device, act on it by that name and add no area: a device's name \
      often mentions somewhere it is not.",
@@ -1049,11 +1075,21 @@ struct HouseFacts {
     /// this home uses for two kinds of thing is left out: there is no one
     /// answer, so there is nothing to correct to.
     kind_of: std::collections::HashMap<String, String>,
-    /// Names this home uses for exactly one device. Such a name is the whole
+    /// Names this home uses for exactly one device, folded for comparison and
+    /// paired with the spelling the home published. Such a name is the whole
     /// address of a thing, so nothing else needs saying to reach it. A name two
     /// devices share is left out — there the area is the only thing telling
     /// them apart.
-    sole: std::collections::HashSet<String>,
+    ///
+    /// The published spelling is kept because it is the only one that works: a
+    /// home matches a name exactly, so a name recovered from what the user said
+    /// has to be written back in the home's own casing, not the user's.
+    sole: std::collections::HashMap<String, String>,
+    /// Area names, folded. Only ever used to *decline* to treat a word as a
+    /// device: a home with a room and a device sharing one name gives that word
+    /// two readings, and "everything in the Office" must not be narrowed to a
+    /// single thing called `Office`.
+    places: std::collections::HashSet<String>,
 }
 
 impl HouseFacts {
@@ -1062,11 +1098,11 @@ impl HouseFacts {
         let mut kind_of: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut ambiguous = Vec::new();
-        let mut sole = std::collections::HashSet::new();
+        let mut sole = std::collections::HashMap::new();
         let mut shared = Vec::new();
         for d in store.devices().unwrap_or_default() {
             let key = d.name.trim().to_lowercase();
-            if !sole.insert(key.clone()) {
+            if sole.insert(key.clone(), d.name.trim().to_string()).is_some() {
                 shared.push(key.clone());
             }
             match kind_of.get(&key) {
@@ -1083,7 +1119,84 @@ impl HouseFacts {
         for key in shared {
             sole.remove(&key);
         }
-        Self { slots, kind_of, sole }
+        let places = store
+            .place_names()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.trim().to_lowercase())
+            .collect();
+        Self { slots, kind_of, sole, places }
+    }
+
+    /// Aim the call at the device the user actually named.
+    ///
+    /// The defect: asked to turn off the *Air conditioner* — a name this home
+    /// publishes, spoken exactly as it is written — a local model wrote
+    /// `HassTurnOff {"area": "Master bedroom"}`, and the house obediently
+    /// switched off two beds, two lights, a salt lamp and a curtain. Nine of
+    /// the nineteen commands in one run that spoke a catalogued name did this,
+    /// and every one of them reached for an area instead. An area is not a
+    /// vaguer way of saying a device; it is a different set of devices.
+    ///
+    /// So when the request contains a name this home uses for exactly one
+    /// thing, that name is the target, and it is written in whatever the model
+    /// wrote. [`HouseFacts::agree`] then takes out the area, the storey and the
+    /// class of device, because a name only one device answers to needs none of
+    /// them — that rule already existed and never fired, for want of a name to
+    /// fire it on.
+    ///
+    /// Nothing here reads a word of any language. It compares what was said
+    /// against the list the server published about itself, so it works on a
+    /// house Fono has never seen, in a language Fono cannot parse, and on a
+    /// cloud backend exactly as on a local one.
+    ///
+    /// Silent in four cases, each of which would be Fono guessing:
+    ///
+    /// - the model already named a device the user said — it is right already;
+    /// - the name is shared by two devices, so there is no single thing to aim
+    ///   at (the area is what tells them apart);
+    /// - the name is also an area's name, so the word has two readings and
+    ///   picking one would break *"everything in the Office"*;
+    /// - the server publishes no field for a device name.
+    ///
+    /// The longest spoken name wins, so a home holding both `Couch` and
+    /// `Couch Blue` reaches the one the user said all of.
+    fn aim_at_what_was_said(
+        &self,
+        args: serde_json::Value,
+        said: &str,
+    ) -> (serde_json::Value, Option<String>) {
+        let Some(field) = self.slots.device else { return (args, None) };
+        let heard = said.trim().to_lowercase();
+        if heard.is_empty() {
+            return (args, None);
+        }
+        let Some(map) = args.as_object() else { return (args, None) };
+
+        // A name the model wrote that the user also said is the answer already.
+        if let Some(written) = map.get(field).and_then(|v| v.as_str()) {
+            if spoken_in(&heard, &written.trim().to_lowercase()) {
+                return (args, None);
+            }
+        }
+
+        let Some((_, published)) = self
+            .sole
+            .iter()
+            .filter(|(folded, _)| !self.places.contains(*folded))
+            .filter(|(folded, _)| spoken_in(&heard, folded))
+            .max_by_key(|(folded, _)| folded.chars().count())
+        else {
+            return (args, None);
+        };
+
+        let mut map = map.clone();
+        let previous = map.insert(field.to_string(), serde_json::Value::String(published.clone()));
+        let note = previous.as_ref().and_then(serde_json::Value::as_str).map_or_else(
+            || format!("{field} is {published}: the user said it"),
+            |was| format!("{field} was {was}, but the user said {published}"),
+        );
+        (serde_json::Value::Object(map), Some(note))
     }
 
     /// Make the call agree with the house that was published.
@@ -1159,7 +1272,7 @@ impl HouseFacts {
                     }
                 }
             }
-            if self.sole.contains(&key) {
+            if self.sole.contains_key(&key) {
                 let wider = [self.slots.place, self.slots.wider_place, self.slots.filter];
                 for field in wider.into_iter().flatten() {
                     if map.remove(field).is_some() {
@@ -1182,6 +1295,36 @@ impl HouseFacts {
         }
         (Value::Object(map), Some(notes.join("; ")))
     }
+}
+
+/// Did the request contain this name, as a name rather than as part of a word?
+///
+/// Both sides arrive folded, so this is a plain search with one condition: what
+/// sits either side of a match must not be a letter or a digit. Without it a
+/// device called `TV` is found inside *"switch it off"*, and a home is free to
+/// name a thing after a syllable.
+///
+/// Deliberately nothing cleverer. No stemming, no fuzzy distance, no word list
+/// — a near-match is a guess, and this is only ever allowed to act on a name
+/// the user said exactly as the home writes it.
+fn spoken_in(heard: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(offset) = heard[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let clear_before = heard[..start].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let clear_after = heard[end..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if clear_before && clear_after {
+            return true;
+        }
+        // Past the first character of this match, so an overlapping one is
+        // still found — and never a zero-width step, which would not end.
+        from = start + heard[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Never send a number the user did not ask for.
@@ -1245,6 +1388,48 @@ fn numbers_nobody_asked_for(
         )
     });
     (args, complaint)
+}
+
+/// The values a tool exists to set, as against the fields that only say which
+/// device it means.
+///
+/// The split needs one thing from the vendor layer and nothing else: the names
+/// of the target fields, which are already asked for and already stated per
+/// server. Everything a tool declares that is not a target is a value it exists
+/// to set. A server whose catalogue is unrecognised supplies no target names,
+/// so every field counts as a value and no tool is ever reduced to one — which
+/// is the right answer when Fono cannot tell the two apart.
+fn the_values_a_tool_sets(schema: &serde_json::Value, slots: vendor::SlotFields) -> Vec<String> {
+    let targets: std::collections::BTreeSet<&str> =
+        [slots.place, slots.wider_place, slots.device, slots.kind, slots.filter]
+            .into_iter()
+            .flatten()
+            .collect();
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|props| props.keys().filter(|k| !targets.contains(k.as_str())).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The one value a tool exists to set, when it sets exactly one.
+///
+/// A tool with a single value field is a tool whose whole purpose is that
+/// value, so a call that omits it asks the server to set nothing. Every such
+/// call in a run of the suite was refused outright by the house: eight of
+/// them, every one `HassClimateSetTemperature` with no temperature, written
+/// after Fono had stopped an invented one and the model deleted the field
+/// rather than change tool.
+///
+/// Nothing is claimed about a tool declaring two or more. A tool taking a
+/// brightness and a colour is a real answer to a request naming either, and
+/// which of them is wanted is the user's business, not a rule's.
+fn the_one_value_a_tool_sets(
+    schema: &serde_json::Value,
+    slots: vendor::SlotFields,
+) -> Option<String> {
+    let values = the_values_a_tool_sets(schema, slots);
+    (values.len() == 1).then(|| values.into_iter().next().unwrap_or_default())
 }
 
 /// Check the arguments against what the server said it accepts.
@@ -1434,9 +1619,13 @@ fn prepare_args(
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let args = drop_empty_arguments(drop_any_kind(args));
+    // A name the user said outranks anything the model reached for instead,
+    // and has to be settled before the house corrects the call: the rules that
+    // take out the area and the storey only fire on a named device.
+    let (args, aimed) = house.aim_at_what_was_said(args, &words.said.words());
     // Anything the house has already stated is not the model's to get wrong.
     let (args, corrected) = house.agree(args);
-    if let Some(note) = corrected {
+    for note in [aimed, corrected].into_iter().flatten() {
         debug!(tool = %call.name, "actions: corrected {}: {note}", call.name);
         current_instant(
             "tool.corrected",
@@ -1471,6 +1660,35 @@ fn prepare_args(
     } else {
         args
     };
+
+    // A tool that sets one thing, written without the thing. The house refuses
+    // these itself, so the only question is whether the user waits for it to
+    // say so; naming the way out here is both faster and more use to the model
+    // than the server's own rejection.
+    if let Some(field) = the_one_value_a_tool_sets(&r.schema, house.slots) {
+        if args.as_object().is_some_and(|o| !o.contains_key(&field)) {
+            let complaint = format!(
+                "{field} is the only thing {} sets, and there is none in this call, so it \
+                 would ask the house to set nothing. Either say the value or use the tool \
+                 that switches things without one.",
+                call.name
+            );
+            warn!(tool = %call.name, args = %call.arguments, "actions: not sending {}: {complaint}", call.name);
+            current_instant(
+                "tool.rejected",
+                "actions",
+                ACTIONS_LANE,
+                serde_json::json!({ "tool": call.name, "args": args, "complaint": complaint }),
+            );
+            return Err(Refusal {
+                sent: args.to_string(),
+                complaint: format!("{} was not sent: {complaint}", call.name),
+                // Writing the same call again would still set nothing, so
+                // there is no reading of the request under which it works.
+                repeat_ok: false,
+            });
+        }
+    }
 
     // Never sent, so nothing moved and a correction is free. The complaint is
     // phrased against the schema the model was shown, which is a more useful
@@ -1855,17 +2073,83 @@ fn claimed(vendor: &'static dyn Vendor, result: &str) -> Vec<String> {
 
 /// What the house reads, as one sentence to hand back to the model.
 ///
+/// A command aimed at a room reaches everything in it, and naming each one back
+/// is the largest thing the model reads in an ordinary turn: one measured reply
+/// listed twelve lights in 152 tokens, which the model paid to read twice while
+/// it corrected itself — 5.7 s of a 15.3 s turn, for a ten-word request.
+///
+/// The reader only needs to know whether the devices agree, and which ones do
+/// not. So devices in the same state are counted rather than listed, and the
+/// names are spent on the ones that stand apart: the largest group is a bare
+/// count, every smaller group is named. A device that disobeyed is the whole
+/// point of looking, and it is exactly what survives.
+///
+/// Grouping is by equality of the state string, so this knows nothing of what
+/// any state means and works for a server Fono has never seen.
+///
 /// Empty when there is nothing to report, so a caller can append it
 /// unconditionally without leaving a stray sentence behind.
 fn state_of_the_house(readings: &[(String, String)]) -> String {
-    if readings.is_empty() {
-        return String::new();
+    // Under this, naming each device is both short and more useful than any
+    // summary of it.
+    const LIST_ALL: usize = 4;
+    // Enough of a minority to say which devices stand apart, before the list
+    // itself becomes the thing being paid for.
+    const NAMED: usize = 6;
+
+    // Two devices with the same name in the same state say the same thing
+    // twice; two with the same name in *different* states are a genuine
+    // disagreement and both survive.
+    let mut seen: Vec<&(String, String)> = Vec::with_capacity(readings.len());
+    for r in readings {
+        if !seen.contains(&r) {
+            seen.push(r);
+        }
     }
-    let each: Vec<String> = readings.iter().map(|(n, s)| format!("{n} is {s}")).collect();
+    let told = match seen.len() {
+        0 => return String::new(),
+        n if n <= LIST_ALL => {
+            seen.iter().map(|(n, s)| format!("{n} is {s}")).collect::<Vec<_>>().join(", ")
+        }
+        total => {
+            let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+            for (name, state) in &seen {
+                match groups.iter_mut().find(|(s, _)| *s == state.as_str()) {
+                    Some((_, names)) => names.push(name),
+                    None => groups.push((state, vec![name])),
+                }
+            }
+            // Biggest first, so the bare count is the one that would have cost
+            // the most to spell out. Ties keep the order the house read them in.
+            groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
+            if groups.len() == 1 {
+                format!("all {total} are {}", groups[0].0)
+            } else {
+                let parts: Vec<String> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (state, names))| {
+                        let is = if names.len() == 1 { "is" } else { "are" };
+                        match (i, names.len()) {
+                            (0, n) => format!("{n} {is} {state}"),
+                            (_, n) if n <= NAMED => {
+                                format!("{n} {is} {state}: {}", names.join(", "))
+                            }
+                            (_, n) => format!(
+                                "{n} {is} {state}: {} and {} more",
+                                names[..NAMED].join(", "),
+                                n - NAMED
+                            ),
+                        }
+                    })
+                    .collect();
+                format!("{total} devices — {}", parts.join("; "))
+            }
+        }
+    };
     format!(
-        " Reading the home back afterwards: {}. Tell the user what the home actually says, not \
-         what was asked for.",
-        each.join(", ")
+        " Reading the home back afterwards: {told}. Tell the user what the home actually says, \
+         not what was asked for."
     )
 }
 
@@ -2030,8 +2314,12 @@ mod tests {
         let mut kind_of = std::collections::HashMap::new();
         kind_of.insert("air conditioner".to_string(), "climate".to_string());
         kind_of.insert("balcony lights".to_string(), "light".to_string());
-        let sole = ["air conditioner", "balcony lights"].into_iter().map(String::from).collect();
-        HouseFacts { slots: slots(), kind_of, sole }
+        let sole = [("air conditioner", "Air conditioner"), ("balcony lights", "Balcony lights")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let places = ["kitchen", "yard", "office"].into_iter().map(String::from).collect();
+        HouseFacts { slots: slots(), kind_of, sole, places }
     }
 
     /// The fields Home Assistant uses to say *which* device a call is about.
@@ -2043,6 +2331,96 @@ mod tests {
             kind: Some("domain"),
             filter: Some("device_class"),
         }
+    }
+
+    /// A tool with only its schema filled in. Nothing here reaches a server,
+    /// so the endpoint is a placeholder.
+    fn runnable(schema: serde_json::Value) -> Runnable {
+        Runnable {
+            endpoint: fono_assistant::mcp_client::McpEndpoint {
+                url: "http://example.invalid/mcp".to_string(),
+                token: None,
+                timeout: CALL_TIMEOUT,
+            },
+            verify: VerifyClass::None,
+            readback: None,
+            schema,
+            source: "hass".to_string(),
+        }
+    }
+
+    /// One call the model wrote.
+    fn wrote(name: &str, arguments: &str) -> ToolCall {
+        ToolCall { id: "1".to_string(), name: name.to_string(), arguments: arguments.to_string() }
+    }
+
+    /// What the user said, in the shape the checks read it.
+    fn said(words: &str) -> Words {
+        let w = Words::default();
+        w.said.heard(words);
+        w
+    }
+
+    /// A tool that sets one thing is the tool that sets that thing. Home
+    /// Assistant's set-temperature intent takes four fields naming a device
+    /// and one temperature; the switch intents take no value at all.
+    #[test]
+    fn a_tool_is_reduced_to_the_one_value_it_sets() {
+        let set_temperature = serde_json::json!({"properties": {
+            "area": {}, "floor": {}, "name": {}, "domain": {}, "temperature": {}
+        }});
+        assert_eq!(
+            the_one_value_a_tool_sets(&set_temperature, slots()),
+            Some("temperature".to_string())
+        );
+
+        let turn_off = serde_json::json!({"properties": {
+            "area": {}, "floor": {}, "name": {}, "domain": {}, "device_class": {}
+        }});
+        assert_eq!(the_one_value_a_tool_sets(&turn_off, slots()), None, "it sets nothing");
+
+        let light_set = serde_json::json!({"properties": {
+            "name": {}, "brightness": {}, "color": {}
+        }});
+        assert_eq!(
+            the_one_value_a_tool_sets(&light_set, slots()),
+            None,
+            "which of the two is wanted is the user's business"
+        );
+    }
+
+    /// A server Fono does not recognise names no target fields, so every field
+    /// counts as a value and nothing is ever insisted on. Saying nothing is the
+    /// right answer when the two cannot be told apart.
+    #[test]
+    fn an_unrecognised_server_has_nothing_insisted_upon() {
+        let schema = serde_json::json!({"properties": {"area": {}, "temperature": {}}});
+        assert_eq!(the_one_value_a_tool_sets(&schema, vendor::SlotFields::default()), None);
+    }
+
+    /// Verbatim from the benchmark: eight calls in one run were
+    /// `HassClimateSetTemperature` with no temperature at all, written after
+    /// Fono had stopped an invented one. The model deleted the field rather
+    /// than change tool, and the house refused every one of them.
+    #[test]
+    fn a_value_tool_written_without_its_value_stays_at_home() {
+        let schema = serde_json::json!({"properties": {
+            "area": {}, "name": {}, "temperature": {}
+        }});
+        let r = runnable(schema);
+        let call = wrote("HassClimateSetTemperature", r#"{"name": "Air conditioner"}"#);
+        let Err(refused) = prepare_args(&r, &house(), &Words::default(), &call) else {
+            panic!("a set-temperature call with no temperature sets nothing")
+        };
+        assert!(refused.complaint.contains("temperature"), "{}", refused.complaint);
+        assert!(!refused.repeat_ok, "writing it again would still set nothing");
+
+        let call =
+            wrote("HassClimateSetTemperature", r#"{"name": "Air conditioner", "temperature": 23}"#);
+        assert!(
+            prepare_args(&r, &house(), &said("set the Air conditioner to 23"), &call).is_ok(),
+            "a temperature was asked for"
+        );
     }
 
     /// Verbatim from the benchmark, four cells over two languages: asked in
@@ -2150,6 +2528,82 @@ mod tests {
         // thing the call gave.
         let args = serde_json::json!({"floor": "1", "domain": ["light"]});
         assert_eq!(house().agree(args.clone()), (args, None), "nothing narrower was given");
+    }
+
+    /// Verbatim from a run: *"turn off the Air conditioner"* produced
+    /// `HassTurnOff {"area": "Master bedroom"}`, and the house switched off two
+    /// beds, two lights, a salt lamp and a curtain. Nine of the nineteen
+    /// commands that spoke a catalogued name did this. The name is in the
+    /// request exactly as the home writes it, and the home's own spelling is
+    /// what goes back — the user's casing matches nothing.
+    #[test]
+    fn a_device_the_user_named_becomes_the_target() {
+        let (fixed, note) = house().aim_at_what_was_said(
+            serde_json::json!({"area": "Master bedroom"}),
+            "turn off the air conditioner",
+        );
+        assert_eq!(fixed["name"], "Air conditioner", "the home's spelling, not the user's");
+        assert!(note.is_some_and(|n| n.contains("Air conditioner")), "written down");
+
+        // And then the rule that was waiting for a name to fire on takes the
+        // area out, because a name only one device answers to needs none.
+        let (fixed, _) = house().agree(fixed);
+        assert_eq!(fixed, serde_json::json!({"name": "Air conditioner"}));
+    }
+
+    /// The four cases where acting would be Fono guessing. Each has to leave
+    /// the call exactly as the model wrote it.
+    #[test]
+    fn a_name_is_only_recovered_when_there_is_one_answer() {
+        let h = house();
+        let said = "turn off the air conditioner";
+
+        // Already named it: nothing to add.
+        let args = serde_json::json!({"name": "Air conditioner"});
+        assert_eq!(h.aim_at_what_was_said(args.clone(), said), (args, None));
+
+        // Nothing catalogued was spoken.
+        let args = serde_json::json!({"area": "Kitchen"});
+        assert_eq!(h.aim_at_what_was_said(args.clone(), "turn the heating up"), (args, None));
+
+        // Two devices answer to the name, so the area is the only thing telling
+        // them apart.
+        let mut shared = house();
+        shared.sole.remove("air conditioner");
+        let args = serde_json::json!({"area": "Master bedroom"});
+        assert_eq!(shared.aim_at_what_was_said(args.clone(), said), (args, None));
+
+        // A word that is both a room and a device has two readings, and
+        // "everything in the Office" must not become one thing called Office.
+        let mut twice = house();
+        twice.sole.insert("office".into(), "Office".into());
+        let args = serde_json::json!({"area": "Office", "domain": ["light"]});
+        assert_eq!(
+            twice.aim_at_what_was_said(args.clone(), "turn off the lights in the office"),
+            (args, None)
+        );
+
+        // A server that publishes no field for a device name has no opinion.
+        let unknown = HouseFacts { slots: vendor::SlotFields::default(), ..house() };
+        let args = serde_json::json!({"area": "Master bedroom"});
+        assert_eq!(unknown.aim_at_what_was_said(args.clone(), said), (args, None));
+    }
+
+    /// A name is only found as a name. Without the boundary test a home is not
+    /// free to call a thing after a syllable, and the longest spoken name has
+    /// to win or a home holding both `Couch` and `Couch Blue` reaches the wrong
+    /// one.
+    #[test]
+    fn a_name_is_matched_whole_and_the_longest_wins() {
+        assert!(spoken_in("turn off the couch blue", "couch"));
+        assert!(!spoken_in("switch it off", "tv"), "not inside a word");
+        assert!(spoken_in("the tv, please", "tv"), "punctuation is not a letter");
+
+        let mut h = house();
+        h.sole.insert("couch".into(), "Couch".into());
+        h.sole.insert("couch blue".into(), "Couch Blue".into());
+        let (fixed, _) = h.aim_at_what_was_said(serde_json::json!({}), "turn on the couch blue");
+        assert_eq!(fixed["name"], "Couch Blue", "the whole of what was said");
     }
 
     /// The defect that started this, verbatim: *"turn the air conditioner
@@ -2767,6 +3221,65 @@ mod tests {
         assert!(g.contains("HassTurnOn"), "the tool name must be pinned too: {g}");
     }
 
+    /// Home Assistant marks nothing required on any of its intents, so a
+    /// set-temperature call with no temperature is writable as far as the
+    /// schema is concerned — and the house refuses every one. A tool that sets
+    /// exactly one thing has that field insisted upon whatever the schema says,
+    /// while a tool that offers a choice of values keeps the choice.
+    #[test]
+    fn a_tool_that_sets_one_thing_must_be_given_it() {
+        let (store, mut rows) = a_small_home();
+        let mut with_value = |name: &str, values: serde_json::Value| {
+            let mut row = rows[0].clone();
+            row.name = name.into();
+            row.schema = serde_json::json!({"type": "object", "properties": values});
+            rows.push(row);
+        };
+        with_value(
+            "HassClimateSetTemperature",
+            serde_json::json!({"name": {"type": "string"}, "temperature": {"type": "number"}}),
+        );
+        with_value(
+            "HassLightSet",
+            serde_json::json!({
+                "name": {"type": "string"},
+                "brightness": {"type": "number"},
+                "color": {"type": "string"},
+            }),
+        );
+
+        let g = rails(&store, &rows).expect("rails");
+        // Each tool gets a label of its own; find it by the name it pins, then
+        // read the rule for the field in question. A field that cannot be
+        // skipped has no alternative branch.
+        let rule_for = |tool: &str, field: &str| -> String {
+            let label = g
+                .lines()
+                .find(|l| l.contains(&format!("\\\"{tool}\\\"")))
+                .and_then(|l| l.split_once(" ::= "))
+                .map(|(name, _)| name.to_owned())
+                .expect("a branch per tool");
+            g.lines()
+                .find(|l| {
+                    l.starts_with(&format!("{label}-a")) && l.contains(&format!("\\\"{field}\\\""))
+                })
+                .expect("a rule per field")
+                .to_owned()
+        };
+        let temperature = rule_for("HassClimateSetTemperature", "temperature");
+        assert!(
+            !temperature.contains(" | "),
+            "the only thing this tool sets cannot be skipped: {temperature}"
+        );
+        for field in ["brightness", "color"] {
+            let rule = rule_for("HassLightSet", field);
+            assert!(
+                rule.contains(" | "),
+                "a tool offering a choice of values keeps the choice: {rule}"
+            );
+        }
+    }
+
     /// The switch is the whole point of shipping this off by default: it has to
     /// be possible to run the same home with and without the rails and compare.
     /// A setting that is read but ignored would make that comparison a lie.
@@ -2836,6 +3349,74 @@ mod tests {
         assert!(out.starts_with("HassTurnOff reached 12 devices: Lamp 0,"), "{out}");
         assert!(out.ends_with("and 4 more."), "{out}");
         assert!(!out.contains("Lamp 9"), "the tail is counted, not listed: {out}");
+    }
+
+    /// Devices that agree are counted; the ones that stand apart keep their
+    /// names. Naming all of them is the largest thing the model reads in an
+    /// ordinary turn, and the roll call says nothing the counts do not.
+    #[test]
+    fn the_reading_counts_the_agreeing_devices_and_names_the_rest() {
+        let read = |v: &[(&str, &str)]| {
+            state_of_the_house(
+                &v.iter().map(|(n, s)| ((*n).to_string(), (*s).to_string())).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(read(&[]), "", "nothing to report leaves no stray sentence");
+
+        // Few enough that the names are both short and more useful.
+        assert!(read(&[("Hall lamp", "on")]).contains("Hall lamp is on."), "one device is named");
+
+        // The real reply that prompted this: twelve lights, four of them on.
+        let mut many: Vec<(&str, &str)> = (0..8).map(|_| ("Couch Blue", "off")).collect();
+        many[1] = ("Couch Green", "off");
+        many[2] = ("Couch Red", "off");
+        many[3] = ("Couch White", "off");
+        many[4] = ("Living square", "off");
+        many[5] = ("Living square (1)", "off");
+        many[6] = ("Living square blue", "off");
+        many[7] = ("Living square green", "off");
+        many.extend([("Couch", "on"), ("Living square red", "on"), ("Living square white", "on")]);
+        let out = read(&many);
+        assert!(out.contains("11 devices — 8 are off; 3 are on: Couch, "), "{out}");
+        assert!(
+            !out.contains("Couch Blue,"),
+            "the agreeing majority is counted, not listed: {out}"
+        );
+        assert!(out.len() < 200, "and the whole thing is short: {} chars", out.len());
+
+        // The one device that stands apart is exactly what the reading is for.
+        let odd = read(&[("a", "off"), ("b", "off"), ("c", "off"), ("d", "off"), ("Hall", "on")]);
+        assert!(odd.contains("5 devices — 4 are off; 1 is on: Hall."), "{odd}");
+
+        // A device the house names twice in the same state says it once; the
+        // same name in two states is a real disagreement and both survive.
+        let twice = read(&[
+            ("Couch", "on"),
+            ("Couch", "on"),
+            ("Couch Blue", "off"),
+            ("Couch Red", "off"),
+            ("Couch White", "off"),
+        ]);
+        assert_eq!(twice.matches("Couch is on").count(), 1, "said once: {twice}");
+        let split = read(&[("Couch", "on"), ("Couch", "off"), ("A", "off"), ("B", "off")]);
+        assert!(split.contains("Couch is on"), "a contradiction survives: {split}");
+        assert!(split.contains("Couch is off"), "a contradiction survives: {split}");
+
+        // Everything agreeing needs no names at all.
+        let agreed: Vec<(&str, &str)> =
+            ["a", "b", "c", "d", "e"].into_iter().map(|n| (n, "off")).collect();
+        assert!(read(&agreed).contains("all 5 are off."), "{}", read(&agreed));
+
+        // A large minority is capped like any other roll call.
+        let mut lopsided: Vec<(&str, &str)> = Vec::new();
+        for i in 0..9 {
+            lopsided.push((["a", "b", "c", "d", "e", "f", "g", "h", "i"][i], "on"));
+        }
+        for i in 0..10 {
+            lopsided.push((["j", "k", "l", "m", "n", "o", "p", "q", "r", "s"][i], "off"));
+        }
+        let capped = read(&lopsided);
+        assert!(capped.contains("9 are on: a, b, c, d, e, f and 3 more"), "{capped}");
     }
 
     /// The check reads the devices the command was aimed at, not the whole

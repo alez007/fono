@@ -478,9 +478,17 @@ fn json_string_literal(s: &str) -> String {
 ///
 /// Whitespace is permitted between tokens rather than fixed, so the grammar
 /// never fights the model over spacing it was trained to produce.
+///
+/// A string holds at least one character. An empty one is never an answer:
+/// Fono strips `""` out of every call before it travels, because no server
+/// treats it as a value, so a model that writes one has spent tokens on
+/// something guaranteed to be thrown away. Sixteen calls in a single run
+/// carried at least one — `"color": ""`, `"floor": ""` — and a field that
+/// genuinely has nothing to say can simply be left out, which the rules above
+/// already allow for anything the schema calls optional.
 const SHARED_RULES: &str = r#"
 ws ::= [ \t\n]*
-str ::= "\"" ([^"\\] | "\\" ["\\/bfnrt])* "\""
+str ::= "\"" ([^"\\] | "\\" ["\\/bfnrt])+ "\""
 int ::= "-"? [0-9]+
 num ::= "-"? [0-9]+ ("." [0-9]+)?
 bool ::= "true" | "false"

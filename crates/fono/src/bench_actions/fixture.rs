@@ -277,7 +277,12 @@ mod tests {
     /// filled from a requirement that has none renders an empty string —
     /// which turns into a command about nothing.
     fn supplies_an_area(r: &Requirement) -> bool {
-        matches!(r, Requirement::AreaWithBystander { .. } | Requirement::NamedArea { .. })
+        matches!(
+            r,
+            Requirement::AreaWithBystander { .. }
+                | Requirement::NamedArea { .. }
+                | Requirement::AreaWithSeveral { .. }
+        )
     }
 
     /// Requirements that pin a real device or area, and so belong only to a
