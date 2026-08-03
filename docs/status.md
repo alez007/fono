@@ -1,5 +1,85 @@
 # Fono — Project Status
-Last updated: 2026-08-01
+Last updated: 2026-08-03
+
+## 2026-08-03 — Three measured retreats, and the fix that stuck
+
+The question was whether the system prompt could be shaped better so a small model stops writing
+the wrong command. Three shapes were built and measured; all three lost commands and were
+reverted. One unrelated fix — a turn that ends in silence — was measured, gained two commands,
+and shipped. Every number below is 90 commands, English and Romanian, three repeats, at normal
+priority.
+
+**What today says, in one sentence: a field or a tool the model can see is one it will use, and
+taking it away does not teach it anything — the probability moves to whatever is left.**
+
+| arm | worked in the end | right first try | right tool first | typical |
+|---|---|---|---|---|
+| as it was | 0.811 | 0.656 | 0.667 | 6.4 s |
+| stop offering fields the house has no values for | 0.667 | 0.489 | 0.589 | 12.4 s |
+| cut a tool's description to its first sentences | 0.800 | 0.500 | 0.567 | 11.3 s |
+| no tool that sets a number, unless a number was said | 0.733 | 0.600 | **0.767** | 6.3 s |
+| **say something even when the correction is refused** | **0.833** | **0.667** | 0.667 | 8.6 s |
+
+**Withholding `floor` and `device_class` cost fifteen commands.** The evidence for hiding them was
+real — the live store showed `floor` invented on 25 of 39 calls — but the invented value was
+harmless and stripped before the call travelled, and shortening `HassTurnOn(area, device_class[],
+domain[], floor, name)` to three fields made the plain on/off tool look *less* applicable to a
+room than `HassLightSet`, whose list was then the longest. Every regressed cell is a room command
+answered with the brightness tool.
+
+**Trimming descriptions bought 977 characters and lost fourteen first-try routings.** Final success
+held only because the recovery pass absorbed it: recoveries went 14 → 27, and the typical wait rose
+five seconds. This overturns F33, which had the tool block down as near-zero signal. It is the
+largest block of the prompt and it is where tool choice comes from. Two measurements now say the
+prompt is not fat to trim — the other is F54.
+
+**Making a value tool unwritable improved tool choice and still lost commands, which is the most
+useful of the three.** Held to the rails without `HassClimateSetTemperature`, the model stopped
+reaching for it to switch an air conditioner off: that cell went 0 → 3 of 3 in both languages and
+`routing_rate` rose ten points, at no cost in time. But asked to set twenty-three degrees — spelled
+out, so no digit — it did not fall back to on/off. It reached for **`HassBroadcast`** and
+*announced the change over the house speakers*, which succeeded, so there was no failure to correct
+and no second chance. A catch-all tool that accepts free text and always reports success is the
+sink every blocked answer drains into. That is now the first thing to fix, and the rule it wants is
+vendor-neutral: a tool that changes nothing in the house is not an answer to a request to change
+something.
+
+**The fix that stuck: a command never ends in silence.** When Fono refuses a correction as a repeat
+of the call that just failed, the turn used to hold no words at all — the corrective pass ends the
+prompt mid-command, so prose was not reachable, and five of twenty-nine spoken commands on 1 August
+ended that way. A turn with nothing to say now asks once more with nothing put in the model's
+mouth; if even that comes back empty the user hears what they were told before the command ran.
+Two commands recovered, none lost, and the only turns that got slower are the ones that used to end
+silent and fail.
+
+**Also today, both measured-neutral and kept.** The settings page promised "the exact words the
+assistant is given" and showed the house paragraph alone — 2,894 characters of 6,559. The tool list
+and the reply-style instructions, the larger and the invisible parts, now render beside it with
+their own sizes, from the same functions the reply path calls. And a room with a second name in
+another language was counted as two rooms (`Kitchen, bucătărie`), while three devices were recorded
+under joined names no house answers to; only the first name on a line is what a thing is called.
+
+**Landed on 2 August, unrecorded until now.** Only a lamp says it is "on" — a blind says "open", an
+air conditioner names its mode, a vacuum says "cleaning". Fono compared every reading against the
+word "on", concluded the command had failed, and sent the opposite one, so asking for a blind to
+open closed it and Fono reported success. Readings are now judged by what they mean. And the local
+gate got quick enough to run before every push: the dev build keeps only the file and line numbers
+a panic needs instead of copying full debug information out of whisper.cpp, llama.cpp and
+onnxruntime into each of ~48 test binaries.
+
+**Two things worth knowing, from a read-only probe of the live house.** `GetLiveContext` already
+reports the **room of every device** — `areas:` on 138 of 156 entities — and Fono's parser drops it,
+which is the limitation we have worked around for weeks and is four lines of parsing, not a protocol
+gap. It carries `device_class` too, on all six covers. **Floors it does not carry at all**: zero
+occurrences in either payload, while every intent tool accepts a `floor` argument. That is the
+upstream PR — an argument the API offers and never grounds — and until it lands, withholding the
+field is correct whatever else we do.
+
+**Open, in order.** Stop offering a tool that cannot change the house for a request that asks to
+change it. Find out why the air conditioner reads back `cool` after `HassTurnOff`, since that makes
+every climate switch-off pay a second pass. And one poisoned row is sitting in the live store —
+`turn off the office AC → HassTurnOff {"area":"Office","domain":["light"]}`, one clean run from the
+fast path, which would switch off the office light for ever after.
 
 ## 2026-08-01 — The benchmark was passing commands nobody heard
 
@@ -61,12 +141,10 @@ slow run failed here on the same call, both the Balcony light — server said `a
 and the light did not move. That is the house, not Fono, and it is the readback earning its keep:
 across the run the server's claim and the house disagreed **6 times out of 15 checks**.
 
-The find that matters more than any of the above: **8 of 22 commands are carried out in silence.**
-The tool is called, the house obeys, and the reply is the empty string — the user hears nothing.
-`an_impossible_request_is_refused_plainly` passes that way, in both languages, and its whole
-purpose is that the refusal is spoken. Present in every run on record including the ones from
-before this session, so nothing here caused it; it has simply never been measured, because the
-scorer reads the house and never asks whether anything was said. F58, Task 42, and it is next.
+The find that matters more than any of the above: **8 of 22 commands are carried out in silence** —
+the tool is called, the house obeys, and the reply is the empty string. Present in every run on
+record, so nothing here caused it; the scorer reads the house and never asked whether anything was
+said. Cause, honest score and fix are in the entry above.
 
 ## 2026-07-31 — One underscore, and every command written free
 
