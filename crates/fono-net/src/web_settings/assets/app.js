@@ -3201,24 +3201,55 @@ function actHousePanel() {
     + '\u2014 so naming an area costs nothing while you are waiting. These names go to the '
     + 'assistant and nowhere else.</p>' + body + '</div></details>';
 }
+// One block of the system prompt, verbatim, with what it costs.
+//
+// Collapsible per block because the three are read for different reasons: the
+// house list to check a name, the tool list to see what is on offer, the rules
+// to see what the model was asked to do. Opening all three at once is what the
+// old panel effectively did with one of them.
+function promptBlock(label, note, text, open) {
+  const n = (text || '').length;
+  return '<details class="prompt-d"' + (open ? ' open' : '') + '><summary>'
+    + '<span class="lbl">' + esc(label) + '</span>'
+    + '<span class="hint">' + esc(note) + '</span>'
+    + '<span style="margin-left:auto" class="hint">' + n.toLocaleString() + ' characters'
+    + '</span></summary><pre class="act-prompt mono">' + esc(text) + '</pre></details>';
+}
 function actPromptPanel() {
-  const hint = toolsData.hint;
+  const p = toolsData.prompt || {};
+  const hint = p.house || toolsData.hint;
   const n = toolsData.offered || 0;
-  const sum = hint ? hint.length.toLocaleString() + ' characters' : 'nothing about your home';
-  let body = '<p class="hint">Every turn, the assistant is given '
-    + esc(n + (n === 1 ? ' thing' : ' things')) + ' it can do'
-    + (hint ? ', and these words about your home. Read them exactly as the assistant does.'
-      : '. It is told nothing about your areas or devices.') + '</p>';
+  const total = p.chars || 0;
+  const sum = total
+    ? total.toLocaleString() + ' characters'
+    : (hint ? hint.length.toLocaleString() + ' characters' : 'nothing about your home');
+  let body = '<p class="hint">Every turn, the assistant reads these blocks in this order, '
+    + 'and nothing else about your home reaches it. The last one is how to answer, not what '
+    + 'to answer with \u2014 it is deliberately last, because a small model forgets an '
+    + 'instruction sitting a thousand words back.</p>';
   if (hint) {
-    body += '<pre class="act-prompt mono">' + esc(hint) + '</pre>'
-      + '<div class="enroll-row"><button class="btn" type="button" id="actcopy">Copy</button>'
-      + '<span class="hint">Catalogue fingerprint <span class="mono">'
-      + esc((toolsData.catalogue_hash || '').slice(0, 12))
-      + '</span> \u2014 changes exactly when these instructions would.</span></div>';
+    body += promptBlock('Your home', 'areas, rules, devices', hint, true);
   } else {
-    body += '<p class="hint">Switch on <a href="#/settings">Tell the assistant your area '
-      + 'names</a> so a command in another language can still find the right area.</p>';
+    body += '<p class="hint">The assistant is told nothing about your areas or devices. '
+      + 'Switch on <a href="#/settings">Tell the assistant your area names</a> so a command '
+      + 'in another language can still find the right area.</p>';
   }
+  if (p.tools) {
+    body += promptBlock('What it can do',
+      n + (n === 1 ? ' tool' : ' tools')
+        + (p.tools_in_prompt ? '' : ' \u2014 sent as data, not as words'),
+      p.tools, false);
+  }
+  if (p.behaviour) body += promptBlock('How to answer', 'your reply style', p.behaviour, false);
+  if (p.tools && !p.tools_in_prompt) {
+    body += '<p class="hint">This assistant is given its tools in the request itself rather '
+      + 'than as words in the prompt, so that block costs the model nothing to read. A local '
+      + 'model reads every character of it.</p>';
+  }
+  body += '<div class="enroll-row"><button class="btn" type="button" id="actcopy">Copy all'
+    + '</button><span class="hint">Catalogue fingerprint <span class="mono">'
+    + esc((toolsData.catalogue_hash || '').slice(0, 12))
+    + '</span> \u2014 changes exactly when these instructions would.</span></div>';
   return '<details class="sec dsec" id="d-prompt"><summary><span class="chev">\u25b6</span>'
     + '<span class="t">The exact words the assistant is given</span>'
     + '<span class="sum">' + esc(sum) + '</span></summary><div class="body">' + body + '</div></details>';
@@ -3488,8 +3519,14 @@ function renderActions() {
     b.addEventListener('click', () => forgetPhrase(b.dataset.sayForget)));
   const copy = el.querySelector('#actcopy');
   if (copy) copy.addEventListener('click', async () => {
+    // The whole head, joined exactly as the daemon joins it, so what lands on
+    // the clipboard is what the model was sent and can be diffed against a
+    // trace.
+    const p = toolsData.prompt || {};
+    const text = [p.house || toolsData.hint, p.tools, p.behaviour]
+      .filter((b) => b && b.trim()).join('\n\n');
     try {
-      await navigator.clipboard.writeText(toolsData.hint || '');
+      await navigator.clipboard.writeText(text);
       toast('Copied');
     } catch (err) { toast('Could not copy: ' + err.message, true); }
   });

@@ -244,11 +244,7 @@ fn parse_places(text: &str) -> Vec<String> {
     let mut names: Vec<String> = inner
         .lines()
         .filter_map(|l| l.trim().strip_prefix("areas:").map(str::trim))
-        // An entity in an area with aliases lists them all on one line
-        // ("areas: Kitchen, bucătărie"), so each has to be split out — kept
-        // whole it would be offered to the model as a single unusable name.
-        .flat_map(|l| l.split(','))
-        .map(|n| n.trim().trim_matches(['\'', '"']).trim().to_string())
+        .map(canonical_name)
         .filter(|n| !n.is_empty() && n.len() < 64)
         .collect();
     names.sort_unstable();
@@ -288,6 +284,19 @@ const ACTIONABLE: &[&str] = &[
     "todo",
 ];
 
+/// The first of the names on one dump line, without its quotes.
+///
+/// A thing with aliases lists them all on one line — `areas: Kitchen,
+/// bucătărie`, `- names: Kitchen display, boxa bucatarie` — and the first is
+/// the one the house is really called. Taking the line whole offered the model
+/// a name no house ever answers to; taking every part offered a second room and
+/// a second speaker that do not exist. The server matches an alias itself, so
+/// nothing is lost by naming each thing once.
+fn canonical_name(line: &str) -> String {
+    let first = line.split(',').next().unwrap_or(line);
+    first.trim().trim_matches(['\'', '"']).trim().to_string()
+}
+
 /// Pull the actionable devices out of a live-context dump, each with the kind
 /// of thing it is.
 ///
@@ -311,7 +320,7 @@ fn parse_devices(text: &str) -> Vec<Device> {
         let t = line.trim();
         if let Some(n) = t.strip_prefix("- names:") {
             // A block without a domain line is dropped, not guessed at.
-            pending = Some(n.trim().trim_matches(['\'', '"']).trim().to_string());
+            pending = Some(canonical_name(n));
         } else if let Some(d) = t.strip_prefix("domain:") {
             let d = d.trim().trim_matches(['\'', '"']).trim();
             if let Some(n) = pending.take() {
@@ -517,14 +526,23 @@ mod tests {
         assert_eq!(parse_places(dump), vec!["Hall", "Kitchen", "Yard"]);
     }
 
-    /// An area with aliases lists them all on one line. Each is a name the
-    /// house will answer to, so each must reach the model separately —
-    /// offered whole, "Kitchen, bucătărie" is an area that does not exist.
+    /// A thing with aliases lists them all on one line, and only the first is
+    /// what the house is called. Offered whole, "Kitchen, bucătărie" is an area
+    /// that does not exist; offered as two, the model is told of a room that
+    /// does not exist either. The server matches an alias on its own.
     #[test]
-    fn an_area_with_aliases_yields_each_name_separately() {
-        let dump = "- names: Kitchen lights\n  domain: light\n  areas: Kitchen, bucătărie\n\
-                    - names: Hall light\n  domain: light\n  areas: 'Hallway , hol'\n";
-        assert_eq!(parse_places(dump), vec!["Hallway", "Kitchen", "bucătărie", "hol"]);
+    fn an_alias_is_not_a_second_room_or_device() {
+        let dump = "- names: Kitchen display, boxa bucatarie\n  domain: media_player\n  \
+                    areas: Kitchen, bucătărie\n- names: Hall light\n  domain: light\n  \
+                    areas: 'Hallway , hol'\n";
+        assert_eq!(parse_places(dump), vec!["Hallway", "Kitchen"]);
+        assert_eq!(
+            parse_devices(dump),
+            vec![
+                Device::new("Hall light", "light"),
+                Device::new("Kitchen display", "media_player"),
+            ]
+        );
     }
 
     /// Anything we do not recognise must yield no names at all. Telling the

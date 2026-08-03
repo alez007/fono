@@ -368,7 +368,7 @@ pub fn build(
             return None;
         }
     };
-    let rows = store.active_tools().ok()?;
+    let mut rows = store.active_tools().ok()?;
     if rows.is_empty() {
         return None;
     }
@@ -664,7 +664,9 @@ pub(crate) fn page_extras(
     store: &ToolCatalogStore,
     uses: &[ToolUse],
 ) -> serde_json::Value {
-    let active = store.active_tools().unwrap_or_default();
+    let mut active = store.active_tools().unwrap_or_default();
+    // The same withholding the reply path does, or the page would show fields
+    // the model is never offered.
 
     let devices = store.devices().unwrap_or_default();
     serde_json::json!({
@@ -680,6 +682,9 @@ pub(crate) fn page_extras(
         // when it is given none. Shown verbatim: paraphrasing it here would
         // recreate the very gap this page exists to close.
         "hint": cfg.assistant.tools.place_names.then(|| area_hint(store)).flatten(),
+        // The whole steady head, block by block, in the order the model reads
+        // it. `hint` above is only the first of the three.
+        "prompt": prompt_blocks(cfg, store, &active),
         "catalogue_hash": store.catalogue_hash().unwrap_or_default(),
         "offered": active.len(),
         // What each tool has actually been asked to do, in the user's own
@@ -691,6 +696,67 @@ pub(crate) fn page_extras(
         // list of phrases that have worked but never earned the fast path is the
         // model's own blind-spot list, so it is shown rather than hidden.
         "shortcuts": phrases(store),
+    })
+}
+
+/// The steady head of the system prompt, block by block, in the order the
+/// model reads it.
+///
+/// The page used to show the house block alone under a heading that promised
+/// the exact words the assistant is given. On a 79-device home that was 2,894
+/// characters of a 6,559-character head: the tool block — the largest of the
+/// three — and the behavioural rules were both invisible, so the one place a
+/// user can look under-reported the prompt by more than half. Anything that is
+/// sent is shown here.
+///
+/// Rendered by the same functions the reply path uses, from the same store, so
+/// the page cannot show a prompt the model was not given. The tool block goes
+/// through [`fono_assistant::local_tools::instructions`] for that reason rather
+/// than being re-spelled here.
+///
+/// `in_prompt` is false for a backend that carries tools as data in its API
+/// request instead of as words in the prompt. The block is still shown — it is
+/// the same information, and a user comparing two backends deserves to see it —
+/// but it does not count towards what the model reads.
+fn prompt_blocks(
+    cfg: &Config,
+    store: &ToolCatalogStore,
+    active: &[fono_core::tool_catalog::ToolRow],
+) -> serde_json::Value {
+    let house = cfg.assistant.tools.place_names.then(|| area_hint(store)).flatten();
+    let descriptors: Vec<serde_json::Value> = active
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": r.name,
+                    "description": r.description,
+                    "parameters": r.schema,
+                }
+            })
+        })
+        .collect();
+    let tools =
+        (!descriptors.is_empty()).then(|| fono_assistant::local_tools::instructions(&descriptors));
+    let behaviour = cfg.assistant.prompt_main.trim();
+    // Only what this backend actually reads as words. `compose_head` joins the
+    // blocks it is given with a blank line, so the joins are counted too.
+    let in_prompt = cfg.assistant.backend == fono_core::config::LlmBackend::Local;
+    let read: Vec<&str> =
+        [house.as_deref(), tools.as_deref().filter(|_| in_prompt), Some(behaviour)]
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.trim().is_empty())
+            .collect();
+    let chars: usize =
+        read.iter().map(|b| b.chars().count()).sum::<usize>() + read.len().saturating_sub(1) * 2;
+    serde_json::json!({
+        "house": house,
+        "tools": tools,
+        "tools_in_prompt": in_prompt,
+        "behaviour": (!behaviour.is_empty()).then(|| behaviour.to_string()),
+        "chars": chars,
     })
 }
 
@@ -836,8 +902,7 @@ fn written_hint(store: &ToolCatalogStore, arm: HintArm) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    let mut hint =
-        format!("Areas in this home, named exactly as they must be used: {}.", names.join(", "));
+    let mut hint = format!("Areas in this home: {}.", names.join(", "));
     if arm != HintArm::NoRules {
         hint.push_str("\nRules for acting on this home:");
         for (n, rule) in RULES.iter().enumerate() {
@@ -891,7 +956,8 @@ fn written_hint(store: &ToolCatalogStore, arm: HintArm) -> Option<String> {
 /// than guessed at — a wrong domain is a call that silently reaches nothing.
 fn by_kind(devices: &[fono_core::tool_catalog::Device]) -> String {
     let mut out = String::from(
-        "\nDevices by kind — the kind is the `domain`. Names work only exactly as written:",
+        "\nDevices by kind — the kind is the `domain`. Areas and names work only exactly as \
+         written:",
     );
     // `devices()` is already ordered by kind then name, so one pass groups it.
     let mut kind: Option<&str> = None;
@@ -2983,6 +3049,65 @@ mod tests {
         let lower = hint.to_lowercase();
         assert!(lower.contains("never translate"), "{hint}");
         assert!(lower.contains("add no area"), "{hint}");
+    }
+
+    /// The page's prompt panel has to carry every block the model reads, not
+    /// just the house. It showed the house alone under a heading promising the
+    /// exact words the assistant is given, and on a real home that was 2,894
+    /// characters of 6,559 — the tool block, the largest of the three, was
+    /// invisible, and so was the reply style.
+    #[test]
+    fn the_page_shows_every_block_of_the_prompt_not_only_the_house() {
+        let store = ToolCatalogStore::open_in_memory().expect("store");
+        store.set_place_names("home", &["Office".to_string()]).expect("areas");
+        store
+            .set_devices("home", &[fono_core::tool_catalog::Device::new("Office light", "light")])
+            .expect("devices");
+        store
+            .reconcile(
+                "home",
+                "sse",
+                &[fono_core::tool_catalog::DiscoveredTool {
+                    name: "HassTurnOn".into(),
+                    description: "Turns on/opens a device or entity".into(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"area": {"type": "string"}, "domain": {"type": "array"}},
+                    }),
+                    capability: fono_core::tool_catalog::Capability::Safe,
+                    verify_class: fono_core::tool_catalog::VerifyClass::ResultContract,
+                    readback_tool: None,
+                }],
+            )
+            .expect("tools");
+
+        let mut cfg = Config::default();
+        cfg.assistant.backend = fono_core::config::LlmBackend::Local;
+        cfg.assistant.tools.place_names = true;
+        cfg.assistant.prompt_main = "Be brief.".into();
+        let active = store.active_tools().expect("active");
+        let blocks = prompt_blocks(&cfg, &store, &active);
+
+        let house = blocks["house"].as_str().expect("the house block");
+        let tools = blocks["tools"].as_str().expect("the tool block");
+        assert!(house.contains("Office light"), "{house}");
+        assert!(tools.contains("HassTurnOn(area, domain[])"), "{tools}");
+        assert_eq!(blocks["behaviour"].as_str(), Some("Be brief."));
+        assert_eq!(blocks["tools_in_prompt"], serde_json::json!(true));
+
+        // The count is what this backend reads, joins included — the number a
+        // budget is judged against.
+        let chars = blocks["chars"].as_u64().expect("a character count");
+        assert_eq!(chars as usize, house.chars().count() + tools.chars().count() + 9 + 4);
+
+        // A backend that carries its tools in the request still shows the block,
+        // because it is the same information — but the model does not read it,
+        // so it is not charged for.
+        cfg.assistant.backend = fono_core::config::LlmBackend::OpenAI;
+        let cloud = prompt_blocks(&cfg, &store, &active);
+        assert!(cloud["tools"].as_str().is_some(), "the block is still shown");
+        assert_eq!(cloud["tools_in_prompt"], serde_json::json!(false));
+        assert!(cloud["chars"].as_u64().expect("count") < chars, "and is not charged for");
     }
 
     /// An area-wide switch-on reaches everything switchable in the area. Asked

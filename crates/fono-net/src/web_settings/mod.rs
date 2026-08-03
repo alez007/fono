@@ -193,8 +193,9 @@ pub type DeleteUtteranceFn = Arc<dyn Fn(i64, i64) -> std::result::Result<(), Str
 /// `house` (the areas, devices and kinds the servers reported), `slots`
 /// (which published field carries an area, a device and a kind, or nulls for a
 /// server Fono has no specific knowledge of), `hint` (the literal sentences
-/// the model is given about the home), `grammar`, `place_names`,
-/// `catalogue_hash` and `offered`.
+/// the model is given about the home), `prompt` (the whole steady head block by
+/// block: `house`, `tools`, `behaviour`, plus `chars` for what this backend
+/// actually reads), `grammar`, `place_names`, `catalogue_hash` and `offered`.
 ///
 /// Reads the local store only — never contacts a server, so the page renders
 /// instantly. Built by the same code that builds the prompt, so what the page
@@ -1095,6 +1096,11 @@ mod tests {
         assert!(APP_JS.contains("held to "), "which fields Fono is narrowing");
         assert!(APP_JS.contains("What the server published, word for word"));
         assert!(APP_JS.contains("The exact words the assistant is given"));
+        // And all three blocks of them. The panel showed the house block alone
+        // under that heading, which was less than half of what is sent.
+        for block in ["Your home", "What it can do", "How to answer"] {
+            assert!(APP_JS.contains(block), "the prompt panel must show {block}");
+        }
     }
 
     /// A saved conversation has to answer the same question the tools page
