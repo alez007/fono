@@ -2490,7 +2490,9 @@ impl Assistant for LlamaLocalAssistant {
             // Rails only when tools are offered this turn AND the setting is on.
             // `ActionTools::grammar` is already `None` when the switch is off,
             // so there is nothing to check here beyond "are there tools at all".
-            grammar: actions.as_ref().and_then(|a| a.grammar.as_deref().map(Arc::from)),
+            grammar: actions
+                .as_ref()
+                .and_then(|a| a.grammar.as_ref().map(|g| Arc::from(g.as_str()))),
             // Where the steady part of this prompt ends. Rendered by the same
             // call the startup warm uses, so the checkpoint taken here and the
             // one warmed there are the same entry rather than two that evict
@@ -2742,7 +2744,7 @@ impl Assistant for LlamaLocalAssistant {
                     let full = format!("{cont}{written}");
                     let turn_prefix = format!("{base}{call_text}{closer}\n");
                     let (cont_prefix, cont_suffix) = match full.strip_prefix(turn_prefix.as_str()) {
-                        Some(rest) if !rest.is_empty() => (turn_prefix, rest.to_string()),
+                        Some(rest) if !rest.is_empty() => (turn_prefix.clone(), rest.to_string()),
                         // Belt and braces: an empty suffix would generate from
                         // nothing, so fall back to the old system-prefix split.
                         _ => (
@@ -2797,7 +2799,46 @@ impl Assistant for LlamaLocalAssistant {
                             let _ = tx.blocking_send(Ok(TokenDelta::text(held.clone())));
                             return Ok(format!("{spoken}{held}"));
                         }
-                        return Ok(spoken);
+                        if !spoken.trim().is_empty() {
+                            return Ok(spoken);
+                        }
+                        // The turn has run its commands and has no words to show
+                        // for them. That is not a rare corner: the corrective
+                        // pass ends the prompt mid-command, so prose is not even
+                        // reachable, and when the command it forces is then
+                        // refused as a repeat the user hears nothing at all and
+                        // has no idea whether the house moved. Ask once more with
+                        // nothing pre-written and no rails, so the only thing
+                        // left to produce is a sentence.
+                        let (prose_prefix, prose_suffix) = match cont
+                            .strip_prefix(turn_prefix.as_str())
+                        {
+                            Some(rest) if !rest.is_empty() => {
+                                (turn_prefix.clone(), rest.to_string())
+                            }
+                            _ => (
+                                cache_prefix.clone(),
+                                cont.strip_prefix(cache_prefix.as_str()).unwrap_or("").to_string(),
+                            ),
+                        };
+                        if let Ok((_, said, rest)) =
+                            run_pass(&cont, &prose_prefix, &prose_suffix, "")
+                        {
+                            if !said.trim().is_empty() {
+                                return Ok(said);
+                            }
+                            // Prose the watcher held back for looking like the
+                            // start of a command, and which turned out not to be
+                            // one, was never sent to the speaker.
+                            if !rest.trim().is_empty() && local_tools::parse_call(&rest).is_none() {
+                                deltas_emitted = deltas_emitted.saturating_add(1);
+                                let _ = tx.blocking_send(Ok(TokenDelta::text(rest.clone())));
+                                return Ok(rest);
+                            }
+                        }
+                        // Even that produced nothing. What the user was told
+                        // before the command ran is better than silence.
+                        return Ok(promised);
                     };
                     info!(
                         "retrying {} as {} after a failure that changed nothing",

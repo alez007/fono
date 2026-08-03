@@ -368,7 +368,7 @@ pub fn build(
             return None;
         }
     };
-    let mut rows = store.active_tools().ok()?;
+    let rows = store.active_tools().ok()?;
     if rows.is_empty() {
         return None;
     }
@@ -664,10 +664,7 @@ pub(crate) fn page_extras(
     store: &ToolCatalogStore,
     uses: &[ToolUse],
 ) -> serde_json::Value {
-    let mut active = store.active_tools().unwrap_or_default();
-    // The same withholding the reply path does, or the page would show fields
-    // the model is never offered.
-
+    let active = store.active_tools().unwrap_or_default();
     let devices = store.devices().unwrap_or_default();
     serde_json::json!({
         "place_names": cfg.assistant.tools.place_names,
