@@ -61,10 +61,11 @@ By making a contribution to this project, I certify that:
 
 ## Tests
 
-Run the whole suite with `cargo test --workspace --all-targets`. Target-
-specific tests may be gated with `#[cfg]`; keep core logic platform-agnostic
-where possible and isolate platform integration in the dedicated crates
-(`fono-inject`, `fono-tray`, `fono-hotkey`).
+Run the whole suite with `cargo test --workspace --tests --lib`, or run the
+full local gate — formatting, lints and tests together — with
+`./tests/check.sh`. Target-specific tests may be gated with `#[cfg]`; keep
+core logic platform-agnostic where possible and isolate platform integration
+in the dedicated crates (`fono-inject`, `fono-tray`, `fono-hotkey`).
 
 ## Adding a new STT or LLM provider backend
 

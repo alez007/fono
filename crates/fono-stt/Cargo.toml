@@ -103,4 +103,6 @@ fono-audio = { path = "../fono-audio", optional = true }
 # stand up an in-process server stub.
 fono-net-codec = { path = "../fono-net-codec" }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `test-util` gives the streaming tests tokio's virtual clock, so the
+# cadence guards they exercise cost no real wall-clock time.
+tokio = { workspace = true, features = ["test-util"] }

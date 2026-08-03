@@ -266,6 +266,25 @@ non_std_lazy_statics = "allow"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+# Dev/test profile: keep line tables, drop everything else.
+#
+# `cargo test --workspace --all-targets` links ~48 executables, and almost
+# every one of them pulls in whisper.cpp, llama.cpp and a ~50 MiB static
+# `libonnxruntime.a`. At cargo's default `debug = 2` the linker copies full
+# DWARF out of every rlib and out of the C++ archives into each of those
+# executables, which makes linking — not codegen — the slowest part of a
+# test run. `line-tables-only` keeps file/line information in panic
+# backtraces (the thing we actually read) and discards the variable and
+# type debug info we never inspect.
+#
+# Dependencies get nothing at all: we do not step through tokio or serde,
+# and their debug info is the bulk of the volume.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
 # Default release profile: stripped + thin-LTO. Trades ~30s of extra build
 # time for cross-crate inlining without sacrificing the dev iteration loop.
 # This profile is for `cargo run` and local benchmarking; it is *not* what

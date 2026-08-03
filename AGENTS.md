@@ -162,8 +162,11 @@ section is the durable backup in case the skill is unavailable.
      If CI stops at fmt it will *not* surface clippy errors, so always
      run clippy locally too.
   3. `nice -n 10 cargo test --workspace --tests --lib` — must pass.
-     (Skip doctests locally if your toolchain lacks `rustdoc`; CI runs
-     them.)
+     This is every lib unit test plus every integration test under
+     `crates/*/tests/`. It deliberately skips the examples and the
+     criterion bench, which contain no test; step 2 already compiles
+     those. There are no executable doctests in the workspace, and no
+     gate runs `--doc`.
 
   These three commands take under a minute on a warm target dir.
   Running them before pushing prevents the "push → wait 10 min → red CI

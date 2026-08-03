@@ -13,13 +13,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
+// `tokio::time::Instant` rather than `std::time::Instant`: identical in a
+// real run, but it reads tokio's clock, so tests can drive the preview
+// cadence below on virtual time instead of sleeping for real seconds.
+use tokio::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::groq::{
@@ -684,7 +688,11 @@ mod tests {
         vec![0.1_f32; (16_000.0 * seconds) as usize]
     }
 
-    #[tokio::test]
+    // `start_paused` puts the sleeps below on tokio's virtual clock: they
+    // still order the frames against the 700 ms cadence guard, but the
+    // runtime jumps straight to each deadline once every task is parked,
+    // so the test costs no real time.
+    #[tokio::test(start_paused = true)]
     async fn three_previews_promote_lcp_then_finalize_emits_full_text() {
         crate::rate_limit_notify::clear_throttle_for_tests();
         let (req, counter) =
@@ -733,7 +741,7 @@ mod tests {
         assert_eq!(finalizes[0].text, "the quick brown fox");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn in_flight_cap_drops_overlap_and_increments_counter() {
         crate::rate_limit_notify::clear_throttle_for_tests();
         // The mock holds the AsyncMutex for ~500 ms; meanwhile we
@@ -785,7 +793,7 @@ mod tests {
     /// stub `GroqVerboseFn` (finalize) that returns one good segment
     /// and one silence-tail "Thank you." segment. The committed text
     /// should contain only the good segment.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finalize_drops_hallucinated_segment_via_verbose() {
         crate::rate_limit_notify::clear_throttle_for_tests();
 

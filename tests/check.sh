@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # fono CI-equivalent local check.
 #
-# Runs the same gate `CONTRIBUTING.md` and `docs/status.md` mandate before
-# a PR lands: fmt + build + clippy + tests across the two feature combos
-# (default and `fono/interactive`).
+# Runs the same gate `CONTRIBUTING.md` and `AGENTS.md` mandate before a PR
+# lands: fmt + clippy + tests on the default feature set.
 #
 # Usage:
-#   ./tests/check.sh                # full matrix (build + clippy + test, both feature sets)
-#   ./tests/check.sh --quick        # default-features only, skip clippy and the slow integration tests
-#   ./tests/check.sh --no-test      # skip the test phase (build + clippy only)
-#   ./tests/check.sh --slim         # cloud-only slim build instead of default features
+#   ./tests/check.sh                # fmt + clippy + all tests (lib and integration)
+#   ./tests/check.sh --quick        # skip clippy and the slower integration tests
+#   ./tests/check.sh --no-test      # skip the test phase (fmt + clippy only)
 #   ./tests/check.sh --size-budget  # ONLY the CI size gate: release-slim glibc cpu, assert ≤ 25 MiB + 4-entry NEEDED (skips the matrix)
 #   ./tests/check.sh --help         # this message
 #
@@ -28,7 +26,6 @@ cd "$(dirname "$0")/.."
 # ── Defaults ──────────────────────────────────────────────────────────
 QUICK=false
 RUN_TESTS=true
-SLIM=false
 SIZE_BUDGET=false
 
 # ── Parse arguments ───────────────────────────────────────────────────
@@ -42,16 +39,12 @@ while [[ $# -gt 0 ]]; do
             RUN_TESTS=false
             shift
             ;;
-        --slim)
-            SLIM=true
-            shift
-            ;;
         --size-budget)
             SIZE_BUDGET=true
             shift
             ;;
         --help|-h)
-            sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '4,14p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -87,27 +80,7 @@ if [[ "$SIZE_BUDGET" == false ]]; then
 step "cargo fmt --check"
 run cargo fmt --all -- --check
 
-# ── Step 2: build matrix ──────────────────────────────────────────────
-if [[ "$SLIM" == true ]]; then
-    # Cloud-only slim build per `crates/fono/Cargo.toml:28`.
-    step "build (slim, cloud-only)"
-    run cargo build -p fono --no-default-features --features tray,cloud-all --all-targets
-    if [[ "$QUICK" == false ]]; then
-        step "build (slim + interactive)"
-        run cargo build -p fono --no-default-features \
-            --features tray,cloud-all,interactive --all-targets
-    fi
-else
-    step "build (default features)"
-    run cargo build --workspace --all-targets
-
-    if [[ "$QUICK" == false ]]; then
-        step "build (default + interactive)"
-        run cargo build --workspace --all-targets --features fono/interactive
-    fi
-fi
-
-# ── Step 2.5: default release tree must not pull ALSA/cpal ────────────
+# ── Step 2: default release tree must not pull ALSA/cpal ──────────────
 step "dependency tree (no cpal/ALSA in default Linux build)"
 if cargo tree -p fono -i cpal >/dev/null 2>&1; then
     red "FAIL: default fono dependency tree still includes cpal (and therefore ALSA/libasound)"
@@ -122,7 +95,7 @@ if cargo tree -p fono -i alsa-sys >/dev/null 2>&1; then
     exit 5
 fi
 
-# ── Step 2.6: no planning bookkeeping in source comments ──────────────
+# ── Step 3: no planning bookkeeping in source comments ────────────────
 # Comments must explain the code, not our schedule (see AGENTS.md). Plan
 # filenames and slice/task/plan-version numbers go stale the moment the
 # work lands and tell a reader nothing they can act on. ADR references
@@ -137,47 +110,28 @@ if git ls-files '*.rs' | xargs grep -n -E 'plans/[0-9]{4}-|[Ss]lice [0-9]|Task [
     exit 5
 fi
 
-# ── Step 3: clippy (skipped in --quick) ───────────────────────────────
+# ── Step 4: clippy (skipped in --quick) ───────────────────────────────
+# `--all-targets` here is what catches rot in the examples and the
+# criterion bench; the test phase below deliberately does not build them.
 if [[ "$QUICK" == false ]]; then
-    if [[ "$SLIM" == true ]]; then
-        step "clippy (slim, cloud-only)"
-        run cargo clippy -p fono --no-default-features \
-            --features tray,cloud-all --all-targets -- -D warnings
-
-        step "clippy (slim + interactive)"
-        run cargo clippy -p fono --no-default-features \
-            --features tray,cloud-all,interactive --all-targets -- -D warnings
-    else
-        step "clippy (default features)"
-        run cargo clippy --workspace --all-targets -- -D warnings
-
-        step "clippy (default + interactive)"
-        run cargo clippy --workspace --all-targets \
-            --features fono/interactive -- -D warnings
-    fi
+    step "clippy (default features)"
+    run cargo clippy --workspace --all-targets -- -D warnings
 fi
 
-# ── Step 4: tests ─────────────────────────────────────────────────────
+# ── Step 5: tests ─────────────────────────────────────────────────────
+# `--tests --lib` rather than `--all-targets`: the examples and the
+# criterion bench contain no test, so building them here only costs a
+# dozen extra links against whisper.cpp, llama.cpp and libonnxruntime.a.
+# Clippy above already compiles them.
 if [[ "$RUN_TESTS" == true ]]; then
     if [[ "$QUICK" == true ]]; then
         # Quick mode: lib tests only — skips the multi-second integration
-        # tests under `crates/*/tests/` and the `--ignored` latency smoke
-        # tests in `fono-bench`.
-        step "test (lib only, default features)"
+        # tests under `crates/*/tests/`.
+        step "test (lib only)"
         run cargo test --workspace --lib
-    elif [[ "$SLIM" == true ]]; then
-        step "test (slim, cloud-only)"
-        run cargo test -p fono --no-default-features --features tray,cloud-all --all-targets
-
-        step "test (slim + interactive)"
-        run cargo test -p fono --no-default-features \
-            --features tray,cloud-all,interactive --all-targets
     else
-        step "test (default features)"
-        run cargo test --workspace --all-targets
-
-        step "test (default + interactive)"
-        run cargo test --workspace --all-targets --features fono/interactive
+        step "test (lib + integration)"
+        run cargo test --workspace --tests --lib
     fi
 fi
 
@@ -185,7 +139,7 @@ fi
 echo
 green "All checks passed."
 
-fi  # end of fmt/build/clippy/test matrix (skipped under --size-budget)
+fi  # end of fmt/clippy/test matrix (skipped under --size-budget)
 
 # ── Optional: size-budget gate (mirrors CI) ───────────────────────────
 # Builds the **canonical CI ship artefact** — `release-slim`, glibc

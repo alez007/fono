@@ -8,11 +8,8 @@
 //! `fono-audio::AudioFrameStream` fire deterministic boundaries.
 //!
 //! Compiled only with the `interactive` feature (the streaming primitives
-//! it exercises live behind the same gate). Invoke via:
-//!
-//! ```bash
-//! cargo test --workspace --tests --features fono/interactive
-//! ```
+//! it exercises live behind the same gate). That feature is on by
+//! default, so a plain `cargo test --workspace --tests --lib` runs this.
 
 #![cfg(feature = "interactive")]
 
