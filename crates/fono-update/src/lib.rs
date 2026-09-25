@@ -651,9 +651,35 @@ pub async fn apply_update(info: &UpdateInfo, opts: ApplyOpts) -> Result<ApplyOut
     // Persist the temp file into the final path. `persist` does
     // `rename(tmp, target)` — atomic on the same filesystem because we
     // created the temp in the same dir.
-    tmp.persist(&target).map_err(|e| anyhow!("persist into {}: {}", target.display(), e.error))?;
+    replace_or_restore(&target, &backup, || {
+        tmp.persist(&target).map(drop).map_err(|e| anyhow!("{}", e.error))
+    })?;
 
     Ok(ApplyOutcome { installed_at: target, backup_at: Some(backup), bytes, sha256: sha })
+}
+
+/// Run `install` (which puts the new binary at `target`) after the old one
+/// has been moved to `backup`. If it fails, move the old binary back, so a
+/// failed update never leaves the user without a `fono` at all, and say in
+/// the error which state the machine is in.
+fn replace_or_restore(
+    target: &Path,
+    backup: &Path,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let Err(e) = install() else { return Ok(()) };
+    match std::fs::rename(backup, target) {
+        Ok(()) => Err(anyhow!(
+            "could not move the new binary into {}: {e:#}; the previous version was restored",
+            target.display()
+        )),
+        Err(restore) => Err(anyhow!(
+            "could not move the new binary into {}: {e:#}; restoring the previous version \
+             also failed ({restore}), it is at {} — rename it back to fix `fono`",
+            target.display(),
+            backup.display()
+        )),
+    }
 }
 
 async fn stream_download(url: &str, out: &mut std::fs::File) -> Result<(u64, String)> {
@@ -816,6 +842,35 @@ mod libc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// If the new binary cannot be moved into place, the old one must come
+    /// back: before this, a failure here left the user with no `fono`.
+    #[test]
+    fn failed_install_restores_the_previous_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fono");
+        let backup = dir.path().join("fono.bak");
+        std::fs::write(&backup, b"old build").unwrap(); // the old binary, already moved aside
+
+        let err = replace_or_restore(&target, &backup, || Err(anyhow!("rename denied")))
+            .expect_err("the failure is still reported");
+        assert!(format!("{err:#}").contains("previous version was restored"), "{err:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old build");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn successful_install_keeps_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fono");
+        let backup = dir.path().join("fono.bak");
+        std::fs::write(&backup, b"old build").unwrap();
+
+        replace_or_restore(&target, &backup, || Ok(std::fs::write(&target, b"new build")?))
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new build");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old build");
+    }
 
     #[test]
     fn newer_detects_minor_bump() {

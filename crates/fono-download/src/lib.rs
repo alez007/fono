@@ -113,6 +113,14 @@ async fn try_download(url: &str, dest: &Path) -> Result<()> {
     if !status.is_success() && status.as_u16() != 206 {
         return Err(anyhow!("HTTP {status} for {url}"));
     }
+    // Append only when the server actually resumed. One that ignores `Range`
+    // answers 200 with the whole file, and appending that after the bytes
+    // already on disk would duplicate the start of the file.
+    let resumed = existing > 0 && status.as_u16() == 206;
+    if existing > 0 && !resumed {
+        info!("server ignored the resume request for {url}; downloading from the start");
+    }
+    let existing = if resumed { existing } else { 0 };
 
     let total = resp.content_length().map(|c| c + existing).unwrap_or(0);
     let pb = ProgressBar::new(total.max(1));
@@ -127,9 +135,8 @@ async fn try_download(url: &str, dest: &Path) -> Result<()> {
         pb.set_position(existing);
     }
 
-    let mut file =
-        OpenOptions::new().create(true).append(existing > 0).write(true).open(dest).await?;
-    if existing == 0 {
+    let mut file = OpenOptions::new().create(true).append(resumed).write(true).open(dest).await?;
+    if !resumed {
         file.set_len(0).await.ok();
     }
 
@@ -160,4 +167,49 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    /// Serve `body` with `200 OK` to every request, ignoring any `Range`
+    /// header, the way some CDN edges and caching proxies do.
+    async fn serve_ignoring_range(body: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = [0u8; 4096];
+                let _ = sock.read(&mut req).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+            }
+        });
+        format!("http://{addr}/model.bin")
+    }
+
+    /// A partial file from an interrupted download must not end up as a
+    /// prefix of the finished one when the server sends the whole file again.
+    #[tokio::test]
+    async fn full_reply_to_a_resume_replaces_the_partial_file() {
+        const BODY: &[u8] = b"the whole model file";
+        let url = serve_ignoring_range(BODY).await;
+        let dir = std::env::temp_dir().join(format!("fono-download-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("model.bin");
+        tokio::fs::write(part_path(&dest), &BODY[..9]).await.unwrap();
+
+        download(&url, &dest, &"0".repeat(64)).await.unwrap();
+
+        let got = tokio::fs::read(&dest).await.unwrap();
+        tokio::fs::remove_dir_all(&dir).await.ok();
+        assert_eq!(got, BODY);
+    }
 }
