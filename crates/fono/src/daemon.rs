@@ -1135,11 +1135,18 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         });
     }
 
+    // Every way of stopping the daemon (tray Quit, `fono` asking over IPC,
+    // SIGTERM, Ctrl-C) ends the accept loop below the same way, so `run()`
+    // returns and its destructors run: the mDNS goodbye, the listeners
+    // closing, and the prompt cache writing itself to disk.
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<&'static str>();
+
     // ---------------------------------------------------------------
-    // Tray menu actions -> hotkey actions / process exit.
+    // Tray menu actions -> hotkey actions / shutdown.
     // ---------------------------------------------------------------
     {
         let action_tx = action_tx.clone();
+        let shutdown_tx = shutdown_tx.clone();
         let paths = paths.clone();
         let orch_for_tray = orchestrator.clone();
         // Snapshot the filtered backend lists for the tray dispatcher
@@ -1182,8 +1189,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                         let _ = action_tx.send(HotkeyAction::TogglePressed);
                     }
                     TrayAction::Quit => {
-                        let _ = std::fs::remove_file(paths.ipc_socket());
-                        std::process::exit(0);
+                        let _ = shutdown_tx.send("quit from the tray");
                     }
                     TrayAction::ShowStatus => notify_last_transcription(&paths),
                     TrayAction::PasteHistory(idx) => paste_history_at(&paths, idx).await,
@@ -1487,10 +1493,19 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
     // handler can `.await` on lock acquisition without parking the
     // executor thread.
     let mcp_speak_slot: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+    let mut sigterm = TerminateSignal::install()?;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received; shutting down");
+                break;
+            }
+            () = sigterm.recv() => {
+                info!("SIGTERM received; shutting down");
+                break;
+            }
+            Some(reason) = shutdown_rx.recv() => {
+                info!("{reason}; shutting down");
                 break;
             }
             accept = fono_ipc::accept(&listener) => {
@@ -1506,11 +1521,12 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                 let cancel_ctrl_for_ipc = cancel_ctrl.clone();
                 let wake_for_ipc = wake.clone();
                 let paths_for_ipc = paths.clone();
+                let shutdown_for_ipc = shutdown_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(
                         stream, fsm, action_tx, orch, registry, tray_for_ipc, mcp_activity,
                         mcp_speak_slot, mcp_cancel_tx, cancel_ctrl_for_ipc, wake_for_ipc,
-                        paths_for_ipc,
+                        paths_for_ipc, shutdown_for_ipc,
                     )
                     .await
                     {
@@ -1521,8 +1537,48 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         }
     }
 
+    // Unwinding can stall on a blocking task that never returns, and the
+    // runtime waits for those when it is dropped. A stop request must still
+    // stop the process, so give the destructors a bounded grace period.
+    std::thread::spawn(|| {
+        std::thread::sleep(SHUTDOWN_GRACE);
+        warn!("shutdown did not finish within {SHUTDOWN_GRACE:?}; exiting now");
+        std::process::exit(0);
+    });
     let _ = std::fs::remove_file(paths.ipc_socket());
     Ok(())
+}
+
+/// How long a clean shutdown may take before the process exits regardless.
+/// Long enough for the prompt cache to write a multi-gigabyte conversation
+/// to disk, well inside systemd's default 90 s stop timeout.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// SIGTERM as a future. `systemctl stop`, logout and system shutdown all send
+/// it, so without a handler the process dies at once and skips the clean exit.
+/// Never fires on platforms without Unix signals.
+struct TerminateSignal(#[cfg(unix)] tokio::signal::unix::Signal);
+
+impl TerminateSignal {
+    fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let kind = tokio::signal::unix::SignalKind::terminate();
+            Ok(Self(tokio::signal::unix::signal(kind).context("install SIGTERM handler")?))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self())
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if self.0.recv().await.is_some() {
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
 }
 
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -1817,6 +1873,7 @@ async fn handle_client(
     cancel_ctrl: Option<fono_hotkey::HotkeyControlSender>,
     wake: crate::wake::WakeHandle,
     paths: Paths,
+    shutdown_tx: mpsc::UnboundedSender<&'static str>,
 ) -> Result<()> {
     let req: Request = read_frame(&mut stream).await?;
     // Read live-preview from the orchestrator's post-reload config
@@ -2025,7 +2082,11 @@ async fn handle_client(
             return Ok(());
         }
         Request::Shutdown => {
-            std::process::exit(0);
+            // Reply first: the installers wait for this answer before they
+            // replace the binary and start the new daemon.
+            write_frame(&mut stream, &Response::Ok).await?;
+            let _ = shutdown_tx.send("shutdown requested over IPC");
+            return Ok(());
         }
     };
     write_frame(&mut stream, &resp).await?;
@@ -6221,6 +6282,23 @@ fn snapshot_discovered(registry: &fono_net::discovery::Registry) -> Vec<fono_ipc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIGTERM must wake the daemon's accept loop instead of killing the
+    /// process, or `systemctl stop` and logout skip the clean exit. The test
+    /// process survives the signal only because the handler is installed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_is_caught_and_wakes_the_loop() {
+        let mut sigterm = TerminateSignal::install().unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        tokio::time::timeout(std::time::Duration::from_secs(5), sigterm.recv())
+            .await
+            .expect("SIGTERM did not reach the handler");
+    }
 
     /// End-to-end against a real MCP server: discover, classify, store, and
     /// prove the user's choice survives a second pass. Exercises the glue the
