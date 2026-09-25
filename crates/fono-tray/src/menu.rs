@@ -135,7 +135,6 @@ pub fn build(t: &MenuInputs<'_>) -> Vec<MenuNode> {
     items.push(MenuNode::Separator);
 
     items.push(MenuNode::item("Toggle recording  (F7)", TrayAction::ToggleRecording));
-    items.push(MenuNode::item("Pause hotkeys", TrayAction::Pause));
     // Assistant controls. The dedicated "Stop assistant" entry was
     // removed when `fono cancel` became the unified cancel surface;
     // "Forget conversation" stays (distinct operation, no playback to
@@ -618,7 +617,6 @@ mod tests {
                 "Fono — idle",
                 "---",
                 "Toggle recording  (F7)",
-                "Pause hotkeys",
                 "Forget conversation",
                 "---",
                 "Recent transcriptions >",

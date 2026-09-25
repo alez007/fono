@@ -1188,9 +1188,6 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                     TrayAction::ShowStatus => notify_last_transcription(&paths),
                     TrayAction::PasteHistory(idx) => paste_history_at(&paths, idx).await,
                     TrayAction::OpenConfig => open_path(&paths.config_file()),
-                    TrayAction::Pause => {
-                        debug!("tray: Pause hotkeys (not yet implemented)");
-                    }
                     TrayAction::UseStt(idx) => {
                         // Box the future so its (Config-holding) stack
                         // frame lives on the heap, keeping the enclosing

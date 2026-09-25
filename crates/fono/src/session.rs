@@ -5770,11 +5770,19 @@ fn has_shell_syntax(s: &str) -> bool {
         " || ",
         " 1>",
         " 2>",
-        "--",
-        " -",
         "/dev/null",
     ];
-    MARKERS.iter().any(|marker| s.contains(marker))
+    MARKERS.iter().any(|marker| s.contains(marker)) || s.split_whitespace().any(is_flag_token)
+}
+
+/// A command-line flag: `-r`, `-rf`, `--verbose`. A bare hyphen or dash
+/// (`asta - da`, `well -- actually`) and a negative number or range (`3 -5`)
+/// are punctuation in prose, not flags, so the dashes must be followed by a
+/// letter.
+fn is_flag_token(token: &str) -> bool {
+    let token = trim_shell_token(token);
+    let rest = token.strip_prefix("--").or_else(|| token.strip_prefix('-'));
+    rest.and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_alphabetic())
 }
 
 fn starts_with_shell_command(s: &str) -> bool {
@@ -6394,6 +6402,34 @@ mod tests {
         assert!(suffix.is_none());
     }
 
+    /// A hyphen is punctuation in prose. It used to count as shell syntax,
+    /// which skipped the language check and sent prose to shell cleanup.
+    #[test]
+    fn terminal_suffix_is_suppressed_for_prose_with_a_hyphen() {
+        let profile = ContextClassifier::classify(Some("kitty"), Some("fono -v"));
+        for (raw, lang) in [
+            ("asta - da, mergem maine", Some("ro")),
+            ("bine -- hai sa vedem maine", Some("ro")),
+            ("well - actually I think we should wait", Some("en")),
+            ("the meeting is 3 -5 pm tomorrow", Some("en")),
+        ] {
+            assert!(
+                gated_builtin_suffix(profile.as_ref(), raw, lang).is_none(),
+                "prose with a hyphen must not get the shell suffix: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_tokens_are_recognised_and_bare_dashes_are_not() {
+        for flag in ["-r", "-rf", "--verbose", "--all,", "'-n'"] {
+            assert!(is_flag_token(flag), "{flag}");
+        }
+        for not_flag in ["-", "--", "-5", "--3", "e-mail", "---"] {
+            assert!(!is_flag_token(not_flag), "{not_flag}");
+        }
+    }
+
     #[test]
     fn terminal_suffix_is_kept_for_shell_commands() {
         let profile = ContextClassifier::classify(Some("kitty"), None);
@@ -6405,6 +6441,7 @@ mod tests {
             "cargo test",
             "rm -rf target",
             "./script.sh --verbose",
+            "make install --prefix /opt",
         ];
 
         for raw in examples {

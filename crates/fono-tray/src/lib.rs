@@ -258,7 +258,6 @@ pub enum TrayAction {
     /// or the current hotkey cheat sheet once setup is done.
     ActivateLeftClick,
     ToggleRecording,
-    Pause,
     /// Re-paste the i-th most recent transcription (0 = newest).
     PasteHistory(usize),
     /// Switch the active STT backend. Index into the `stt_labels`

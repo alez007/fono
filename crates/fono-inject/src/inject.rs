@@ -572,16 +572,31 @@ pub fn warm_backend() -> Result<&'static str> {
     }
 }
 
+/// Run a typing tool and report whether it typed. A non-zero exit is an
+/// error, never a success: `ydotool` without `ydotoold`, `xdotool` with an
+/// unreachable `DISPLAY` and `wtype` without the virtual-keyboard protocol
+/// all exit non-zero having typed nothing, and only an `Err` lets
+/// [`type_text_with_outcome`] fall back to the clipboard. The tool's stderr
+/// goes into the error because it names the cause.
 fn inject_subprocess(cmd: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(cmd)
+    let out = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
-        .status()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| anyhow!("spawning {cmd} failed: {e}"))?;
-    if !status.success() {
-        warn!("{cmd} exited with {status}");
+    if out.status.success() {
+        return Ok(());
     }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    warn!("{cmd} exited with {}: {stderr}", out.status);
+    if stderr.is_empty() {
+        Err(anyhow!("{cmd} exited with {}", out.status))
+    } else {
+        Err(anyhow!("{cmd} exited with {}: {stderr}", out.status))
+    }
 }
 
 #[cfg(feature = "enigo-backend")]
@@ -616,4 +631,34 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::inject_subprocess;
+
+    #[test]
+    fn a_typing_tool_that_exits_zero_is_success() {
+        assert!(inject_subprocess("sh", &["-c", "exit 0"]).is_ok());
+    }
+
+    /// A tool that starts and then fails must be an error, or the caller
+    /// reports the dictation as typed and never copies it to the clipboard.
+    #[test]
+    fn a_typing_tool_that_exits_non_zero_is_an_error_carrying_its_stderr() {
+        let err = inject_subprocess(
+            "sh",
+            &["-c", "echo 'failed to connect socket /tmp/.ydotool_socket' >&2; exit 1"],
+        )
+        .expect_err("non-zero exit must not report success");
+        let msg = err.to_string();
+        assert!(msg.contains("exit status: 1"), "{msg}");
+        assert!(msg.contains("ydotool_socket"), "{msg}");
+    }
+
+    #[test]
+    fn a_silent_failure_is_still_an_error() {
+        let err = inject_subprocess("sh", &["-c", "exit 3"]).unwrap_err();
+        assert!(err.to_string().contains("exit status: 3"), "{err}");
+    }
 }

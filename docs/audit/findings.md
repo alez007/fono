@@ -4932,3 +4932,32 @@ Binding on whoever implements an approved finding.
 6. **Commit messages follow the project's user-facing rule** — describe the behaviour that
    changed for the user, not the mechanism, and never cite a plan file or a finding ID in
    the subject line.
+
+---
+
+# Stage 3 — Task 3.4: approvals (2026-09-25)
+
+Approved by the maintainer on 2026-09-25, re-checked against `main` the same day — every
+approved finding was still present.
+
+| ID | Decision | Commit group |
+|---|---|---|
+| `F-M001` | approved | 1 — dictated text is never lost silently |
+| `F-A004` | approved | 1 |
+| `F-B004` | approved (hide the item; do not implement pausing) | 1 |
+| `F-B001` + `F-B002` + `F-C001` | approved as a group | 2 — clean shutdown |
+| `F-H001` + `F-H002` | approved as a group | 3 — LAN speech server token |
+| `F-G001` | approved | 3 |
+| `F-O001` | approved | 4 — updates and downloads |
+| `F-O002` | approved | 4 |
+| `F-L001` | **rejected** — the 45 s cloud speech-to-text limit stays | — |
+| `F-0008` | deferred — the default wake model is not hosted yet, so there is no SHA to pin | — |
+
+Every other finding stays open and unapproved.
+
+**Override of execution rule 1.** The maintainer asked for the tranche to land as four
+commits rather than one per finding. Each commit names every ID it fixes in its body, and
+within a commit each finding's change and its regression test are kept separable so one
+fix can still be reverted by hand. Rules 2–6 stand.
+
+**Resolved.** Filled in with commit hashes once the four commits land.
