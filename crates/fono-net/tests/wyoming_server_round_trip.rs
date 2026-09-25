@@ -213,3 +213,40 @@ async fn server_rejects_non_loopback_when_loopback_only() {
     assert_eq!(res.text, "ok");
     handle.shutdown().await;
 }
+
+/// With a token configured, the real client's token must reach the check:
+/// the right one is served, a wrong one is refused with a readable error
+/// instead of a dropped connection. (A remote peer sending no token is
+/// refused too; that case is covered by the server's unit tests because
+/// staging a non-loopback connection here depends on the environment.)
+#[tokio::test]
+async fn server_checks_the_token_the_client_sends() {
+    let mock = Arc::new(MockStt { canned_text: "ok".to_string(), calls: Mutex::new(Vec::new()) });
+    let cfg = WyomingServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        auth_token: Some("s3cret".to_string()),
+        ..WyomingServerConfig::default()
+    };
+    let handle =
+        WyomingServer::with_fixed_stt(cfg, mock.clone()).start().await.expect("server starts");
+    let uri = format!("tcp://{}", handle.local_addr());
+    let pcm = [0.0_f32; 100];
+
+    let good = WyomingStt::from_uri(&uri).unwrap().with_auth_token(Some("s3cret".into()));
+    let res = tokio::time::timeout(Duration::from_secs(5), good.transcribe(&pcm, 16_000, None))
+        .await
+        .expect("timeout")
+        .expect("the right token is served");
+    assert_eq!(res.text, "ok");
+
+    let bad = WyomingStt::from_uri(&uri).unwrap().with_auth_token(Some("wrong".into()));
+    let err = tokio::time::timeout(Duration::from_secs(5), bad.transcribe(&pcm, 16_000, None))
+        .await
+        .expect("timeout")
+        .expect_err("a wrong token is refused");
+    assert!(format!("{err:#}").contains("refused"), "unexpected error: {err:#}");
+    assert_eq!(mock.calls.lock().unwrap().len(), 1, "the refused request never reached STT");
+
+    handle.shutdown().await;
+}

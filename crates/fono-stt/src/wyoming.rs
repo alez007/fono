@@ -16,9 +16,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fono_net_codec::wyoming::{
-    AudioChunk, AudioStart, AudioStop, Info, Transcribe, Transcript, AUDIO_CHUNK, AUDIO_START,
-    AUDIO_STOP, DESCRIBE, INFO, TRANSCRIBE, TRANSCRIPT, TRANSCRIPT_CHUNK, TRANSCRIPT_START,
-    TRANSCRIPT_STOP,
+    with_auth_token, AudioChunk, AudioStart, AudioStop, Info, Transcribe, Transcript, AUDIO_CHUNK,
+    AUDIO_START, AUDIO_STOP, DESCRIBE, ERROR, INFO, TRANSCRIBE, TRANSCRIPT, TRANSCRIPT_CHUNK,
+    TRANSCRIPT_START, TRANSCRIPT_STOP,
 };
 use fono_net_codec::Frame;
 use serde_json::to_value;
@@ -95,10 +95,10 @@ pub struct WyomingStt {
     /// Configured language allow-list (see `crate::lang`). Forwarded
     /// to the server as `transcribe.language` when non-auto.
     languages: Vec<String>,
-    /// Optional pre-shared bearer token. Reserved for the future
-    /// `fono.auth` extension event; Wyoming v1
-    /// has no in-band auth so this field is plumbed but unused. Set
-    /// via `with_auth_token`; `fono doctor` can verify it's present.
+    /// Optional pre-shared token, attached to the first event of every
+    /// connection (see [`fono_net_codec::wyoming::with_auth_token`]). A
+    /// Fono server with a token configured refuses remote peers without
+    /// it; other Wyoming servers ignore the extra key.
     auth_token: Option<String>,
 }
 
@@ -185,7 +185,8 @@ impl SpeechToText for WyomingStt {
 
         // 1. audio-start
         let start = AudioStart { rate: sample_rate, width: 2, channels: 1, timestamp: None };
-        Frame::new(AUDIO_START).with_data(to_value(&start)?).write_async(&mut write_half).await?;
+        let first = Frame::new(AUDIO_START).with_data(to_value(&start)?);
+        with_auth_token(first, self.auth_token.as_deref()).write_async(&mut write_half).await?;
 
         // 2. audio-chunk × N — int16 LE PCM in `payload`, header carries format.
         for chunk in pcm.chunks(PCM_CHUNK_SAMPLES) {
@@ -248,6 +249,13 @@ impl SpeechToText for WyomingStt {
                         // the accumulated chunks in that case.
                         return Ok((std::mem::take(&mut streaming_buf), detected_lang.take()));
                     }
+                    ERROR => {
+                        let text = f.data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        return Err(anyhow!(
+                            "wyoming server at {} refused the request: {text}",
+                            self.endpoint()
+                        ));
+                    }
                     other => {
                         tracing::trace!(target: "fono::wyoming", event = other, "unexpected event ignored");
                     }
@@ -283,7 +291,8 @@ impl SpeechToText for WyomingStt {
         let stream = self.connect().await?;
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        Frame::new(DESCRIBE).write_async(&mut write_half).await?;
+        let describe = with_auth_token(Frame::new(DESCRIBE), self.auth_token.as_deref());
+        describe.write_async(&mut write_half).await?;
         let f = timeout(Duration::from_secs(5), Frame::read_async(&mut reader))
             .await
             .with_context(|| {

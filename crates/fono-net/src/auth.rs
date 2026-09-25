@@ -78,6 +78,17 @@ pub fn decide(
     }
 }
 
+/// Compare two secrets in time that depends only on their lengths, so a
+/// peer cannot learn a token byte by byte from how fast it is rejected.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +147,14 @@ mod tests {
     fn non_loopback_with_valid_token_is_admitted_with_key_id() {
         let v = verifier_accepting("good", 7);
         assert_eq!(decide(true, false, Some("good"), Some(&v)), AuthDecision::Allow(Some(7)));
+    }
+
+    #[test]
+    fn constant_time_eq_compares_whole_values() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

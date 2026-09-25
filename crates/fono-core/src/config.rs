@@ -1849,10 +1849,13 @@ pub struct ServerWyoming {
     pub bind: String,
     /// TCP port. Default `10300` (the de-facto Wyoming port).
     pub port: u16,
-    /// Optional pre-shared bearer token reference, resolved through
-    /// `secrets.toml` / env. Empty = no auth. Wyoming v1 has no in-band
-    /// auth, so this is checked out of band before the protocol
-    /// handshake.
+    /// Optional pre-shared token reference, resolved through
+    /// `secrets.toml` / env. Empty = no token. Wyoming v1 has no in-band
+    /// auth, so a Fono client attaches the token to the first event of
+    /// each connection. When set, remote peers without the right token
+    /// are refused; local (loopback) peers without one are still served,
+    /// and a wrong token is refused from anywhere. Home Assistant cannot
+    /// send a token, so a remote Home Assistant needs this left empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_token_ref: String,
 }

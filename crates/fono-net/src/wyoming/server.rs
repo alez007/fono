@@ -31,15 +31,16 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use fono_audio::wakeword::WakeWord;
 use fono_net_codec::wyoming::{
-    AsrModel, AsrProgram, Attribution, AudioChunk, AudioStart, AudioStop, Detect, Detection, Info,
-    Synthesize, Transcribe, Transcript, TtsProgram, TtsVoice, WakeModel, WakeProgram, AUDIO_CHUNK,
-    AUDIO_START, AUDIO_STOP, DESCRIBE, DETECT, DETECTION, INFO, SYNTHESIZE, TRANSCRIBE, TRANSCRIPT,
+    take_auth_token, AsrModel, AsrProgram, Attribution, AudioChunk, AudioStart, AudioStop, Detect,
+    Detection, Info, Synthesize, Transcribe, Transcript, TtsProgram, TtsVoice, WakeModel,
+    WakeProgram, AUDIO_CHUNK, AUDIO_START, AUDIO_STOP, DESCRIBE, DETECT, DETECTION, ERROR, INFO,
+    SYNTHESIZE, TRANSCRIBE, TRANSCRIPT,
 };
 use fono_net_codec::Frame;
 use fono_stt::traits::SpeechToText;
 use fono_tts::traits::TextToSpeech;
 use serde_json::to_value;
-use tokio::io::{AsyncWrite, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -60,10 +61,14 @@ pub struct WyomingServerConfig {
     pub bind: String,
     /// TCP port. Default [`DEFAULT_PORT`] (`10300`).
     pub port: u16,
-    /// Optional pre-shared bearer token, resolved by the daemon. Wyoming
-    /// v1 has no auth event, so this is plumbed for the Fono
-    /// extension; today its value is logged at `debug!` and otherwise
-    /// unused. Storing it here keeps the wiring honest.
+    /// Optional pre-shared token, resolved by the daemon from
+    /// `secrets.toml` or the environment. When set, the first event on
+    /// every connection must carry it under
+    /// [`fono_net_codec::wyoming::AUTH_TOKEN_KEY`], following the same
+    /// rules as the HTTP servers ([`crate::auth::decide`]): a presented
+    /// token must match even from loopback, and a remote peer that
+    /// presents none is refused. A loopback peer that presents none is
+    /// admitted, so a Home Assistant on the same host keeps working.
     pub auth_token: Option<String>,
     /// Server name advertised in `info.asr[].name`,
     /// `info.asr[].models[].attribution.name`, and (later) in mDNS TXT
@@ -352,6 +357,66 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     }
 }
 
+/// Decide whether a connection may proceed, given the token configured on
+/// the server and the one the peer attached to its first event.
+fn admit(expected: Option<&str>, loopback: bool, presented: Option<&str>) -> bool {
+    let expected = expected.filter(|t| !t.is_empty());
+    let verifier: Option<crate::auth::AuthVerifier> = expected.map(|want| {
+        let want = want.as_bytes().to_vec();
+        let verify: crate::auth::AuthVerifier = Arc::new(move |tok: &str| {
+            crate::auth::constant_time_eq(tok.as_bytes(), &want).then_some(0)
+        });
+        verify
+    });
+    let decision = crate::auth::decide(expected.is_some(), loopback, presented, verifier.as_ref());
+    decision != crate::auth::AuthDecision::Deny
+}
+
+/// Read one frame, giving up after [`IDLE_TIMEOUT`] of silence.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<Frame> {
+    match tokio::time::timeout(IDLE_TIMEOUT, Frame::read_async(reader)).await {
+        Ok(Ok(f)) => Ok(f),
+        Ok(Err(e)) => Err(anyhow!("frame read error: {e}")),
+        Err(_) => Err(anyhow!("idle timeout — no traffic for {IDLE_TIMEOUT:?}")),
+    }
+}
+
+/// Check the token on a connection's first frame. On refusal, tell the peer
+/// and close without destroying that reply, then return an error.
+async fn check_first_frame<R, W>(
+    frame: &mut Frame,
+    cfg: &WyomingServerConfig,
+    peer: SocketAddr,
+    reader: &mut R,
+    write_half: &mut W,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let presented = take_auth_token(frame);
+    if admit(cfg.auth_token.as_deref(), is_loopback(&peer), presented.as_deref()) {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "fono::wyoming::server",
+        %peer,
+        token_presented = presented.is_some(),
+        "refusing peer: missing or wrong token"
+    );
+    let err = serde_json::json!({ "text": "missing or wrong token", "code": "unauthorized" });
+    Frame::new(ERROR).with_data(err).write_async(&mut *write_half).await.ok();
+    write_half.shutdown().await.ok();
+    // Closing with the peer's later frames still unread makes the kernel
+    // reset the connection, which can destroy the error before the peer
+    // reads it. Discard what it sent, bounded in both time and bytes.
+    let mut unread = reader.take(1 << 20);
+    let mut sink = tokio::io::sink();
+    let drain = tokio::io::copy(&mut unread, &mut sink);
+    tokio::time::timeout(Duration::from_secs(1), drain).await.ok();
+    Err(anyhow!("refused: missing or wrong token"))
+}
+
 /// Per-connection state machine. Returns when the peer disconnects or
 /// sends a malformed event; the spawned task logs and exits.
 async fn handle_connection(
@@ -373,13 +438,15 @@ async fn handle_connection(
     let mut sample_rate: u32 = 16_000;
     let mut audio_started = false;
     let mut pending_transcribe: Option<Transcribe> = None;
+    let mut admitted = false;
 
     loop {
-        let frame = match tokio::time::timeout(IDLE_TIMEOUT, Frame::read_async(&mut reader)).await {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => return Err(anyhow!("frame read error: {e}")),
-            Err(_) => return Err(anyhow!("idle timeout — no traffic for {IDLE_TIMEOUT:?}")),
-        };
+        let mut frame = read_frame(&mut reader).await?;
+
+        // Only the first frame of a connection carries the token.
+        if !std::mem::replace(&mut admitted, true) {
+            check_first_frame(&mut frame, &cfg, peer, &mut reader, &mut write_half).await?;
+        }
 
         match frame.kind.as_str() {
             DESCRIBE => {
@@ -812,6 +879,20 @@ fn build_info(cfg: &WyomingServerConfig) -> Info {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_rules_match_the_http_servers() {
+        // No token configured: everyone is admitted, as before.
+        assert!(admit(None, false, None));
+        assert!(admit(Some(""), false, None), "a blank token means no token");
+        // Token configured.
+        let t = Some("good");
+        assert!(!admit(t, false, None), "a remote peer must present the token");
+        assert!(!admit(t, false, Some("bad")));
+        assert!(admit(t, false, Some("good")));
+        assert!(admit(t, true, None), "a local peer without a token is the owner");
+        assert!(!admit(t, true, Some("bad")), "a wrong token is refused even locally");
+    }
 
     #[test]
     fn decode_int16_le_round_trips_silence() {

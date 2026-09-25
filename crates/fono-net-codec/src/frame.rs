@@ -89,8 +89,12 @@ impl Frame {
     where
         R: AsyncBufRead + Unpin,
     {
+        // Cap the read itself, not just the result: a peer that never sends
+        // a newline would otherwise grow `line` until the daemon runs out of
+        // memory, and the length check below would never be reached.
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let limit = MAX_HEADER_LINE_BYTES as u64 + 1;
+        let n = (&mut *reader).take(limit).read_line(&mut line).await?;
         if n == 0 {
             return Err(FrameError::Truncated("header line"));
         }
@@ -209,6 +213,18 @@ mod tests {
         frame.write_async(&mut buf).await.unwrap();
         let mut reader = BufReader::new(buf.as_slice());
         Frame::read_async(&mut reader).await.unwrap()
+    }
+
+    /// A header that never ends must be refused once it passes the cap, not
+    /// buffered forever. `repeat` is an endless stream with no newline, so
+    /// without the bound this test would never finish.
+    #[tokio::test]
+    async fn endless_header_line_is_refused_at_the_cap() {
+        let mut reader = BufReader::new(tokio::io::repeat(b'a'));
+        match Frame::read_async(&mut reader).await {
+            Err(FrameError::HeaderTooLong(n)) => assert_eq!(n, MAX_HEADER_LINE_BYTES + 1),
+            other => panic!("expected HeaderTooLong, got {other:?}"),
+        }
     }
 
     #[tokio::test]

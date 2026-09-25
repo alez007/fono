@@ -16,8 +16,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fono_net_codec::wyoming::{
-    AudioChunk, AudioStart, Info, Synthesize, Voice, AUDIO_CHUNK, AUDIO_START, AUDIO_STOP,
-    DESCRIBE, INFO, SYNTHESIZE,
+    with_auth_token, AudioChunk, AudioStart, Info, Synthesize, Voice, AUDIO_CHUNK, AUDIO_START,
+    AUDIO_STOP, DESCRIBE, ERROR, INFO, SYNTHESIZE,
 };
 use fono_net_codec::Frame;
 use serde_json::to_value;
@@ -82,8 +82,8 @@ fn pcm_i16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
 pub struct WyomingTts {
     host: String,
     port: u16,
-    /// Reserved for the `fono.auth` extension (Wyoming v1 has no
-    /// in-band auth). Plumbed but unused today.
+    /// Optional pre-shared token, attached to the first event of every
+    /// connection (see [`fono_net_codec::wyoming::with_auth_token`]).
     auth_token: Option<String>,
 }
 
@@ -154,7 +154,8 @@ impl TextToSpeech for WyomingTts {
             }
         };
         let req = Synthesize { text: text.to_string(), voice: voice_obj };
-        Frame::new(SYNTHESIZE).with_data(to_value(&req)?).write_async(&mut write_half).await?;
+        let first = Frame::new(SYNTHESIZE).with_data(to_value(&req)?);
+        with_auth_token(first, self.auth_token.as_deref()).write_async(&mut write_half).await?;
 
         // 2. read audio-start → audio-chunk* → audio-stop, accumulating PCM.
         let mut sample_rate: u32 = NATIVE_RATE_HINT;
@@ -187,6 +188,13 @@ impl TextToSpeech for WyomingTts {
                     }
                     AUDIO_STOP => {
                         return Ok::<(), anyhow::Error>(());
+                    }
+                    ERROR => {
+                        let text = f.data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        return Err(anyhow!(
+                            "wyoming TTS server at {} refused the request: {text}",
+                            self.endpoint()
+                        ));
                     }
                     other => {
                         tracing::trace!(
@@ -230,7 +238,8 @@ impl TextToSpeech for WyomingTts {
         let stream = self.connect().await?;
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        Frame::new(DESCRIBE).write_async(&mut write_half).await?;
+        let describe = with_auth_token(Frame::new(DESCRIBE), self.auth_token.as_deref());
+        describe.write_async(&mut write_half).await?;
         let f = timeout(Duration::from_secs(5), Frame::read_async(&mut reader))
             .await
             .with_context(|| {

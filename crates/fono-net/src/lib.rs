@@ -8,10 +8,10 @@
 #[cfg(feature = "discovery")]
 pub mod discovery;
 
-#[cfg(any(feature = "llm-server", feature = "web-settings"))]
+#[cfg(any(feature = "llm-server", feature = "web-settings", feature = "wyoming-server"))]
 pub mod auth;
 
-#[cfg(any(feature = "llm-server", feature = "web-settings"))]
+#[cfg(any(feature = "llm-server", feature = "web-settings", feature = "wyoming-server"))]
 pub use auth::{AuthVerifier, KeyId, UsageSink};
 
 #[cfg(feature = "wyoming-server")]

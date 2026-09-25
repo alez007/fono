@@ -235,5 +235,11 @@ TCP/10300. Keep the container on a trusted LAN and, if needed:
 - publish the port only on a specific interface (`-p 192.168.1.5:10300:10300`), or
 - block port 10300 at your firewall.
 
+`[server.wyoming].auth_token_ref` is for Fono-to-Fono use only: when it is
+set, remote peers must send the token, which other Fono daemons do and Home
+Assistant cannot. Leave it empty if Home Assistant runs on another host.
+A Home Assistant on the same host is still served, because loopback peers
+without a token are admitted.
+
 Audio and transcripts stay on the box with the default local backends;
 cloud backends are strictly opt-in via the variables above.

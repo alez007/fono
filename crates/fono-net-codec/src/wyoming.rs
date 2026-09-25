@@ -37,6 +37,33 @@ pub const DETECT: &str = "detect";
 /// Server → client: a wake word fired. Carries the detected name and an
 /// optional timestamp (ms into the audio stream).
 pub const DETECTION: &str = "detection";
+/// Server → client: the request failed. Standard Wyoming event carrying
+/// `text` and an optional machine-readable `code`.
+pub const ERROR: &str = "error";
+
+/// Fono extension: key under which a client puts the server's pre-shared
+/// token in the `data` of the **first** event on a connection. Wyoming v1
+/// has no auth event; servers that do not know the key ignore it.
+pub const AUTH_TOKEN_KEY: &str = "fono_auth_token";
+
+/// Put `token` into `frame`'s data under [`AUTH_TOKEN_KEY`]. A `None` or
+/// blank token leaves the frame untouched, so unauthenticated peers send
+/// exactly what they sent before.
+#[must_use]
+pub fn with_auth_token(mut frame: crate::Frame, token: Option<&str>) -> crate::Frame {
+    if let (Some(tok), Value::Object(map)) = (token.filter(|t| !t.is_empty()), &mut frame.data) {
+        map.insert(AUTH_TOKEN_KEY.to_string(), Value::String(tok.to_string()));
+    }
+    frame
+}
+
+/// Remove and return the token a client attached with [`with_auth_token`].
+pub fn take_auth_token(frame: &mut crate::Frame) -> Option<String> {
+    match frame.data.as_object_mut()?.remove(AUTH_TOKEN_KEY)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    }
+}
 
 /// `audio-start` — open an audio stream with the agreed PCM format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +321,17 @@ mod tests {
     use crate::Frame;
     use serde_json::{json, to_value};
     use tokio::io::BufReader;
+
+    #[test]
+    fn auth_token_is_attached_and_taken_back_out() {
+        let f = Frame::new(DESCRIBE);
+        assert_eq!(with_auth_token(f.clone(), None), f, "no token leaves the frame as it was");
+        assert_eq!(with_auth_token(f.clone(), Some("")), f, "a blank token is not sent");
+        let mut f = with_auth_token(f, Some("s3cret"));
+        assert_eq!(take_auth_token(&mut f).as_deref(), Some("s3cret"));
+        assert_eq!(f, Frame::new(DESCRIBE), "taking the token strips it from the data");
+        assert_eq!(take_auth_token(&mut f), None);
+    }
 
     #[tokio::test]
     async fn audio_start_round_trip() {

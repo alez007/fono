@@ -53,7 +53,7 @@ pub fn build_tts(
 ) -> Result<Option<Arc<dyn TextToSpeech>>> {
     let primary: Arc<dyn TextToSpeech> = match cfg.backend {
         TtsBackend::None => return Ok(None),
-        TtsBackend::Wyoming => build_wyoming(cfg)?,
+        TtsBackend::Wyoming => build_wyoming(cfg, secrets)?,
         TtsBackend::OpenAI => build_openai(cfg, secrets)?,
         TtsBackend::Groq => build_groq(cfg, secrets)?,
         TtsBackend::OpenRouter => build_openrouter(cfg, secrets)?,
@@ -216,7 +216,7 @@ fn build_local(
 }
 
 #[cfg(feature = "wyoming")]
-fn build_wyoming(cfg: &Tts) -> Result<Arc<dyn TextToSpeech>> {
+fn build_wyoming(cfg: &Tts, secrets: &Secrets) -> Result<Arc<dyn TextToSpeech>> {
     let wy = cfg.wyoming.as_ref().ok_or_else(|| {
         anyhow!(
             "wyoming TTS selected but `[tts.wyoming]` is missing — set \
@@ -229,14 +229,17 @@ fn build_wyoming(cfg: &Tts) -> Result<Arc<dyn TextToSpeech>> {
              URL like `tcp://piper.local:10200`"
         ));
     }
-    let backend = crate::wyoming::WyomingTts::from_uri(&wy.uri)?;
-    // auth_token reserved for the future fono.auth extension event;
-    // not threaded through yet (Wyoming v1 has no in-band auth).
+    let token = if wy.auth_token_ref.trim().is_empty() {
+        None
+    } else {
+        secrets.resolve(&wy.auth_token_ref)
+    };
+    let backend = crate::wyoming::WyomingTts::from_uri(&wy.uri)?.with_auth_token(token);
     Ok(Arc::new(backend))
 }
 
 #[cfg(not(feature = "wyoming"))]
-fn build_wyoming(_cfg: &Tts) -> Result<Arc<dyn TextToSpeech>> {
+fn build_wyoming(_cfg: &Tts, _secrets: &Secrets) -> Result<Arc<dyn TextToSpeech>> {
     Err(anyhow!("Wyoming TTS not compiled in (enable the `wyoming` feature on `fono-tts`)"))
 }
 

@@ -3670,6 +3670,38 @@ fn wyoming_wake_models(config: &Config) -> Vec<fono_net::wyoming::server::Advert
         .collect()
 }
 
+/// Resolve `[server.wyoming].auth_token_ref` through secrets.toml first, then
+/// the environment, like every other `*_ref` field. A bare env lookup made a
+/// token saved with `fono keys` invisible here. Warns when the server is
+/// reachable from the network with no token.
+fn resolve_wyoming_token(
+    paths: &Paths,
+    token_ref: &str,
+    bind: &str,
+    loopback_only: bool,
+) -> Option<String> {
+    let token = if token_ref.is_empty() {
+        None
+    } else {
+        let token = Secrets::load(&paths.secrets_file()).unwrap_or_default().resolve(token_ref);
+        if token.is_none() {
+            warn!(
+                "[server.wyoming].auth_token_ref = {token_ref:?} is not in secrets.toml or the \
+                 environment; the Wyoming server will run without a token"
+            );
+        }
+        token
+    };
+    if !loopback_only && token.is_none() {
+        warn!(
+            "[server.wyoming] is bound beyond loopback ({bind}) with no token — anyone on the \
+             network can use this machine for speech-to-text and text-to-speech. Set \
+             [server.wyoming].auth_token_ref."
+        );
+    }
+    token
+}
+
 /// Spawn the LAN Wyoming server if `[server.wyoming].enabled = true`
 /// and the orchestrator is alive. Returns `None` when the server is
 /// disabled, the orchestrator is in degraded mode, or the listener
@@ -3694,8 +3726,7 @@ async fn spawn_wyoming_server_if_enabled(
     };
 
     let loopback_only = cfg.bind == "127.0.0.1" || cfg.bind == "::1";
-    let auth_token =
-        if cfg.auth_token_ref.is_empty() { None } else { std::env::var(&cfg.auth_token_ref).ok() };
+    let auth_token = resolve_wyoming_token(paths, &cfg.auth_token_ref, &cfg.bind, loopback_only);
     let model = config.stt.local.model.clone();
     // TTS rides this same listener and is served automatically whenever
     // a `[tts]` backend is configured (the orchestrator hands out a
@@ -3899,7 +3930,7 @@ async fn spawn_llm_server_if_enabled(
         &auth,
         "llm",
         &cfg.auth_token_ref,
-        std::env::var(&cfg.auth_token_ref).ok(),
+        Secrets::load(&paths.secrets_file()).unwrap_or_default().resolve(&cfg.auth_token_ref),
     );
     if !loopback_only && cfg.auth && auth.active_count() == 0 {
         warn!(
