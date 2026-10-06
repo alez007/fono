@@ -323,6 +323,10 @@ pub enum TrayAction {
     /// (persisting `server.web.enabled = true`), then opens the page
     /// via `xdg-open` / `open` / `explorer`.
     OpenSettingsWeb,
+    /// Open the browser welcome screen: connect a cloud provider, paste a
+    /// key, or switch to the on-device model. Same lazy start as
+    /// [`TrayAction::OpenSettingsWeb`].
+    OpenWelcome,
     OpenConfig,
     /// Wipe the rolling assistant conversation history. Independent
     /// of the playback state; intended as a "fresh start" entry.

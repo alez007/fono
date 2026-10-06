@@ -2318,6 +2318,7 @@ function currentView() {
   if (location.hash === '#/cache') return 'cache';
   if (location.hash === '#/history') return 'history';
   if (location.hash === '#/actions') return 'actions';
+  if (location.hash === '#/welcome') return 'welcome';
   return 'settings';
 }
 function showView() {
@@ -2327,6 +2328,8 @@ function showView() {
   document.getElementById('view-cache').hidden = v !== 'cache';
   document.getElementById('view-history').hidden = v !== 'history';
   document.getElementById('view-actions').hidden = v !== 'actions';
+  document.getElementById('view-welcome').hidden = v !== 'welcome';
+  if (v === 'welcome') openWelcome(); else closeWelcome();
   document.getElementById('verchip').textContent =
     v + (meta && meta.version ? ' \u00b7 v' + meta.version : '');
   if (v === 'doctor') renderDoctor();
@@ -4037,6 +4040,231 @@ async function setServerTools(server, enabled, solo) {
   await loadTools();
   renderActions();
 }
+
+// ---------- welcome (first-run onboarding) ----------
+// One screen: the free cloud providers, this computer, and paste-anywhere for
+// a key the user already has. Every card comes from GET /api/onboarding/state,
+// which reads the provider catalogue, so no provider is named here. The daemon
+// tests keys and writes config; this view only renders and posts.
+let wel = null, welErr = null, welTimer = null, welChanged = false;
+let welOpenUrl = '', welLastText = null, welWatching = false, welTried = '';
+const WEL_PHASE = {
+  waiting: '\u23f3', testing: '\u23f3', connected: '\u2713', failed: '\u2715', timeout: '\u2715',
+};
+
+function openWelcome() { renderWelcome(); loadWelcome(); }
+function closeWelcome() {
+  clearTimeout(welTimer);
+  if (wel && wel.progress && wel.progress.phase === 'waiting') {
+    api('/api/onboarding/watch', { method: 'DELETE' }).catch(() => {});
+  }
+  // The settings editor holds its own copy of the config; re-read it so it
+  // shows what the welcome screen just changed. Unsaved edits win.
+  if (welChanged && cfg && dirtyPaths().length === 0) {
+    welChanged = false;
+    api('/api/config').then((c) => { cfg = c; orig = clone(c); renderAll(); }).catch(() => {});
+  }
+}
+async function loadWelcome() {
+  clearTimeout(welTimer);
+  try { wel = await api('/api/onboarding/state'); welErr = null; } catch (e) { welErr = e.message; }
+  if (currentView() !== 'welcome') return;
+  renderWelcome();
+  const p = wel && wel.progress;
+  const busy = (p && (p.phase === 'waiting' || p.phase === 'testing'))
+    || (wel && wel.local.phase === 'downloading');
+  if (busy) welTimer = setTimeout(loadWelcome, 1000);
+  if (wel && welReady() && !welWatching) {
+    welWatching = true;
+    watchFirstDictation();
+  }
+}
+
+// "Try it": show the next dictation on the page, so the user sees Fono work
+// before leaving the screen. Polls history only while the view is open.
+async function watchFirstDictation() {
+  try {
+    const r = await api('/api/history/dictation?limit=1');
+    const e = (r.entries || [])[0];
+    const text = e ? (e.cleaned || e.raw || '') : '';
+    if (welLastText === null) welLastText = text; // what was there before
+    else if (text !== welLastText) {
+      welLastText = text;
+      welTried = text;
+      const box = document.getElementById('wel-tried');
+      if (box) { box.textContent = text; box.hidden = false; }
+    }
+  } catch (e) { /* history off: the hint alone still helps */ }
+  if (currentView() === 'welcome') setTimeout(watchFirstDictation, 1500);
+  else welWatching = false;
+}
+
+// Whether dictation can run right now: a cloud provider is connected, or the
+// local model is in use and not still downloading.
+function welReady() {
+  const l = wel.local;
+  return !!wel.connected || l.phase === 'ready' || (l.active && l.phase !== 'downloading');
+}
+
+function welCard(p) {
+  const working = p.key === 'works' || p.key === 'unverified';
+  const badge = p.id === wel.recommended && !wel.connected
+    ? '<span class="wel-badge">Recommended</span>' : '';
+  let status = '', action;
+  if (p.active && working) {
+    status = '<span class="wel-ok">\u2713 Connected</span>';
+  } else {
+    if (p.key === 'rejected') status = '<span class="wel-bad">The saved key stopped working</span>';
+    else if (working) status = '<span class="wel-ok">Key found on this computer</span>';
+    let label = 'Connect';
+    if (working) label = 'Use this';
+    else if (wel.connected) label = 'Switch to this';
+    action = '<button class="btn' + (p.free && !wel.connected ? ' primary' : '')
+      + '" type="button" data-wel-connect="' + esc(p.id) + '" data-wel-has-key="' + (working ? 1 : 0)
+      + '">' + esc(label) + '</button>';
+  }
+  return '<div class="wel-card' + (p.active && working ? ' on' : '') + '">'
+    + '<div class="wel-name">' + esc(p.name) + badge + '</div>'
+    + '<div class="wel-line">' + esc(p.line) + '</div>'
+    + '<div class="wel-foot">' + (status || '') + (action || '') + '</div></div>';
+}
+
+function welLocalCard() {
+  const l = wel.local;
+  const size = l.size_mb ? (l.size_mb >= 1000 ? (l.size_mb / 1000).toFixed(1) + ' GB' : l.size_mb + ' MB') : '';
+  let foot;
+  if (l.phase === 'downloading') foot = '<span class="wel-wait">\u23f3 Downloading\u2026</span>';
+  else if (l.phase === 'failed') foot = '<span class="wel-bad">Download failed. Fono retries on the next start.</span>';
+  else if (l.active && !wel.connected) foot = '<span class="wel-ok">\u2713 In use</span>';
+  else foot = '<button class="btn" type="button" data-wel-local>Use this computer</button>';
+  return '<div class="wel-card' + (l.active && !wel.connected ? ' on' : '') + '">'
+    + '<div class="wel-name">This computer</div>'
+    + '<div class="wel-line">Works offline. Your voice never leaves this computer.'
+    + (size ? ' One-time download of ' + esc(size) + '.' : '') + '</div>'
+    + '<div class="wel-foot">' + foot + '</div></div>';
+}
+
+function welProgress() {
+  const p = wel.progress;
+  if (!p || p.phase === 'connected') return '';
+  const prov = wel.providers.find((x) => x.id === p.provider);
+  if (!prov) return '';
+  const status = '<p class="wel-status">' + (WEL_PHASE[p.phase] || '') + ' ' + esc(p.message) + '</p>';
+  const reopen = welOpenUrl
+    ? '<a href="' + esc(welOpenUrl) + '" target="_blank" rel="noopener">Open the page again</a> \u00b7 ' : '';
+  const cancel = p.phase === 'waiting'
+    ? '<button class="btn ghost" type="button" data-wel-cancel>Cancel</button>' : '';
+  const steps = prov.oauth
+    ? '<p>Sign in on the ' + esc(prov.name) + ' page, then click <b>Authorize</b>. This page updates by itself.</p>'
+    : '<ol><li>Sign in. A Google account works.</li><li>Click <b>Create API key</b>.</li>'
+      + '<li>Click <b>Copy</b>. Fono picks the key up by itself.</li></ol>';
+  return '<section class="sec wel-steps"><b>Connecting ' + esc(prov.name) + '</b>' + steps + status
+    + '<p class="hint">' + reopen + cancel + '</p></section>';
+}
+
+function renderWelcome() {
+  const el = document.getElementById('view-welcome');
+  if (!wel) {
+    el.innerHTML = '<p class="hint">' + (welErr ? esc(welErr) : 'Loading\u2026') + '</p>';
+    return;
+  }
+  // Polling re-renders every second; keep what the user is typing.
+  const prev = document.getElementById('wel-paste');
+  const typed = prev ? prev.value : '';
+  const focused = prev && document.activeElement === prev;
+  const otherOpen = !!el.querySelector('.wel-other[open]');
+  const free = wel.providers.filter((p) => p.free);
+  const other = wel.providers.filter((p) => !p.free);
+  const conn = wel.providers.find((p) => p.id === wel.connected);
+  const ready = welReady();
+  const tryIt = ready
+    ? '<section class="sec wel-try"><b>' + (conn ? '\u2713 ' + esc(conn.name) + ' is connected. ' : '')
+      + 'Try it:</b> press <span class="kbd">' + esc(wel.hotkey) + '</span>, say something, and press it again.'
+      + '<p id="wel-tried" class="wel-tried"' + (welTried ? '>' + esc(welTried) : ' hidden>')
+      + '</p></section>'
+    : '';
+  el.innerHTML = '<h2 class="wel-title">How should Fono understand your voice?</h2>'
+    + tryIt
+    + '<div class="wel-row"><div class="wel-col"><div class="wel-h">Free cloud'
+    + '<span class="hint"> \u00b7 pick any, each one works fully</span></div>'
+    + '<div class="wel-cards">' + free.map(welCard).join('') + '</div></div>'
+    + '<div class="wel-col wel-local"><div class="wel-h">Private</div>'
+    + '<div class="wel-cards">' + welLocalCard() + '</div></div></div>'
+    + welProgress()
+    + '<div class="wel-paste">Already have an API key? Paste it anywhere on this page '
+    + '(<span class="kbd">Ctrl</span>+<span class="kbd">V</span>), or here: '
+    + '<input id="wel-paste" autocomplete="off" spellcheck="false" placeholder="paste a key" /></div>'
+    + (other.length ? '<details class="wel-other"><summary>Other services (paid, trial credit, or partial)</summary>'
+      + '<div class="wel-cards">' + other.map(welCard).join('') + '</div></details>' : '')
+    + '<p class="wel-done"><a class="btn" href="#/">' + (ready ? 'Done' : 'Skip for now') + '</a></p>';
+  el.querySelectorAll('[data-wel-connect]').forEach((b) => b.addEventListener('click',
+    () => welConnect(b.dataset.welConnect, b.dataset.welHasKey === '1')));
+  el.querySelectorAll('[data-wel-local]').forEach((b) => b.addEventListener('click', welLocal));
+  const box = document.getElementById('wel-paste');
+  box.value = typed;
+  if (focused) box.focus();
+  if (otherOpen) el.querySelector('.wel-other').open = true;
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') welPaste(e.target.value);
+  });
+  el.querySelectorAll('[data-wel-cancel]').forEach((b) => b.addEventListener('click', async () => {
+    await api('/api/onboarding/watch', { method: 'DELETE' }).catch(() => {});
+    wel.progress = null; welOpenUrl = ''; renderWelcome();
+  }));
+}
+
+async function welConnect(id, hasKey) {
+  // Open the tab inside the click, before any await: browsers block a
+  // window opened later from a script. A provider whose key already works
+  // needs no page.
+  const tab = hasKey ? null : window.open('about:blank', '_blank');
+  try {
+    const r = await api('/api/onboarding/connect/' + encodeURIComponent(id), { method: 'POST' });
+    welOpenUrl = r.open_url || '';
+    if (tab) {
+      if (welOpenUrl) { tab.opener = null; tab.location.href = welOpenUrl; } else tab.close();
+    }
+    welChanged = true;
+  } catch (e) {
+    if (tab) tab.close();
+    toast(e.message, true);
+  }
+  loadWelcome();
+}
+
+async function welLocal() {
+  try {
+    await api('/api/onboarding/local', { method: 'POST' });
+    welChanged = true;
+  } catch (e) { toast(e.message, true); }
+  loadWelcome();
+}
+
+async function welPaste(text) {
+  if (!text || !text.trim()) return;
+  try {
+    const r = await api('/api/onboarding/key', { method: 'POST', body: JSON.stringify({ value: text }) });
+    welChanged = true;
+    toast(r.name + ' is connected.');
+  } catch (e) { toast(e.message, true); }
+  const box = document.getElementById('wel-paste');
+  if (box) box.value = '';
+  loadWelcome();
+}
+
+// Paste anywhere on the welcome screen. The browser hands a page what the
+// user pastes without asking for clipboard permission. Pastes into other
+// fields keep their normal behaviour.
+document.addEventListener('paste', (e) => {
+  if (currentView() !== 'welcome') return;
+  const t = e.target;
+  const field = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA');
+  if (field && t.id !== 'wel-paste') return;
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  if (!text) return;
+  e.preventDefault();
+  welPaste(text);
+});
 
 // ---------- search + theme ----------
 function applyFilter(q) {

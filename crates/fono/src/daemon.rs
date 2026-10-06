@@ -383,6 +383,24 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
         .await,
     ));
 
+    // First start from the app menu: there was no terminal for the setup
+    // wizard, so open the welcome screen in the browser instead. Without a
+    // display (a server, an SSH session) there is nobody to show it to, and
+    // the default local setup stands.
+    if (crate::welcome::take_welcome_request() || first_run) && crate::is_graphical_session() {
+        info!("first run: opening the welcome screen");
+        Box::pin(open_settings_web_via_tray(
+            paths,
+            &web_settings,
+            orchestrator.as_ref(),
+            &wake,
+            &llm_ctl,
+            &wyoming_ctl,
+            "#/welcome",
+        ))
+        .await;
+    }
+
     // ---------------------------------------------------------------
     // Refresh what the connected homes and services offer, once, at
     // startup. The catalogue is a cache on disk, and until now nothing
@@ -1406,7 +1424,9 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                     TrayAction::OpenSettingsTui => {
                         open_settings_tui();
                     }
-                    TrayAction::OpenSettingsWeb => {
+                    TrayAction::OpenSettingsWeb | TrayAction::OpenWelcome => {
+                        let fragment =
+                            if matches!(ta, TrayAction::OpenWelcome) { "#/welcome" } else { "" };
                         // Box the future for the same large_stack_frames
                         // reason as the server toggles below.
                         Box::pin(open_settings_web_via_tray(
@@ -1416,6 +1436,7 @@ pub async fn run(paths: &Paths, verbosity: Verbosity) -> Result<()> {
                             &wake_tray,
                             &llm_ctl_for_tray,
                             &wyoming_ctl_for_tray,
+                            fragment,
                         ))
                         .await;
                     }
@@ -4031,6 +4052,9 @@ async fn spawn_web_settings_if_enabled(
 /// Tray "Settings…" handler: lazy-start the web settings listener when
 /// it isn't running (persisting `server.web.enabled = true` so it
 /// survives restarts), then open the page in the default browser.
+///
+/// `fragment` picks the page's view (`""` for settings, `"#/welcome"` for
+/// the first-run welcome screen).
 async fn open_settings_web_via_tray(
     paths: &Paths,
     slot: &WebSettingsSlot,
@@ -4038,6 +4062,7 @@ async fn open_settings_web_via_tray(
     wake: &crate::wake::WakeHandle,
     llm_ctl: &LlmControl,
     wyoming_ctl: &WyomingControl,
+    fragment: &str,
 ) {
     let mut guard = slot.lock().await;
     if guard.is_none() {
@@ -4062,7 +4087,7 @@ async fn open_settings_web_via_tray(
                 .await;
     }
     if let Some(handle) = guard.as_ref() {
-        open_url(&web_settings_url(&handle.local_addr()));
+        open_url(&format!("{}{fragment}", web_settings_url(&handle.local_addr())));
     } else {
         fono_core::notify::send(
             "Fono — settings page failed to start",
@@ -4328,6 +4353,7 @@ fn web_settings_hooks(
         list_threads,
         get_thread,
         delete_history,
+        onboarding: crate::welcome::hook(paths, orchestrator, wake),
     }
 }
 

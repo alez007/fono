@@ -739,3 +739,30 @@ details.sec .body > .row:first-child, details.sec .body > .row.master { border-t
   .slotgrid .sv-held::before { content: '\2192\a0'; color: var(--ink-dim); }
   .act-detail { padding-left: 14px; margin-left: 10px; }
 }
+
+/* Welcome (first-run onboarding): provider cards + this computer. */
+.wel-title { font-size: 20px; font-weight: 600; margin: 8px 0 16px; }
+.wel-row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+.wel-col { flex: 3 1 420px; min-width: 0; }
+.wel-col.wel-local { flex: 1 1 200px; }
+.wel-h { font-size: 12px; font-weight: 600; color: var(--ink-mute); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; }
+.wel-h .hint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.wel-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.wel-card { display: flex; flex-direction: column; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.wel-card.on { border-color: var(--ok); }
+.wel-name { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wel-badge { font-size: 10.5px; font-weight: 500; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 1px 8px; }
+.wel-line { font-size: 12.5px; color: var(--ink-mute); flex: 1; }
+.wel-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; min-height: 28px; }
+.wel-ok { color: var(--ok); font-size: 12.5px; }
+.wel-bad { color: var(--accent); font-size: 12.5px; }
+.wel-wait { color: var(--warn); font-size: 12.5px; }
+.wel-steps, .wel-try { margin: 16px 0; }
+.wel-steps ol { margin: 8px 0; padding-left: 20px; }
+.wel-status { font-weight: 500; }
+.wel-tried { margin: 10px 0 0; padding: 10px 12px; border-left: 3px solid var(--ok); background: var(--bg-2); border-radius: 4px; }
+.wel-paste { margin: 18px 0; font-size: 13px; color: var(--ink-mute); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wel-paste input { flex: 1 1 200px; font: inherit; font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 5px 8px; }
+.wel-other { margin: 12px 0; }
+.wel-other summary { cursor: pointer; color: var(--ink-mute); font-size: 13px; margin-bottom: 10px; }
+.wel-done { margin-top: 20px; }

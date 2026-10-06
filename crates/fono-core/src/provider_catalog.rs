@@ -351,6 +351,62 @@ pub fn build_auth_get(
     (final_url, headers)
 }
 
+/// Whether a provider can be used free of charge.
+///
+/// The classification is by what Fono's *default* models cost on that
+/// provider, since those are what onboarding configures. It drifts as
+/// providers change their plans, so each entry was checked against the
+/// provider's pricing page on 2026-10-06; re-check before changing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeTier {
+    /// No free use of the default models.
+    None,
+    /// A free allowance that renews (daily or monthly) with no card on file.
+    Ongoing,
+    /// A one-off credit that runs out. Not offered as "free".
+    TrialCredit,
+}
+
+/// How onboarding obtains a key for a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignIn {
+    /// Open the provider's key page ([`CloudProvider::console_url`]); the
+    /// user creates a key and Fono picks it up from the clipboard or a paste.
+    KeyPage,
+    /// OAuth 2 authorization-code flow with PKCE (RFC 7636): the provider
+    /// redirects back to a loopback callback and Fono exchanges the code
+    /// for a key the user never has to see.
+    OAuthPkce {
+        /// Authorization page the browser is sent to.
+        auth_url: &'static str,
+        /// Endpoint that trades `{code, code_verifier}` for `{key}`.
+        exchange_url: &'static str,
+    },
+}
+
+/// Data the first-run onboarding screen needs about a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Onboarding {
+    /// Whether the default models can be used free of charge.
+    pub free_tier: FreeTier,
+    /// Literal prefixes this provider's API keys start with, used to
+    /// recognise a pasted key. Empty when the keys have no distinctive
+    /// prefix (bare hex); such keys are never auto-detected.
+    pub key_prefixes: &'static [&'static str],
+    /// How a key is obtained.
+    pub sign_in: SignIn,
+    /// One plain-language line for the provider's card. No model names,
+    /// no limits — those change too often to print on a button.
+    pub card_line: &'static str,
+}
+
+/// OpenRouter's OAuth PKCE endpoints. Localhost callbacks are accepted on
+/// any port, which is what lets a desktop app use it without a server.
+const OPENROUTER_OAUTH: SignIn = SignIn::OAuthPkce {
+    auth_url: "https://openrouter.ai/auth",
+    exchange_url: "https://openrouter.ai/api/v1/auth/keys",
+};
+
 /// One cloud provider entry in the catalogue.
 #[derive(Debug, Clone, Copy)]
 pub struct CloudProvider {
@@ -377,6 +433,9 @@ pub struct CloudProvider {
     /// API-key validation metadata. `None` ⇒ the wizard saves the key
     /// without probing (the unwired STT stubs azure/google/nemotron).
     pub key_validation: Option<KeyValidation>,
+    /// What the first-run onboarding screen shows and does for this
+    /// provider.
+    pub onboarding: Onboarding,
 }
 
 /// Canonical capability catalogue. Order matches the wizard's
@@ -394,6 +453,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Bearer,
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &["sk-"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Paid, pay as you go",
+        },
         stt: Some(SttDefaults { model: "gpt-transcribe" }),
         polish: Some(PolishDefaults { model: "gpt-5.4-nano" }),
         // TODO: re-enable web search when fono-assistant migrates the
@@ -450,6 +515,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Bearer,
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::Ongoing,
+            key_prefixes: &["gsk_"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Fastest",
+        },
         stt: Some(SttDefaults { model: "whisper-large-v3-turbo" }),
         polish: Some(PolishDefaults { model: "openai/gpt-oss-120b" }),
         assistant: Some(AssistantDefaults {
@@ -528,6 +599,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Header("x-api-key"),
             extra_headers: &[("anthropic-version", "2023-06-01")],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &["sk-ant-"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Paid, cleanup and assistant only",
+        },
         stt: None,
         polish: Some(PolishDefaults {
             // TODO: verify against Anthropic's current model list — the
@@ -560,6 +637,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Bearer,
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::Ongoing,
+            key_prefixes: &["csk-"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Free plan, cleanup only",
+        },
         stt: None,
         polish: Some(PolishDefaults { model: "gpt-oss-120b" }),
         assistant: Some(AssistantDefaults {
@@ -589,6 +672,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::QueryParam("key"),
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::Ongoing,
+            key_prefixes: &["AIza"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Uses your Google account",
+        },
         stt: Some(SttDefaults { model: "gemini-flash-lite-latest" }),
         polish: Some(PolishDefaults { model: "gemini-flash-lite-latest" }),
         assistant: Some(AssistantDefaults {
@@ -665,6 +754,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
                 ("X-OpenRouter-Categories", crate::openrouter_attribution::CATEGORIES),
             ],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &["sk-or-"],
+            sign_in: OPENROUTER_OAUTH,
+            card_line: "One click, pay as you go",
+        },
         stt: Some(SttDefaults {
             // OpenRouter proxies OpenAI-compatible
             // `POST /v1/audio/transcriptions` to upstream providers;
@@ -728,6 +823,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::HeaderPrefixed { header: "Authorization", prefix: "Token" },
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::TrialCredit,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Trial credit, speech only",
+        },
         stt: Some(SttDefaults { model: "nova-3" }),
         polish: None,
         assistant: None,
@@ -769,6 +870,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             auth: KeyAuth::Header("Authorization"),
             extra_headers: &[],
         }),
+        onboarding: Onboarding {
+            free_tier: FreeTier::TrialCredit,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Trial credit, speech only",
+        },
         stt: Some(SttDefaults { model: "best" }),
         polish: None,
         assistant: None,
@@ -791,6 +898,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         // via the realtime WebSocket endpoint
         // (`wss://api.cartesia.ai/stt/turns/websocket`) which is the
         // streaming work.
+        onboarding: Onboarding {
+            free_tier: FreeTier::Ongoing,
+            key_prefixes: &["sk_car_"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Free plan, speech only",
+        },
         stt: Some(SttDefaults { model: "ink-whisper" }),
         polish: None,
         assistant: None,
@@ -841,6 +954,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         }),
         // Scribe is ElevenLabs' batch speech-to-text model
         // (`POST /v1/speech-to-text`, multipart `model_id` + `file`).
+        onboarding: Onboarding {
+            free_tier: FreeTier::Ongoing,
+            key_prefixes: &["sk_"],
+            sign_in: SignIn::KeyPage,
+            card_line: "Free plan, speech only",
+        },
         stt: Some(SttDefaults { model: "scribe_v1" }),
         polish: None,
         assistant: None,
@@ -905,6 +1024,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         console_url: "https://portal.azure.com/",
         key_env: "AZURE_API_KEY",
         key_validation: None,
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Not available yet",
+        },
         stt: Some(SttDefaults { model: "whisper" }),
         polish: None,
         assistant: None,
@@ -926,6 +1051,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         // "operating point" rather than a model name; `enhanced` is the
         // higher-accuracy default. The STT client treats this string as
         // the `operating_point` in its `transcription_config`.
+        onboarding: Onboarding {
+            free_tier: FreeTier::TrialCredit,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Trial credit, speech only",
+        },
         stt: Some(SttDefaults { model: "enhanced" }),
         polish: None,
         assistant: None,
@@ -958,6 +1089,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         console_url: "https://console.cloud.google.com/",
         key_env: "GOOGLE_API_KEY",
         key_validation: None,
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Not available yet",
+        },
         stt: Some(SttDefaults { model: "default" }),
         polish: None,
         assistant: None,
@@ -971,6 +1108,12 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         console_url: "https://build.nvidia.com/",
         key_env: "NEMOTRON_API_KEY",
         key_validation: None,
+        onboarding: Onboarding {
+            free_tier: FreeTier::None,
+            key_prefixes: &[],
+            sign_in: SignIn::KeyPage,
+            card_line: "Not available yet",
+        },
         stt: Some(SttDefaults {
             // No specific entry yet; generic Whisper fallback.
             model: "whisper-large-v3",

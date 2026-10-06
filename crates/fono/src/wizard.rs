@@ -78,19 +78,31 @@ pub async fn run(paths: &Paths) -> Result<()> {
     let tier = snap.tier();
     print_hw_summary(&snap, tier);
 
-    let path_choice = pick_path(&theme, tier, &snap)?;
-
     let mut config = Config::default();
     let mut download_task: Option<JoinHandle<()>> = None;
 
+    // Same order as the welcome screen: a saved key that works, then the
+    // free services, a key the user already has, this computer, and the
+    // rest of the catalogue.
+    let path_choice = match pick_start(&theme, &mut secrets, tier, &snap).await? {
+        Start::Provider(entry) => {
+            configure_cloud_with(&theme, &mut config, &snap, entry)?;
+            None
+        }
+        Start::Path(p) => Some(p),
+    };
+
     match path_choice {
-        PathChoice::Local => {
+        None => {}
+        Some(PathChoice::Local) => {
             configure_local(&theme, &mut config, &mut secrets, &snap).await?;
             prompt_optional_cloud_key(&theme, &mut secrets).await?;
             download_task = spawn_model_downloads(paths, &config);
         }
-        PathChoice::Cloud => configure_cloud(&theme, &mut config, &mut secrets, &snap).await?,
-        PathChoice::Customize => {
+        Some(PathChoice::Cloud) => {
+            configure_cloud(&theme, &mut config, &mut secrets, &snap).await?;
+        }
+        Some(PathChoice::Customize) => {
             configure_customize(&theme, &mut config, &mut secrets, &snap).await?;
         }
     }
@@ -453,6 +465,36 @@ pub fn apply_primary_provider(config: &mut Config, entry: &CloudProvider) {
             }
         }
     }
+}
+
+/// Switch an existing config to `entry` for every capability it covers,
+/// leaving the rest as the user had it.
+///
+/// Used when a provider is connected from the welcome screen or the
+/// wizard's paste-a-key step. Unlike [`apply_primary_provider`], which
+/// builds a fresh config, it never moves a capability the provider lacks
+/// back to local, keeps the chosen local models and per-language prompts,
+/// and leaves the assistant alone: the assistant stays opt-in, so
+/// connecting a provider for dictation must not switch it on.
+pub fn connect_provider(config: &mut Config, entry: &CloudProvider) {
+    let before = config.clone();
+    apply_primary_provider(config, entry);
+    if is_stt_wired(entry) {
+        config.stt.local = before.stt.local;
+        config.stt.prompts = before.stt.prompts;
+        config.stt.wyoming = before.stt.wyoming;
+    } else {
+        config.stt = before.stt;
+    }
+    if is_polish_wired(entry) {
+        config.polish.local = before.polish.local;
+    } else {
+        config.polish = before.polish;
+    }
+    if !is_tts_wired(entry) {
+        config.tts = before.tts;
+    }
+    config.assistant = before.assistant;
 }
 
 /// Phase D1 — pair to [`apply_primary_provider`]. Inserts a mocked
@@ -960,64 +1002,247 @@ fn print_hw_summary(snap: &HardwareSnapshot, tier: LocalTier) {
     println!("{blurb}\n");
 }
 
-fn pick_path(
+/// Outcome of the wizard's first question.
+enum Start {
+    /// A provider whose key is now in `secrets`.
+    Provider(&'static CloudProvider),
+    /// Fall through to the existing local / full-catalogue / customise flow.
+    Path(PathChoice),
+}
+
+/// One row of the first question.
+#[derive(Debug, Clone, Copy)]
+enum StartChoice {
+    /// A free service: open its key page and wait for the key.
+    Free(&'static CloudProvider),
+    /// Paste a key the user already has; Fono finds the service.
+    Paste,
+    Local,
+    /// Every other service, or one backend per capability.
+    Other,
+}
+
+// Catalogue entries are identified by id.
+impl PartialEq for StartChoice {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Free(a), Self::Free(b)) => a.id == b.id,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+/// Rows for the first question, in welcome-screen order, and the index
+/// the cursor starts on: the recommended free service, or this computer
+/// when the hardware handles local models well.
+fn start_choices(tier: LocalTier) -> (Vec<StartChoice>, usize) {
+    let mut rows: Vec<StartChoice> = fono_core::onboarding::free_dictation_providers()
+        .into_iter()
+        .map(StartChoice::Free)
+        .collect();
+    let recommended = fono_core::onboarding::recommended_free_provider()
+        .and_then(|r| rows.iter().position(|c| *c == StartChoice::Free(r)))
+        .unwrap_or(0);
+    rows.extend([StartChoice::Paste, StartChoice::Local, StartChoice::Other]);
+    let local = rows.iter().position(|c| *c == StartChoice::Local).unwrap_or(0);
+    let default = if tier.local_default() || recommended >= local { local } else { recommended };
+    (rows, default)
+}
+
+fn start_row(choice: StartChoice, tier: LocalTier, width: usize) -> String {
+    let recommended = fono_core::onboarding::recommended_free_provider();
+    match choice {
+        StartChoice::Free(p) => {
+            let tag = if Some(p.id) == recommended.map(|r| r.id) { " (recommended)" } else { "" };
+            format!("{:<width$}Free · {}{tag}", p.display_name, p.onboarding.card_line)
+        }
+        StartChoice::Paste => {
+            format!("{:<width$}Fono finds the service from the key", "I have a key")
+        }
+        StartChoice::Local => {
+            let floor = if tier == LocalTier::Unsuitable { " (slow on this computer)" } else { "" };
+            format!("{:<width$}Private, works offline{floor}", "This computer")
+        }
+        StartChoice::Other => {
+            format!("{:<width$}Paid services, or one backend per capability", "Other")
+        }
+    }
+}
+
+/// The wizard's first question. Asks again when the user backs out of a
+/// step (an empty key prompt), so skipping never ends setup by accident.
+async fn pick_start(
     theme: &ColorfulTheme,
+    secrets: &mut Secrets,
     tier: LocalTier,
     snap: &HardwareSnapshot,
-) -> Result<PathChoice> {
-    // Unsuitable: gate local behind explicit confirmation, default cloud.
+) -> Result<Start> {
+    if let Some(entry) = reuse_saved_key(theme, secrets).await {
+        return Ok(Start::Provider(entry));
+    }
     if tier == LocalTier::Unsuitable {
         if let Err(reason) = snap.suitability() {
-            println!(
-                "  Local models are below the supported floor on this machine: {reason}.\n  \
-                 The wizard will default to cloud APIs."
-            );
+            println!("  Local models are below the supported floor on this machine: {reason}.");
         }
-        let want_local = Confirm::with_theme(theme)
-            .with_prompt(
-                "I understand my hardware is below the supported floor — show local anyway?",
+    }
+    let (choices, default) = start_choices(tier);
+    let width = choices
+        .iter()
+        .map(|c| match c {
+            StartChoice::Free(p) => p.display_name.chars().count(),
+            _ => "This computer".len(),
+        })
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let rows: Vec<String> = choices.iter().map(|c| start_row(*c, tier, width)).collect();
+    let mut cursor = default;
+    loop {
+        let idx = Select::with_theme(theme)
+            .with_prompt("How should Fono understand your voice?")
+            .items(&rows)
+            .default(cursor)
+            .interact()
+            .context("prompt")?;
+        cursor = idx;
+        match choices[idx] {
+            StartChoice::Free(entry) => {
+                if secrets.has_in_file(entry.key_env) {
+                    println!("  reusing the saved {} key", entry.display_name);
+                    return Ok(Start::Provider(entry));
+                }
+                print_key_page_steps(entry);
+                if let Some(found) = paste_key(theme, secrets, Some(entry)).await? {
+                    return Ok(Start::Provider(found));
+                }
+            }
+            StartChoice::Paste => {
+                if let Some(found) = paste_key(theme, secrets, None).await? {
+                    return Ok(Start::Provider(found));
+                }
+            }
+            StartChoice::Local => {
+                let ok = tier != LocalTier::Unsuitable
+                    || Confirm::with_theme(theme)
+                        .with_prompt("Local models will be slow on this computer. Use them anyway?")
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false);
+                if ok {
+                    return Ok(Start::Path(PathChoice::Local));
+                }
+            }
+            StartChoice::Other => return Ok(Start::Path(PathChoice::Cloud)),
+        }
+    }
+}
+
+/// Offer a saved key that still works, so a reinstall or a second run
+/// never makes the user create a new one. Tests every saved or
+/// environment key for a service that can run dictation; free services
+/// are offered first. A key found only in the environment is copied to
+/// `secrets.toml` when accepted, so the daemon finds it without the
+/// variable.
+async fn reuse_saved_key(
+    theme: &ColorfulTheme,
+    secrets: &mut Secrets,
+) -> Option<&'static CloudProvider> {
+    let free = fono_core::onboarding::free_dictation_providers();
+    let mut candidates: Vec<&'static CloudProvider> = CLOUD_PROVIDERS
+        .iter()
+        .filter(|p| is_stt_wired(p) && secrets.resolve(p.key_env).is_some())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by_key(|p| !free.iter().any(|f| f.id == p.id));
+    println!("  Checking the API keys already on this computer…");
+    let envs: Vec<String> = candidates.iter().map(|p| p.key_env.to_string()).collect();
+    let results = crate::key_probe::probe_keys(&envs, secrets).await;
+    let entry = candidates.into_iter().find(|p| {
+        matches!(
+            results.get(p.key_env),
+            Some(
+                crate::key_probe::KeyReachability::Valid
+                    | crate::key_probe::KeyReachability::Unexpected(_)
             )
+        )
+    })?;
+    let use_it = Confirm::with_theme(theme)
+        .with_prompt(format!("Your saved {} key works. Use it?", entry.display_name))
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+    if !use_it {
+        return None;
+    }
+    if !secrets.has_in_file(entry.key_env) {
+        if let Some(value) = secrets.resolve(entry.key_env) {
+            secrets.insert(entry.key_env, value);
+        }
+    }
+    Some(entry)
+}
+
+/// The three steps for a service whose key is created on its own page,
+/// plus the page itself, opened in the browser when there is one.
+fn print_key_page_steps(entry: &CloudProvider) {
+    let label = fono_core::onboarding::key_label(&fono_core::onboarding::host_name());
+    println!("\n  Connecting {}:", entry.display_name);
+    println!("    1. Sign in. A Google account works.");
+    println!("    2. Click \"Create API key\". If it asks for a name, use {label}.");
+    println!("    3. Copy the key and paste it here.");
+    if !entry.console_url.is_empty() {
+        println!("  Page: {}", entry.console_url);
+        if crate::is_graphical_session() {
+            crate::daemon::open_url(entry.console_url);
+        }
+    }
+}
+
+/// Read a key, work out its service from the prefix (falling back to
+/// `expected` for services whose keys have none), test it and save it.
+/// `None` when the user leaves the prompt empty or declines to keep a
+/// key that failed its test.
+async fn paste_key(
+    theme: &ColorfulTheme,
+    secrets: &mut Secrets,
+    expected: Option<&'static CloudProvider>,
+) -> Result<Option<&'static CloudProvider>> {
+    let label =
+        expected.map_or_else(|| "API key".to_string(), |e| format!("{} key", e.display_name));
+    let raw = prompt_masked_api_key(&label)?;
+    let key = raw.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let Some(entry) = fono_core::onboarding::detect_provider(key).or(expected) else {
+        println!("  That doesn't look like a key from a service Fono knows.");
+        return Ok(None);
+    };
+    if expected.is_some_and(|e| e.id != entry.id) {
+        println!(
+            "  That is a {} key, so Fono will use {}.",
+            entry.display_name, entry.display_name
+        );
+    }
+    print!("  Testing the {} key … ", entry.display_name);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if let Err(e) = validate_cloud_key(entry.key_env, key).await {
+        println!("FAILED ({e:#})");
+        let keep = Confirm::with_theme(theme)
+            .with_prompt("Save this key anyway? (offline / behind proxy / try later)")
             .default(false)
             .interact()
             .unwrap_or(false);
-        if want_local {
-            return Ok(PathChoice::Local);
+        if !keep {
+            return Ok(None);
         }
-        return Ok(PathChoice::Cloud);
+    } else {
+        println!("OK");
     }
-
-    // R3.3 — three top-level options in a fixed order, rendered as a
-    // two-column table. Order is independent of hardware tier; only
-    // the default cursor position tracks `tier.local_default()`.
-    let mapping = [PathChoice::Local, PathChoice::Cloud, PathChoice::Customize];
-    let rows = pick_path_rows();
-    let default_idx = usize::from(!tier.local_default());
-
-    let idx = Select::with_theme(theme)
-        .with_prompt("Where should Fono run speech-to-text and polish?")
-        .items(&rows)
-        .default(default_idx)
-        .interact()
-        .context("prompt")?;
-    Ok(mapping[idx])
-}
-
-/// Rows shown by `pick_path`'s two-column Select. Each row is
-/// `"<name padded>  <description>"` where the pad width is computed
-/// from the longest name + 2 spaces so future variants (e.g. `Hybrid`)
-/// don't break alignment. Factored out for unit testing.
-fn pick_path_rows() -> [String; 3] {
-    let entries: [(&str, &str); 3] = [
-        ("Local", "Private, offline, runs on this machine"),
-        ("Cloud", "Fast, accurate, needs an API key"),
-        ("Customize", "Pick a backend per capability"),
-    ];
-    let width = entries.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
-    [
-        format!("{:<width$}{}", entries[0].0, entries[0].1, width = width),
-        format!("{:<width$}{}", entries[1].0, entries[1].1, width = width),
-        format!("{:<width$}{}", entries[2].0, entries[2].1, width = width),
-    ]
+    secrets.insert(entry.key_env, key);
+    Ok(Some(entry))
 }
 
 async fn configure_local(
@@ -1216,7 +1441,17 @@ async fn configure_cloud(
     // Single key entry (or reuse) for the primary provider.
     prompt_or_reuse_key(theme, secrets, entry.key_env, entry.display_name, entry.console_url)
         .await?;
+    configure_cloud_with(theme, config, snap, entry)
+}
 
+/// Fill every capability from `entry` once its key is in place, then ask
+/// for languages. Shared by the free-service row and the full picker.
+fn configure_cloud_with(
+    theme: &ColorfulTheme,
+    config: &mut Config,
+    snap: &HardwareSnapshot,
+    entry: &'static CloudProvider,
+) -> Result<()> {
     // Walk capabilities — the chosen primary drives every capability it
     // covers with a wired backend; every other capability leans on a
     // local backend so the user ends up with a complete configuration
@@ -2648,32 +2883,22 @@ mod tests {
         assert_eq!(ids.len(), 11, "unexpected primary candidate set: {ids:?}");
     }
 
-    /// Pins the two-column layout of `pick_path`'s
-    /// rows: name padded to longest-name + 2 spaces, then description.
-    /// The fixed order is `Local`, `Cloud`, `Customize`.
+    /// The first question lists every free service, then "I have a key",
+    /// this computer and "Other", and starts on the recommended free
+    /// service unless the hardware handles local models well.
     #[test]
-    fn pick_path_rows_render_two_column_table() {
-        let rows = pick_path_rows();
-        assert_eq!(
-            rows,
-            [
-                "Local      Private, offline, runs on this machine".to_string(),
-                "Cloud      Fast, accurate, needs an API key".to_string(),
-                "Customize  Pick a backend per capability".to_string(),
-            ]
-        );
-        // Padding width derived from the longest name ("Customize") + 2.
-        let expected_width = "Customize".len() + 2;
-        for row in &rows {
-            // The first `expected_width` chars contain the padded name;
-            // char `expected_width - 1` is always a space (the second
-            // of the two trailing pad spaces).
-            assert_eq!(
-                row.as_bytes()[expected_width - 1],
-                b' ',
-                "row {row:?} should have pad-space at column {}",
-                expected_width - 1
-            );
+    fn start_choices_follow_welcome_screen_order() {
+        let free = fono_core::onboarding::free_dictation_providers();
+        assert!(!free.is_empty(), "catalogue should offer at least one free service");
+        for tier in [LocalTier::Unsuitable, LocalTier::Minimum, LocalTier::HighEnd] {
+            let (rows, default) = start_choices(tier);
+            let tail = &rows[free.len()..];
+            assert_eq!(tail, [StartChoice::Paste, StartChoice::Local, StartChoice::Other]);
+            for (row, p) in rows.iter().zip(&free) {
+                assert_eq!(*row, StartChoice::Free(p));
+            }
+            let expected = if tier.local_default() { free.len() + 1 } else { 0 };
+            assert_eq!(default, expected, "tier {tier:?}");
         }
     }
 

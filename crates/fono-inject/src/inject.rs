@@ -359,6 +359,26 @@ pub fn copy_to_clipboard(text: &str) -> Result<&'static str> {
 /// compositor that arboard supports. Worker re-creation on set-text
 /// failure (e.g. X server restart) is automatic.
 fn copy_to_clipboard_native(text: &str) -> Result<()> {
+    with_native_clipboard(|cb| cb.set_text(text.to_owned()))
+        .map_err(|e| anyhow!("arboard set_text failed: {e}"))
+}
+
+/// The clipboard's current text, or `None` when it holds no text or can't
+/// be read. Reads through the same long-lived handle as
+/// [`copy_to_clipboard_native`]. On Wayland a compositor without the
+/// data-control protocol refuses reads from an unfocused client, so callers
+/// must treat `None` as "unknown", not "empty".
+#[must_use]
+pub fn read_clipboard_text() -> Option<String> {
+    with_native_clipboard(arboard::Clipboard::get_text).ok()
+}
+
+/// Run `op` on the process-wide `arboard` handle, creating it on first use
+/// and dropping it after a failure so the next call reconnects cleanly
+/// (e.g. after the X server restarts or the Wayland compositor reconnects).
+fn with_native_clipboard<T>(
+    op: impl FnOnce(&mut arboard::Clipboard) -> std::result::Result<T, arboard::Error>,
+) -> Result<T> {
     use std::sync::{Mutex, OnceLock};
     static HANDLE: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
     let slot = HANDLE.get_or_init(|| Mutex::new(None));
@@ -368,17 +388,15 @@ fn copy_to_clipboard_native(text: &str) -> Result<()> {
     }
     // Unwrap is safe: we just set it if it was None.
     let cb = guard.as_mut().expect("arboard handle just initialised");
-    let set_result = cb.set_text(text.to_owned());
-    if let Err(e) = set_result {
-        // Drop the stale handle so the next call recreates the X / Wayland
-        // connection cleanly (e.g. after the X server restarts or the
-        // Wayland compositor reconnects).
-        *guard = None;
-        drop(guard);
-        return Err(anyhow!("arboard set_text failed: {e}"));
+    match op(cb) {
+        Ok(v) => Ok(v),
+        // "Nothing to read" is a normal state, not a broken connection.
+        Err(arboard::Error::ContentNotAvailable) => Err(anyhow!("clipboard holds no text")),
+        Err(e) => {
+            *guard = None;
+            Err(anyhow!("{e}"))
+        }
     }
-    drop(guard);
-    Ok(())
 }
 
 /// One attempt's result for diagnostic surfacing.

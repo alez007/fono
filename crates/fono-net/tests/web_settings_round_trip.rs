@@ -132,7 +132,29 @@ fn stub_hooks() -> WebSettingsHooks {
         list_threads,
         get_thread,
         delete_history,
+        onboarding: onboarding_stub(),
     }
+}
+
+/// Echoes each decoded request back so the tests can see what the server
+/// handed the daemon. Accepts one key and one OAuth `state`, refuses the rest.
+fn onboarding_stub() -> fono_net::web_settings::OnboardingFn {
+    use fono_net::web_settings::OnboardingRequest as R;
+    Arc::new(|req| {
+        Box::pin(async move {
+            match req {
+                R::State => Ok(serde_json::json!({ "free": [] })),
+                R::Key(v) if v == "gsk_good" => Ok(serde_json::json!({ "provider": "groq" })),
+                R::Key(_) => Err("Groq rejected this key.".to_string()),
+                R::Connect { provider, callback_url } => {
+                    Ok(serde_json::json!({ "provider": provider, "callback": callback_url }))
+                }
+                R::OAuthCallback { state, .. } if state == "good" => Ok(serde_json::json!({})),
+                R::OAuthCallback { .. } => Err("This sign-in link has expired.".to_string()),
+                R::StopWatch | R::UseLocal | R::Finish => Ok(serde_json::json!({ "ok": true })),
+            }
+        })
+    })
 }
 
 /// Minimal in-memory API-key store so the management routes have real
@@ -632,6 +654,79 @@ async fn history_browse_search_and_delete_round_trip() {
     // An unknown history kind is a 404, not a silent success.
     let r = client.delete(format!("{base}/api/history/nonsense")).send().await.expect("send");
     assert_eq!(r.status(), 404);
+
+    handle.shutdown().await;
+}
+
+/// A pasted key reaches the daemon, and neither the accepted nor the refused
+/// reply ever carries the key back.
+#[tokio::test]
+async fn onboarding_key_is_never_echoed() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    for (key, status) in [("gsk_good", 200), ("gsk_bad", 422)] {
+        let r = client
+            .post(format!("{base}/api/onboarding/key"))
+            .json(&serde_json::json!({ "value": key }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status(), status, "{key}");
+        let body = r.text().await.expect("body");
+        assert!(!body.contains(key), "the reply to {key} echoes the key: {body}");
+    }
+
+    let r = client.post(format!("{base}/api/onboarding/key")).body("{}").send().await.unwrap();
+    assert_eq!(r.status(), 400, "a body without a value is malformed");
+
+    handle.shutdown().await;
+}
+
+/// Connecting names the provider from the path and hands the daemon a
+/// callback URL on this server's own port.
+#[tokio::test]
+async fn onboarding_connect_builds_the_callback_url() {
+    let handle = start(true).await;
+    let port = handle.local_addr().port();
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    let r = client.post(format!("{base}/api/onboarding/connect/openrouter")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["provider"], "openrouter");
+    assert_eq!(body["callback"], format!("http://localhost:{port}/oauth/callback"));
+
+    let r = client.get(format!("{base}/api/onboarding/state")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client.get(format!("{base}/api/onboarding/nonsense")).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+
+    handle.shutdown().await;
+}
+
+/// The OAuth callback answers with a page a person can read, refuses an
+/// unknown `state`, and treats a refusal on the consent page as no change.
+#[tokio::test]
+async fn oauth_callback_checks_state_and_renders_a_page() {
+    let handle = start(true).await;
+    let base = format!("http://{}", handle.local_addr());
+    let client = reqwest::Client::new();
+
+    let r = client.get(format!("{base}/oauth/callback?code=abc&state=good")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("You can close this tab"));
+
+    let r =
+        client.get(format!("{base}/oauth/callback?code=abc&state=forged")).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("expired"));
+
+    let r = client.get(format!("{base}/oauth/callback?error=access_denied")).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("nothing changed"));
 
     handle.shutdown().await;
 }

@@ -51,6 +51,38 @@ reachability validation are generated entirely from this catalogue
 provider is a single `CLOUD_PROVIDERS` edit — it then surfaces in every
 wizard list and validates its key with no changes to the wizard code.
 
+## Free services and first-run setup
+
+On the first start of a graphical session, Fono opens a welcome screen in
+the browser. It shows one card per free service, "This computer" (local
+models), and a field to paste a key you already have; the tray's
+"Connect a service…" opens it again later. `fono setup` asks the same
+question in the terminal. Fono recognises the service from the key's
+prefix and tests the key before saving it. A saved key that still works
+is offered first, so reinstalling never needs a new key. Policy:
+[ADR 0043](decisions/0043-free-cloud-onboarding.md).
+
+A service is in the free row only when it has an ongoing free tier with
+no card that runs both speech-to-text and cleanup on Fono's default
+models. Checked against each pricing page on 2026-10-06:
+
+| Service | Free of charge | On the welcome screen |
+|---|---|---|
+| Groq | Ongoing free plan (speech-to-text and cleanup, daily limits) | Free row |
+| Gemini | Ongoing free tier | Free row |
+| Cerebras | Ongoing free tier, no speech-to-text | Other services |
+| ElevenLabs, Cartesia | Ongoing free plan, speech only | Other services |
+| OpenRouter | Free models exist, but Fono's defaults are paid | Other services, one-click sign-in |
+| Deepgram, AssemblyAI, Speechmatics | One-off trial credit | Other services |
+| OpenAI, Anthropic | Paid | Other services |
+
+OpenRouter connects without copying a key: Fono opens OpenRouter's
+sign-in page, and after you click **Authorize** the key comes back to
+Fono on `127.0.0.1`, labelled `fono-<hostname>`. For the other services
+Fono opens the key page and picks the key up when you copy it (or paste
+it on the welcome screen). On Wayland, background clipboard reads may
+not work; pasting on the page always does.
+
 ## Switching providers (no daemon restart)
 
 The smallest valid cloud config is two lines plus one key:

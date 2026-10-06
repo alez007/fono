@@ -139,6 +139,17 @@ pub async fn probe_keys(
     futures::future::join_all(probes).await.into_iter().collect()
 }
 
+/// Probe one key value that isn't saved anywhere yet, such as a key the
+/// user just pasted. Same request and classification as [`probe_keys`].
+pub async fn probe_key(key_env: &str, key: &str) -> KeyReachability {
+    let mut secrets = Secrets::default();
+    secrets.insert(key_env, key);
+    probe_keys(&[key_env.to_string()], &secrets)
+        .await
+        .remove(key_env)
+        .unwrap_or(KeyReachability::NoProbe)
+}
+
 /// Probe a single key against its catalogue validation endpoint.
 async fn probe_one(client: &reqwest::Client, key_env: &str, key: &str) -> KeyReachability {
     let Some(entry) = fono_core::provider_catalog::find_by_key_env(key_env) else {

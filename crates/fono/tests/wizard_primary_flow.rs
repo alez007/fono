@@ -265,3 +265,28 @@ fn customize_groq_stt_anthropic_llm_wyoming_tts_round_trip() {
     assert_eq!(parsed.tts.backend, TtsBackend::Wyoming);
     assert_eq!(parsed.tts.wyoming.as_ref().map(|w| w.uri.as_str()), Some("tcp://piper.lan:10200"));
 }
+
+/// Every service in the free row runs dictation and cleanup in the cloud
+/// from its one key, which is what "pick any, each one works fully" on
+/// the welcome screen and the wizard's first question promises.
+/// Connecting one later never switches the opt-in assistant on.
+#[test]
+fn every_free_service_covers_dictation_and_cleanup() {
+    use fono::wizard::connect_provider;
+    let free = fono_core::onboarding::free_dictation_providers();
+    assert!(!free.is_empty());
+    for entry in free {
+        let mut cfg = Config::default();
+        apply_primary_provider(&mut cfg, entry);
+        assert_ne!(cfg.stt.backend, SttBackend::Local, "{} should transcribe", entry.id);
+        assert_eq!(cfg.stt.cloud.as_ref().map(|c| c.api_key_ref.as_str()), Some(entry.key_env));
+        assert!(cfg.polish.enabled);
+        assert_ne!(cfg.polish.backend, LlmBackend::Local, "{} should clean up", entry.id);
+
+        let mut later = Config::default();
+        let assistant_before = later.assistant.enabled;
+        connect_provider(&mut later, entry);
+        assert_eq!(later.assistant.enabled, assistant_before, "{}", entry.id);
+        assert_eq!(later.stt.backend, cfg.stt.backend);
+    }
+}

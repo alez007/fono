@@ -320,6 +320,7 @@ pub fn build(t: &MenuInputs<'_>) -> Vec<MenuNode> {
         items.push(MenuNode::item(label, TrayAction::UpdateForGpuAcceleration));
     }
 
+    items.push(MenuNode::item("Connect a service…", TrayAction::OpenWelcome));
     items.push(MenuNode::item("Settings…", TrayAction::OpenSettingsWeb));
     items.push(MenuNode::item("Edit config", TrayAction::OpenConfig));
     items.push(MenuNode::Separator);
@@ -629,6 +630,7 @@ mod tests {
                 "Servers >",
                 "---",
                 "Update to v9.9.9",
+                "Connect a service…",
                 "Settings…",
                 "Edit config",
                 "---",

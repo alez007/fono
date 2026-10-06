@@ -20,6 +20,12 @@
 //!   what is resident, what is pinned, what falls out next, and how the
 //!   entries share prefixes. Metadata only; the cached KV state never
 //!   leaves the daemon.
+//! * `/api/onboarding/*` — the first-run welcome screen: which providers
+//!   to offer, accepting a pasted key, connecting a provider, choosing the
+//!   local model. See [`OnboardingRequest`].
+//! * `GET /oauth/callback` — where a provider's OAuth consent page sends
+//!   the browser back to. Reached from loopback only, like every other
+//!   route on a loopback bind.
 //!
 //! ## Why raw hyper (no axum)
 //!
@@ -289,6 +295,56 @@ pub type GetThreadFn =
 pub type DeleteHistoryFn =
     Arc<dyn Fn(&str, Option<i64>) -> std::result::Result<usize, String> + Send + Sync>;
 
+/// One first-run onboarding action, decoded from its HTTP request.
+///
+/// The server only parses; the daemon tests keys, writes secrets and
+/// config, and talks to providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardingRequest {
+    /// `GET /api/onboarding/state`: provider cards, saved keys and whether
+    /// they work, the local model, and any connect in progress.
+    State,
+    /// `POST /api/onboarding/key {value}`: a key the user pasted. The
+    /// provider is recognised from the key itself.
+    Key(String),
+    /// `POST /api/onboarding/connect/{provider}`: start connecting. The
+    /// reply carries the page to open and whether Fono is now watching the
+    /// clipboard for the key or waiting for an OAuth callback.
+    Connect {
+        /// Catalogue id of the provider.
+        provider: String,
+        /// Absolute URL of [`OAUTH_CALLBACK_PATH`] on this server, as the
+        /// browser reaches it.
+        callback_url: String,
+    },
+    /// `DELETE /api/onboarding/watch`: stop watching the clipboard.
+    StopWatch,
+    /// `POST /api/onboarding/local`: use the on-device model.
+    UseLocal,
+    /// `POST /api/onboarding/finish`: the user is done with the screen.
+    Finish,
+    /// `GET /oauth/callback?code=…&state=…`: the provider sent the browser
+    /// back after the user approved access.
+    OAuthCallback {
+        /// Authorization code to exchange.
+        code: String,
+        /// The value Fono put on the authorization URL; must match a
+        /// pending, unexpired session.
+        state: String,
+    },
+}
+
+/// Path a provider's OAuth consent page redirects back to.
+pub const OAUTH_CALLBACK_PATH: &str = "/oauth/callback";
+
+/// Handle one [`OnboardingRequest`]. `Err` carries a sentence fit to show
+/// the user as-is.
+pub type OnboardingFn = Arc<
+    dyn Fn(OnboardingRequest) -> BoxFuture<'static, std::result::Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
+
 /// Hook closures supplied by the daemon layer. The server itself is a thin
 /// wire adapter with no config semantics.
 #[derive(Clone)]
@@ -340,6 +396,8 @@ pub struct WebSettingsHooks {
     pub list_threads: ListThreadsFn,
     pub get_thread: GetThreadFn,
     pub delete_history: DeleteHistoryFn,
+    /// First-run welcome screen and the OAuth callback.
+    pub onboarding: OnboardingFn,
 }
 
 /// Configuration for [`WebSettingsServer::start`]. Built from
@@ -654,6 +712,8 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
             route_tools(m, p, req, &ctx).await
         }
         (m, p) if p.starts_with("/api/history/") => route_history(m, p, req.uri().query(), &ctx),
+        (m, p) if p.starts_with("/api/onboarding/") => route_onboarding(m, p, req, &ctx).await,
+        (&Method::GET, OAUTH_CALLBACK_PATH) => oauth_callback(req.uri().query(), &ctx).await,
         (&Method::POST, "/api/llm/probe") => route_llm_probe(req, &ctx).await,
         (&Method::POST, "/v1/audio/speech") => {
             let Some(body) = read_json_body(req).await else {
@@ -676,6 +736,95 @@ async fn route(req: Request<Incoming>, peer: SocketAddr, ctx: ServerCtx) -> Resp
             .await
             .unwrap_or_else(|| error_response(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+/// `/api/onboarding/*` — the first-run welcome screen. A rejected key or an
+/// unknown provider is the user's input being wrong, hence `422`; the
+/// message is written for the user and shown as-is.
+async fn route_onboarding(
+    method: &Method,
+    path: &str,
+    req: Request<Incoming>,
+    ctx: &ServerCtx,
+) -> Response<ResBody> {
+    let request = match (method, path) {
+        (&Method::GET, "/api/onboarding/state") => OnboardingRequest::State,
+        (&Method::POST, "/api/onboarding/key") => {
+            let value = read_json_body(req)
+                .await
+                .and_then(|b| b.get("value").and_then(|v| v.as_str()).map(str::to_owned));
+            let Some(value) = value else {
+                return error_response(StatusCode::BAD_REQUEST, "body must be {\"value\": \"…\"}");
+            };
+            OnboardingRequest::Key(value)
+        }
+        (&Method::POST, p) if p.starts_with("/api/onboarding/connect/") => {
+            let provider = p.trim_start_matches("/api/onboarding/connect/").to_owned();
+            let callback_url = callback_url(&req, ctx.cfg.port);
+            OnboardingRequest::Connect { provider, callback_url }
+        }
+        (&Method::DELETE, "/api/onboarding/watch") => OnboardingRequest::StopWatch,
+        (&Method::POST, "/api/onboarding/local") => OnboardingRequest::UseLocal,
+        (&Method::POST, "/api/onboarding/finish") => OnboardingRequest::Finish,
+        _ => return error_response(StatusCode::NOT_FOUND, "not found"),
+    };
+    match (ctx.hooks.onboarding)(request).await {
+        Ok(v) => json_ok(&v),
+        Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    }
+}
+
+/// The OAuth callback URL as the browser reaches this server. Built from
+/// the `Host` header's port so it works on any bind, and always names
+/// `localhost`: providers that accept desktop-app callbacks accept them on
+/// `localhost`, and the listener answers there on a loopback bind.
+fn callback_url(req: &Request<Incoming>, default_port: u16) -> String {
+    let port = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(default_port);
+    format!("http://localhost:{port}{OAUTH_CALLBACK_PATH}")
+}
+
+/// `GET /oauth/callback` — the tab the provider sends back. Answers with a
+/// small page the user reads once and closes; the welcome screen in the
+/// other tab picks up the result on its own.
+async fn oauth_callback(query: Option<&str>, ctx: &ServerCtx) -> Response<ResBody> {
+    // A provider reports a refusal ("Cancel" on its consent page) as
+    // `?error=…` with no code.
+    let (code, state) = (query_param(query, "code"), query_param(query, "state"));
+    let outcome = match (code, state) {
+        (Some(code), Some(state)) if !code.is_empty() => {
+            (ctx.hooks.onboarding)(OnboardingRequest::OAuthCallback { code, state }).await
+        }
+        _ => Err("Access was not granted, so nothing changed.".to_string()),
+    };
+    let (title, body) = match &outcome {
+        Ok(_) => ("Fono is connected", "You can close this tab.".to_string()),
+        Err(e) => ("Fono could not connect", e.clone()),
+    };
+    let page = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>{title}</title>\
+         <style>body{{font:16px system-ui,sans-serif;max-width:32em;margin:15vh auto;\
+         padding:0 1em;text-align:center}}</style></head><body><h1>{title}</h1>\
+         <p>{}</p></body></html>",
+        html_escape(&body)
+    );
+    let status = if outcome.is_ok() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .body(full(Bytes::from(page)))
+        .expect("static response builder")
+}
+
+/// Escape text for an HTML body.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Dispatch the inbound API-key management routes (`/api/apikeys[/id]`).

@@ -840,6 +840,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     eprintln!(
                         "fono: re-run `fono setup` from a terminal to configure STT/polish backends."
                     );
+                    // Started from the app menu: the daemon offers the
+                    // welcome screen in the browser instead of the wizard.
+                    crate::welcome::request_welcome();
                 }
             }
             // Startup-failure notification (issue #8): on autostart

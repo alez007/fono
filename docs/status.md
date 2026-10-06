@@ -1,5 +1,35 @@
 # Fono — Project Status
-Last updated: 2026-08-17
+Last updated: 2026-10-06
+
+## 2026-10-06 — First-run setup offers the free cloud services
+
+Starting Fono from the app menu used to skip setup entirely: the wizard only
+runs in a terminal, so a new user got a local-only config and was never offered
+a cloud service. Now the first start of a graphical session opens a welcome
+screen in the browser (`#/welcome` on the settings page; the tray's "Connect a
+service…" reopens it). It shows one card per free service, "This computer", a
+paste-anywhere field for an existing key, and a collapsed "Other services" list.
+`fono setup` asks the same first question in the same order.
+
+- **Free row = Groq and Gemini.** Checked against each pricing page today; they
+  are the only ongoing free tiers that run speech-to-text and cleanup on our
+  default models. OpenRouter has 3 free audio models, but Fono's OpenRouter
+  speech-to-text uses paid Whisper, so OpenRouter sits under "Other services"
+  with its one-click OAuth sign-in. Policy and the definition of "free":
+  ADR 0043.
+- **Saved keys come first.** Every saved or environment key is tested; one that
+  works is offered before any sign-up step, so reinstalling needs no new key.
+- **Pasted keys are recognised by prefix**, tested, then applied with
+  `connect_provider`, which changes only what the provider covers and never
+  switches the assistant on.
+- **Clipboard watcher** for providers without OAuth: 2 minutes, that provider's
+  prefix only, never logs non-matching text. Pasting on the page is the fallback
+  where background reads fail (Wayland).
+- No new dependencies.
+
+Not done: routing OpenRouter speech-to-text through a free audio chat model
+(would put OpenRouter in the free row); the plan's optional "Fono"-branded OAuth
+consent page. Not yet tested by hand in a browser against live providers.
 
 ## 2026-08-17 — Conversations are now kept on disk
 
