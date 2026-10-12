@@ -388,15 +388,16 @@ fn with_native_clipboard<T>(
     }
     // Unwrap is safe: we just set it if it was None.
     let cb = guard.as_mut().expect("arboard handle just initialised");
-    match op(cb) {
-        Ok(v) => Ok(v),
-        // "Nothing to read" is a normal state, not a broken connection.
-        Err(arboard::Error::ContentNotAvailable) => Err(anyhow!("clipboard holds no text")),
-        Err(e) => {
-            *guard = None;
-            Err(anyhow!("{e}"))
-        }
+    let result = op(cb);
+    // "Nothing to read" is a normal state, not a broken connection.
+    if matches!(result, Err(ref e) if !matches!(e, arboard::Error::ContentNotAvailable)) {
+        *guard = None;
     }
+    drop(guard);
+    result.map_err(|e| match e {
+        arboard::Error::ContentNotAvailable => anyhow!("clipboard holds no text"),
+        e => anyhow!("{e}"),
+    })
 }
 
 /// One attempt's result for diagnostic surfacing.

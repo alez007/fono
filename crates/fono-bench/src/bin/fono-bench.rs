@@ -1731,7 +1731,7 @@ async fn run_embedded_replay(args: &AssistantReplayArgs, prompt: &str) -> Result
             let mut first_token_ms = None;
             let mut output = String::new();
             let mut delta_count = 0_usize;
-            let mut stream = assistant.reply_raw_prompt_stream(prompt.to_string()).await?;
+            let mut stream = assistant.reply_raw_prompt_stream(prompt.to_string())?;
             while let Some(delta) = stream.next().await {
                 let delta = delta?;
                 if delta.tool_event.is_some() || delta.text.is_empty() {

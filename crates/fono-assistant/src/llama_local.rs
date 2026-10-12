@@ -1347,7 +1347,8 @@ impl LlamaLocalAssistant {
         Ok(generation.text.trim().to_string())
     }
     /// Run an already-rendered llama prompt and stream deltas. Intended for diagnostics and benchmark replay.
-    pub async fn reply_raw_prompt_stream(
+    /// Must be called inside a Tokio runtime: inference starts on a blocking task right away.
+    pub fn reply_raw_prompt_stream(
         &self,
         prompt: String,
     ) -> Result<BoxStream<'static, Result<TokenDelta>>> {

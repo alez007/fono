@@ -102,9 +102,6 @@ pub async fn run(paths: &Paths) -> Result<()> {
         Some(PathChoice::Cloud) => {
             configure_cloud(&theme, &mut config, &mut secrets, &snap).await?;
         }
-        Some(PathChoice::Customize) => {
-            configure_customize(&theme, &mut config, &mut secrets, &snap).await?;
-        }
     }
 
     // Voice assistant — opt-in step. Independent of the dictation
@@ -968,12 +965,9 @@ fn assistant_picker_rows(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathChoice {
     Local,
+    /// Cloud also offers the per-capability "Customize" entry, which
+    /// leads to [`configure_customize`].
     Cloud,
-    /// Customize = pick STT and polish backends independently. Lets users
-    /// run e.g. local whisper for privacy + cloud Cerebras for fast
-    /// cleanup, or cloud Groq STT + skip-LLM (raw output) on a slow-CPU
-    /// machine.
-    Customize,
 }
 
 fn print_hw_summary(snap: &HardwareSnapshot, tier: LocalTier) {

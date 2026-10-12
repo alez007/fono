@@ -335,9 +335,7 @@ impl DepthBuffer {
             self.width = width;
             self.height = height;
         } else {
-            for v in &mut self.buf {
-                *v = 1.0;
-            }
+            self.buf.fill(1.0);
         }
     }
 

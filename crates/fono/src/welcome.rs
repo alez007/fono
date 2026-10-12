@@ -245,16 +245,21 @@ impl Welcome {
             .collect();
         let local_model = &config.stt.local.model;
         let local_mb = fono_stt::registry::ModelRegistry::get(local_model).map(|m| m.approx_mb);
-        let inner = self.lock();
-        let progress = inner
-            .progress
-            .as_ref()
-            .map(|p| json!({ "provider": p.provider, "phase": p.phase, "message": p.message }));
-        let local_phase = inner.local.map(|l| match l {
-            LocalPhase::Downloading => "downloading",
-            LocalPhase::Ready => "ready",
-            LocalPhase::Failed => "failed",
-        });
+        let (progress, local_phase) = {
+            let inner = self.lock();
+            let progress = inner
+                .progress
+                .as_ref()
+                .map(|p| json!({ "provider": p.provider, "phase": p.phase, "message": p.message }));
+            let local = inner.local;
+            drop(inner);
+            let local_phase = local.map(|l| match l {
+                LocalPhase::Downloading => "downloading",
+                LocalPhase::Ready => "ready",
+                LocalPhase::Failed => "failed",
+            });
+            (progress, local_phase)
+        };
         Ok(json!({
             "providers": cards,
             "recommended": onb::recommended_free_provider().map(|p| p.id),
@@ -549,9 +554,8 @@ mod tests {
         assert_eq!(q["callback_url"], "http://localhost:7/oauth/callback");
         assert_eq!(q["code_challenge_method"], "S256");
         assert!(q["key_label"].starts_with("fono"));
-        let inner = w.lock();
-        let session = &inner.oauth[&q["state"]];
-        assert_eq!(Pkce::from_verifier(session.verifier.clone()).challenge, q["code_challenge"]);
+        let verifier = w.lock().oauth[&q["state"]].verifier.clone();
+        assert_eq!(Pkce::from_verifier(verifier).challenge, q["code_challenge"]);
     }
 
     #[tokio::test]
