@@ -70,7 +70,12 @@ fn warm_client() -> reqwest::Client {
 struct MessagesReq<'a> {
     model: &'a str,
     max_tokens: u32,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// `{"effort": "low"}` on models that think by default, so a spoken
+    /// reply doesn't wait on a long hidden reasoning pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
     system: &'a str,
     messages: Vec<Message<'a>>,
     stream: bool,
@@ -188,10 +193,14 @@ impl Assistant for AnthropicChat {
                 "web search tool active: {tool_id}"
             );
         }
+        // Newer Claude models reject `temperature` and spend part of
+        // `max_tokens` on thinking; see `claude_takes_sampling`.
+        let sampling = fono_core::provider_catalog::claude_takes_sampling(&self.model);
         let req = MessagesReq {
             model: &self.model,
-            max_tokens: 1024,
-            temperature: 0.5,
+            max_tokens: if sampling { 1024 } else { 4096 },
+            temperature: sampling.then_some(0.5),
+            output_config: (!sampling).then(|| serde_json::json!({ "effort": "low" })),
             system: &system_full,
             messages,
             stream: true,

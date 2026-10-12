@@ -883,10 +883,10 @@ mod tests {
         let secrets = make_secrets("ANTHROPIC_API_KEY");
         let r = resolve_cloud(&cfg, &secrets, LlmBackend::Anthropic, "anthropic").unwrap();
         // Anthropic catalogue entry's multimodal_model is the same as
-        // the text model (Haiku 4.5 is multimodal); the swap is still
+        // the text model (Haiku 5.5 is multimodal); the swap is still
         // a no-op-equivalent — but we assert the field source is the
         // catalogue's multimodal_model literal.
-        assert_eq!(r.model, "claude-haiku-4-5-20251001");
+        assert_eq!(r.model, "claude-haiku-5-5");
     }
 
     #[cfg(feature = "openai-compat")]

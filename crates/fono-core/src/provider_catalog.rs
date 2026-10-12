@@ -460,7 +460,7 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             card_line: "Paid, pay as you go",
         },
         stt: Some(SttDefaults { model: "gpt-transcribe" }),
-        polish: Some(PolishDefaults { model: "gpt-5.4-nano" }),
+        polish: Some(PolishDefaults { model: "gpt-5.6-luna" }),
         // TODO: re-enable web search when fono-assistant migrates the
         // OpenAI client to the Responses API (POST /v1/responses). The
         // chat/completions API rejects unknown tool types.
@@ -522,17 +522,9 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             card_line: "Fastest",
         },
         stt: Some(SttDefaults { model: "whisper-large-v3-turbo" }),
-        polish: Some(PolishDefaults { model: "openai/gpt-oss-120b" }),
+        polish: Some(PolishDefaults { model: "qwen/qwen3.8-27b" }),
         assistant: Some(AssistantDefaults {
-            text_model: "openai/gpt-oss-120b",
-            // Groq currently exposes no vision-capable model Fono is
-            // willing to default to. `openai/gpt-oss-120b` (the text
-            // model above) is text-only; the previously catalogued
-            // `llama-4-maverick-17b-128e-instruct` was removed after
-            // Groq returned 404 `model_not_found` for it. Re-enable
-            // multimodal here only when Groq ships a hosted vision
-            // model with an OSI-compatible licence we're willing to
-            // make the default.
+            text_model: "qwen/qwen3.8-27b",
             multimodal_model: None,
             // TODO: Groq's compound-beta / compound-beta-mini models
             // provide built-in web search via model swap. Wire as an
@@ -544,9 +536,7 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         }),
         tts: Some(TtsDefaults {
             // Canopy Labs Orpheus on Groq's OpenAI-compatible
-            // `/audio/speech` endpoint. Replaces the PlayAI family
-            // (the previously catalogued model now returns
-            // `model_not_found` after Groq retired it). Groq's
+            // `/audio/speech` endpoint. Groq's
             // hosted Orpheus exposes a curated six-voice set —
             // `autumn` / `diana` / `hannah` / `austin` / `daniel` /
             // `troy` — which is narrower than Canopy's open-source
@@ -606,19 +596,11 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             card_line: "Paid, cleanup and assistant only",
         },
         stt: None,
-        polish: Some(PolishDefaults {
-            // TODO: verify against Anthropic's current model list — the
-            // Groq Maverick incident (issue: 404 model_not_found) exposed
-            // that the catalogue contained at least one hallucinated model
-            // id; the Anthropic dated suffix here is the most likely
-            // remaining suspect.
-            model: "claude-haiku-4-5-20251001",
-        }),
+        polish: Some(PolishDefaults { model: "claude-haiku-5-5" }),
         assistant: Some(AssistantDefaults {
-            // TODO: verify against Anthropic's current model list.
-            text_model: "claude-haiku-4-5-20251001",
-            // Claude Haiku 4.5 is multimodal (image input supported).
-            multimodal_model: Some("claude-haiku-4-5-20251001"),
+            text_model: "claude-haiku-5-5",
+            // Claude Haiku 5.5 takes text and images; reuse it for both.
+            multimodal_model: Some("claude-haiku-5-5"),
             web_search: WebSearchSupport::NativeTool("web_search_20250305"),
             realtime: None,
             badges: &[Badge::Polish, Badge::Assistant, Badge::Vision, Badge::Search],
@@ -646,7 +628,7 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
         stt: None,
         polish: Some(PolishDefaults { model: "gpt-oss-120b" }),
         assistant: Some(AssistantDefaults {
-            text_model: "zai-glm-4.7",
+            text_model: "gpt-oss-120b",
             multimodal_model: None,
             web_search: WebSearchSupport::None,
             realtime: None,
@@ -767,9 +749,9 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             // Whisper model.
             model: "openai/whisper-large-v3-turbo",
         }),
-        polish: Some(PolishDefaults { model: "openai/gpt-5.4-nano" }),
+        polish: Some(PolishDefaults { model: "openai/gpt-5.6-luna" }),
         assistant: Some(AssistantDefaults {
-            text_model: "anthropic/claude-haiku-4.5",
+            text_model: "anthropic/claude-haiku-5.5",
             // Multimodal is route-dependent on OpenRouter; leave None
             // until the wizard surfaces explicit per-route choices.
             multimodal_model: None,
@@ -780,10 +762,7 @@ pub const CLOUD_PROVIDERS: &[CloudProvider] = &[
             badges: &[Badge::Polish, Badge::Assistant, Badge::Tts],
         }),
         tts: Some(TtsDefaults {
-            // xAI's `grok-voice-tts-1.0` via OpenRouter. Replaces the
-            // previous `openai/tts-1` default — the OpenAI model is
-            // not exposed on OpenRouter today, and Grok Voice TTS
-            // works correctly through OpenRouter's `/audio/speech`
+            // xAI's `grok-voice-tts-1.0` via OpenRouter's `/audio/speech`
             // proxy. Users who want a different voice can pin
             // `model = "…"` and `voice = "…"` in `[tts.openrouter]`
             // of `config.toml`.
@@ -1187,6 +1166,22 @@ pub fn cloud_pair_from_catalog(id: &str) -> Option<(SttBackend, LlmBackend)> {
     Some((stt_backend, llm_backend))
 }
 
+/// True for Claude models that accept a custom `temperature` and run
+/// without adaptive thinking: the Claude 3 family and Claude 4 up to 4.6.
+/// Later models return 400 for any `temperature` other than 1, think by
+/// default, and take `output_config.effort` instead.
+#[must_use]
+pub fn claude_takes_sampling(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if m.contains("claude-3") {
+        return true;
+    }
+    let Some((_, rest)) = m.split_once("-4-") else { return false };
+    let minor = rest.split('-').next().unwrap_or_default();
+    // `claude-sonnet-4-20250514` carries a date where the minor version goes.
+    minor.len() == 8 || minor.parse::<u32>().is_ok_and(|n| n <= 6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1190,22 @@ mod tests {
         llm_backend_str, llm_key_env, parse_tts_backend, stt_backend_str, stt_key_env,
         tts_backend_str, tts_key_env,
     };
+
+    #[test]
+    fn claude_sampling_follows_the_model_generation() {
+        for m in [
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-6",
+            "claude-3-5-sonnet-latest",
+        ] {
+            assert!(claude_takes_sampling(m), "{m}");
+        }
+        for m in ["claude-haiku-5-5", "claude-opus-4-7", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            assert!(!claude_takes_sampling(m), "{m}");
+        }
+    }
 
     /// Test 1 — key_env on every entry matches the canonical
     /// `*_key_env` of every capability variant it claims.
@@ -1448,12 +1459,9 @@ mod tests {
             ),
             (
                 "anthropic",
-                Some("claude-haiku-4-5-20251001"),
+                Some("claude-haiku-5-5"),
                 WebSearchSupport::NativeTool("web_search_20250305"),
             ),
-            // Groq: no multimodal model in the catalogue today — the
-            // previously advertised `llama-4-maverick-17b-128e-instruct`
-            // returned 404 from Groq and was removed.
             ("groq", None, WebSearchSupport::None),
             ("cerebras", None, WebSearchSupport::None),
             ("openrouter", None, WebSearchSupport::None),

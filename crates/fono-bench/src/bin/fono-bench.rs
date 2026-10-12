@@ -3245,12 +3245,12 @@ fn build_polish_with_options(
         }
         LlmProvider::Groq => {
             let key = resolve_key(&secrets, "GROQ_API_KEY")?;
-            let m = model.unwrap_or("openai/gpt-oss-20b").to_string();
+            let m = model.unwrap_or("qwen/qwen3.8-27b").to_string();
             Some(Arc::new(OpenAiCompat::groq(key, m)))
         }
         LlmProvider::Openai => {
             let key = resolve_key(&secrets, "OPENAI_API_KEY")?;
-            let m = model.unwrap_or("gpt-5.4-nano").to_string();
+            let m = model.unwrap_or("gpt-5.6-luna").to_string();
             Some(Arc::new(OpenAiCompat::openai(key, m)))
         }
         LlmProvider::Network => {
@@ -3260,12 +3260,12 @@ fn build_polish_with_options(
         }
         LlmProvider::Openrouter => {
             let key = resolve_key(&secrets, "OPENROUTER_API_KEY")?;
-            let m = model.unwrap_or("openai/gpt-5.4-nano").to_string();
+            let m = model.unwrap_or("openai/gpt-5.6-luna").to_string();
             Some(Arc::new(OpenAiCompat::openrouter(key, m)))
         }
         LlmProvider::Anthropic => {
             let key = resolve_key(&secrets, "ANTHROPIC_API_KEY")?;
-            let m = model.unwrap_or("claude-haiku-4-5-20251001").to_string();
+            let m = model.unwrap_or("claude-haiku-5-5").to_string();
             Some(Arc::new(fono_polish::anthropic::AnthropicLlm::new(key, m)))
         }
         LlmProvider::LlamaCpp => {
@@ -3318,17 +3318,17 @@ fn build_assistant_with_options(
         LlmProvider::Fake => Arc::new(FakeAssistant),
         LlmProvider::Cerebras => {
             let key = resolve_key(&secrets, "CEREBRAS_API_KEY")?;
-            let m = options.model.unwrap_or("zai-glm-4.7").to_string();
+            let m = options.model.unwrap_or("gpt-oss-120b").to_string();
             Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::cerebras(key, m))
         }
         LlmProvider::Groq => {
             let key = resolve_key(&secrets, "GROQ_API_KEY")?;
-            let m = options.model.unwrap_or("openai/gpt-oss-120b").to_string();
+            let m = options.model.unwrap_or("qwen/qwen3.8-27b").to_string();
             Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::groq(key, m))
         }
         LlmProvider::Openai => {
             let key = resolve_key(&secrets, "OPENAI_API_KEY")?;
-            let m = options.model.unwrap_or("gpt-5.4-mini").to_string();
+            let m = options.model.unwrap_or("gpt-5.6-luna").to_string();
             Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::openai(key, m))
         }
         LlmProvider::Network => {
@@ -3340,12 +3340,12 @@ fn build_assistant_with_options(
         }
         LlmProvider::Openrouter => {
             let key = resolve_key(&secrets, "OPENROUTER_API_KEY")?;
-            let m = options.model.unwrap_or("anthropic/claude-haiku-4.5").to_string();
+            let m = options.model.unwrap_or("anthropic/claude-haiku-5.5").to_string();
             Arc::new(fono_assistant::openai_compat_chat::OpenAiCompatChat::openrouter(key, m))
         }
         LlmProvider::Anthropic => {
             let key = resolve_key(&secrets, "ANTHROPIC_API_KEY")?;
-            let m = options.model.unwrap_or("claude-haiku-4-5-20251001").to_string();
+            let m = options.model.unwrap_or("claude-haiku-5-5").to_string();
             Arc::new(fono_assistant::anthropic_chat::AnthropicChat::new(key, m))
         }
         LlmProvider::LlamaCpp => {
@@ -3424,12 +3424,12 @@ impl fono_assistant::Assistant for FakeAssistant {
 fn default_assistant_model(provider: LlmProvider) -> String {
     match provider {
         LlmProvider::None | LlmProvider::Fake => "fake".to_string(),
-        LlmProvider::Cerebras => "zai-glm-4.7".to_string(),
-        LlmProvider::Groq => "openai/gpt-oss-120b".to_string(),
-        LlmProvider::Openai => "gpt-5.4-mini".to_string(),
+        LlmProvider::Cerebras => "gpt-oss-120b".to_string(),
+        LlmProvider::Groq => "qwen/qwen3.8-27b".to_string(),
+        LlmProvider::Openai => "gpt-5.6-luna".to_string(),
         LlmProvider::Network => "llama3.2".to_string(),
-        LlmProvider::Openrouter => "anthropic/claude-haiku-4.5".to_string(),
-        LlmProvider::Anthropic => "claude-haiku-4-5-20251001".to_string(),
+        LlmProvider::Openrouter => "anthropic/claude-haiku-5.5".to_string(),
+        LlmProvider::Anthropic => "claude-haiku-5-5".to_string(),
         LlmProvider::LlamaCpp => "llama-cpp".to_string(),
     }
 }
@@ -3451,11 +3451,11 @@ fn default_polish_model(provider: LlmProvider, model_path: Option<&std::path::Pa
     match provider {
         LlmProvider::None | LlmProvider::Fake => "fake".to_string(),
         LlmProvider::Cerebras => "gpt-oss-120b".to_string(),
-        LlmProvider::Groq => "openai/gpt-oss-20b".to_string(),
-        LlmProvider::Openai => "gpt-5.4-nano".to_string(),
+        LlmProvider::Groq => "qwen/qwen3.8-27b".to_string(),
+        LlmProvider::Openai => "gpt-5.6-luna".to_string(),
         LlmProvider::Network => "llama3.2".to_string(),
-        LlmProvider::Openrouter => "openai/gpt-5.4-nano".to_string(),
-        LlmProvider::Anthropic => "claude-haiku-4-5-20251001".to_string(),
+        LlmProvider::Openrouter => "openai/gpt-5.6-luna".to_string(),
+        LlmProvider::Anthropic => "claude-haiku-5-5".to_string(),
         LlmProvider::LlamaCpp => model_path
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())

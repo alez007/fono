@@ -16,10 +16,10 @@
 //!   cargo run --release --example smoke_assistant -p fono
 //!   ```
 //!
-//! * **CI** (`--ci` flag) — exercises Groq + Cerebras only and
-//!   skips the OpenAI TTS test. These are the providers whose
-//!   API keys are stored as GitHub Actions secrets and exposed
-//!   to the workflow. Anthropic and OpenAI are local-only.
+//! * **CI** (`--ci` flag) — exercises Groq only and skips the
+//!   OpenAI TTS test. Groq is the provider whose API key is
+//!   stored as a GitHub Actions secret and exposed to the
+//!   workflow. Anthropic, Cerebras and OpenAI are local-only.
 //!
 //!   ```sh
 //!   cargo run --release --example smoke_assistant -p fono -- --ci
@@ -61,8 +61,7 @@ struct Provider {
     key_env: &'static str,
     model: &'static str,
     /// Run this provider in `--ci` mode? CI's GitHub Secrets
-    /// store keys for Groq + Cerebras only; Anthropic + OpenAI
-    /// are local-only.
+    /// store a key for Groq only; the others are local-only.
     ci: bool,
 }
 
@@ -72,7 +71,7 @@ fn providers() -> Vec<Provider> {
             backend: LlmBackend::Anthropic,
             label: "anthropic",
             key_env: "ANTHROPIC_API_KEY",
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-haiku-5-5",
             ci: false,
         },
         Provider {
@@ -81,21 +80,21 @@ fn providers() -> Vec<Provider> {
             key_env: "CEREBRAS_API_KEY",
             // Mirrors the user-facing default in
             // fono-assistant/src/factory.rs:73.
-            model: "zai-glm-4.7",
-            ci: true,
+            model: "gpt-oss-120b",
+            ci: false,
         },
         Provider {
             backend: LlmBackend::Groq,
             label: "groq",
             key_env: "GROQ_API_KEY",
-            model: "openai/gpt-oss-120b",
+            model: "qwen/qwen3.8-27b",
             ci: true,
         },
         Provider {
             backend: LlmBackend::OpenAI,
             label: "openai",
             key_env: "OPENAI_API_KEY",
-            model: "gpt-5.4-mini",
+            model: "gpt-5.6-luna",
             ci: false,
         },
     ]
@@ -159,7 +158,7 @@ async fn main() -> Result<()> {
 
         // Retry up to 3 times with backoff on 429 / queue-full. If
         // all attempts are 429 the provider is overloaded — log SKIP
-        // rather than FAIL so a transient Cerebras / Groq outage
+        // rather than FAIL so a transient provider outage
         // doesn't block the release gate.
         let retry_delays: &[u64] = &[5, 15, 30]; // seconds
         let mut last_err: Option<anyhow::Error> = None;
@@ -409,7 +408,7 @@ async fn exercise_groq_e2e(secrets: &Secrets) -> Result<()> {
     let llm_cfg = AssistantCfg {
         enabled: true,
         backend: LlmBackend::Groq,
-        cloud: LlmCloud { api_key_ref: "GROQ_API_KEY".into(), model: "openai/gpt-oss-120b".into() },
+        cloud: LlmCloud { api_key_ref: "GROQ_API_KEY".into(), model: "qwen/qwen3.8-27b".into() },
         ..AssistantCfg::default()
     };
     let assistant = fono_assistant::build_assistant(&llm_cfg, secrets, Path::new("."))

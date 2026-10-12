@@ -29,11 +29,34 @@ impl AnthropicLlm {
 struct Req<'a> {
     model: &'a str,
     max_tokens: u32,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop_sequences: Vec<&'a str>,
     system: &'a str,
     messages: Vec<Message<'a>>,
+}
+
+impl<'a> Req<'a> {
+    /// Older Claude models get a low temperature and a tight budget.
+    /// Newer ones reject `temperature` and think before answering, so they
+    /// get `low` effort and room for the thinking tokens instead.
+    fn new(model: &'a str, system: &'a str, user: &'a str) -> Self {
+        let sampling = fono_core::provider_catalog::claude_takes_sampling(model);
+        Self {
+            model,
+            max_tokens: if sampling { 512 } else { 2048 },
+            temperature: sampling.then_some(0.2),
+            output_config: (!sampling).then(|| serde_json::json!({ "effort": "low" })),
+            // Anthropic's Messages API rejects whitespace-only stop
+            // sequences with a 400, so no `"\n\n"` guard here.
+            stop_sequences: vec![],
+            system,
+            messages: vec![Message { role: "user", content: user }],
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -58,18 +81,7 @@ impl TextFormatter for AnthropicLlm {
     async fn format(&self, raw: &str, ctx: &FormatContext) -> Result<String> {
         let system = ctx.system_prompt();
         let user = user_prompt(raw);
-        let req = Req {
-            model: &self.model,
-            // Latency plan L19 — short cleanup outputs. Length is bounded by
-            // `max_tokens` alone; we used to also pass `stop_sequences =
-            // ["\n\n"]` as a blank-line heuristic, but Anthropic's Messages
-            // API now rejects whitespace-only stop sequences with a 400.
-            max_tokens: 512,
-            temperature: 0.2,
-            stop_sequences: vec![],
-            system: &system,
-            messages: vec![Message { role: "user", content: &user }],
-        };
+        let req = Req::new(&self.model, &system, &user);
         let res = self
             .client
             .post(ENDPOINT)
@@ -125,18 +137,21 @@ mod tests {
     /// entirely (it's `skip_serializing_if = "Vec::is_empty"`).
     #[test]
     fn request_body_omits_stop_sequences() {
-        let req = Req {
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 512,
-            temperature: 0.2,
-            stop_sequences: vec![],
-            system: "sys",
-            messages: vec![Message { role: "user", content: "hi" }],
-        };
+        let req = Req::new("claude-haiku-5-5", "sys", "hi");
         let body = serde_json::to_string(&req).expect("serialize");
         assert!(
             !body.contains("stop_sequences"),
             "stop_sequences must be omitted from the wire body, got: {body}"
         );
+    }
+
+    #[test]
+    fn sampling_follows_the_model() {
+        let new = serde_json::to_string(&Req::new("claude-haiku-5-5", "s", "u")).unwrap();
+        assert!(!new.contains("temperature"), "{new}");
+        assert!(new.contains(r#""output_config":{"effort":"low"}"#), "{new}");
+        let old = serde_json::to_string(&Req::new("claude-haiku-4-5", "s", "u")).unwrap();
+        assert!(old.contains(r#""temperature":0.2"#), "{old}");
+        assert!(!old.contains("output_config"), "{old}");
     }
 }

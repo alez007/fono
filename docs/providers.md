@@ -920,7 +920,7 @@ full design.
 | Provider   | Vision (multimodal model)              | Web search (native tool)            |
 |------------|-----------------------------------------|--------------------------------------|
 | OpenAI     | `gpt-5.6-luna` (same as text default)   | `web_search_preview`                 |
-| Anthropic  | `claude-haiku-4-5-20251001`             | `web_search_20250305`                |
+| Anthropic  | `claude-haiku-5-5` (same as text default) | `web_search_20250305`              |
 | Gemini     | `gemini-flash-lite-latest`              | `google_search` *(not yet wired)*    |
 | Groq       | —                                       | —                                    |
 | Cerebras   | —                                       | —                                    |

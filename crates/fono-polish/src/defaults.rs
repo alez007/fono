@@ -30,10 +30,10 @@ mod tests {
     #[test]
     fn known_providers_resolve_via_catalogue() {
         assert_eq!(default_cloud_model("cerebras"), "gpt-oss-120b");
-        assert_eq!(default_cloud_model("groq"), "openai/gpt-oss-120b");
-        assert_eq!(default_cloud_model("openai"), "gpt-5.4-nano");
-        assert_eq!(default_cloud_model("anthropic"), "claude-haiku-4-5-20251001");
-        assert_eq!(default_cloud_model("openrouter"), "openai/gpt-5.4-nano");
+        assert_eq!(default_cloud_model("groq"), "qwen/qwen3.8-27b");
+        assert_eq!(default_cloud_model("openai"), "gpt-5.6-luna");
+        assert_eq!(default_cloud_model("anthropic"), "claude-haiku-5-5");
+        assert_eq!(default_cloud_model("openrouter"), "openai/gpt-5.6-luna");
         assert_eq!(default_cloud_model("gemini"), "gemini-flash-lite-latest");
     }
 

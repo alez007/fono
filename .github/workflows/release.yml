@@ -95,16 +95,16 @@ jobs:
           retention-days: 30
 
   cloud-assistant:
-    name: Cloud assistant smoke (Groq + Cerebras)
+    name: Cloud assistant smoke (Groq)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # 30 min: up to 3 retry attempts with 5+15+30s back-off on 429s,
     # plus ~5 min compile time.
     # Same tag-suffix escape hatch as `cloud-equivalence`. Per
     # `crates/fono/examples/smoke_assistant.rs`, the `--ci` mode
-    # exercises the two providers whose API keys are stored as
-    # GitHub Actions secrets (Groq + Cerebras) and skips the
-    # local-only ones (Anthropic + OpenAI + OpenAI TTS).
+    # exercises the provider whose API key is stored as a GitHub
+    # Actions secret (Groq) and skips the local-only ones
+    # (Anthropic, Cerebras, OpenAI, OpenAI TTS).
     if: ${{ !endsWith(github.ref, '-no-cloud-gate') }}
     steps:
       - uses: actions/checkout@v5
@@ -135,14 +135,13 @@ jobs:
           echo "ORT_LIB_LOCATION=${ort_dir}" >> "$GITHUB_ENV"
           echo "pinned ORT_LIB_LOCATION=${ort_dir}"
 
-      - name: Run assistant smoke (Groq + Cerebras)
+      - name: Run assistant smoke (Groq)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${GROQ_API_KEY:-}" ] && [ -z "${CEREBRAS_API_KEY:-}" ]; then
-            echo "Neither GROQ_API_KEY nor CEREBRAS_API_KEY secret set — skipping assistant smoke."
+          if [ -z "${GROQ_API_KEY:-}" ]; then
+            echo "GROQ_API_KEY secret not set — skipping assistant smoke."
             exit 0
           fi
           cargo run --release --example smoke_assistant -p fono -- --ci

@@ -84,15 +84,15 @@ const STT_PROVIDERS = [
   ['nemotron', 'Nemotron', 'whisper-large-v3'], ['openrouter', 'OpenRouter', 'whisper-large-v3-turbo'],
 ];
 const POLISH_PROVIDERS = [
-  ['local', 'Local model', 'on-device'], ['openai', 'OpenAI', 'gpt-5.4-nano'],
-  ['anthropic', 'Anthropic', 'claude-haiku-4-5'], ['gemini', 'Gemini', 'gemini-flash-lite-latest'],
-  ['groq', 'Groq', 'gpt-oss-120b'], ['cerebras', 'Cerebras', 'gpt-oss-120b'],
-  ['openrouter', 'OpenRouter', 'gpt-5.4-nano'],
+  ['local', 'Local model', 'on-device'], ['openai', 'OpenAI', 'gpt-5.6-luna'],
+  ['anthropic', 'Anthropic', 'claude-haiku-5-5'], ['gemini', 'Gemini', 'gemini-flash-lite-latest'],
+  ['groq', 'Groq', 'qwen3.8-27b'], ['cerebras', 'Cerebras', 'gpt-oss-120b'],
+  ['openrouter', 'OpenRouter', 'gpt-5.6-luna'],
 ];
 const ASSISTANT_PROVIDERS = [
-  ['openai', 'OpenAI', 'gpt-5.4-mini'], ['anthropic', 'Anthropic', 'claude-haiku-4-5'],
-  ['gemini', 'Gemini', 'gemini-flash-lite-latest'], ['groq', 'Groq', 'gpt-oss-120b'],
-  ['cerebras', 'Cerebras', 'zai-glm-4.7'], ['openrouter', 'OpenRouter', 'claude-haiku-4.5'],
+  ['openai', 'OpenAI', 'gpt-5.6-luna'], ['anthropic', 'Anthropic', 'claude-haiku-5-5'],
+  ['gemini', 'Gemini', 'gemini-flash-lite-latest'], ['groq', 'Groq', 'qwen3.8-27b'],
+  ['cerebras', 'Cerebras', 'gpt-oss-120b'], ['openrouter', 'OpenRouter', 'claude-haiku-5.5'],
 ];
 const TTS_PROVIDERS = [
   ['openai', 'OpenAI', 'tts-1'], ['elevenlabs', 'ElevenLabs', 'eleven_v3'],
